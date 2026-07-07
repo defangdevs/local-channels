@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "local-channels",
+  "description": "Local channel plugins for this host",
+  "owner": {
+    "name": "claude"
+  },
+  "plugins": [
+    {
+      "name": "gh-webhook",
+      "description": "One-way GitHub webhook channel (HMAC-verified) that pushes repo events into the session.",
+      "source": "./gh-webhook",
+      "keywords": ["channel", "mcp", "github", "webhook"]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "gh-webhook",
+  "description": "One-way GitHub webhook channel (HMAC-verified) that pushes repo events into the session.",
+  "version": "0.1.0",
+  "keywords": ["channel", "mcp", "github", "webhook"]
+}

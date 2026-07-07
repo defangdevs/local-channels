@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gh-webhook": {
+      "command": "/home/claude/.nix-profile/bin/bun",
+      "args": ["/home/claude/gh-webhook-channel/webhook.ts"]
+    }
+  }
+}
