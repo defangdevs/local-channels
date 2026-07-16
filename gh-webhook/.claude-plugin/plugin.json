@@ -1,6 +1,0 @@
-{
-  "name": "gh-webhook",
-  "description": "HMAC-verified GitHub webhook channel that pushes repo events into the session, plus repo_subscribe / repo_unsubscribe MCP tools for routing which repos come through.",
-  "version": "0.2.0",
-  "keywords": ["channel", "mcp", "github", "webhook"]
-}

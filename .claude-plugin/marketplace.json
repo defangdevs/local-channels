@@ -7,10 +7,10 @@
   },
   "plugins": [
     {
-      "name": "gh-webhook",
-      "description": "HMAC-verified GitHub webhook channel that pushes repo events into the session, plus repo_subscribe / repo_unsubscribe MCP tools for routing which repos come through.",
-      "source": "./gh-webhook",
-      "keywords": ["channel", "mcp", "github", "webhook"]
+      "name": "local-webhook",
+      "description": "HMAC-verified webhook channel: pushes deliveries from GitHub or any other signing sender into the session, plus webhook_subscribe / webhook_unsubscribe MCP tools for topic routing.",
+      "source": "./local-webhook",
+      "keywords": ["channel", "mcp", "webhook", "github"]
     }
   ]
 }
