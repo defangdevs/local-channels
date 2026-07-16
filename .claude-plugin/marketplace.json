@@ -11,6 +11,12 @@
       "description": "HMAC-verified webhook channel: pushes deliveries from GitHub or any other signing sender into the session, plus webhook_subscribe / webhook_unsubscribe MCP tools for topic routing.",
       "source": "./local-webhook",
       "keywords": ["channel", "mcp", "webhook", "github"]
+    },
+    {
+      "name": "gh-webhook",
+      "description": "TEMPORARY alias of local-webhook (same code) for sessions launched with the old --channels plugin:gh-webhook flag; see gh-webhook/README.md. Remove after nixos-defang-ca 698082c is rebuilt in.",
+      "source": "./gh-webhook",
+      "keywords": ["channel", "mcp", "webhook", "github", "alias"]
     }
   ]
 }
