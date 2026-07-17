@@ -82,23 +82,29 @@ sender-ignore: their sender is merely who triggered the run, and muting your
 own login must not mute CI results for your own pushes.
 
 ```json
-{ "enabled": true, "ttlHours": 48, "topics": [
+{ "enabled": true, "ttlHours": 24, "topics": [
     "github:defangdevs/*",
+    { "topic": "github:me/my-config-repo", "ttlHours": 0,
+      "note": "this box's own repo — pinned", "subscribedAt": "2026-07-16T00:00:00Z" },
     { "topic": "github:defangdevs/claude-box", "ignoreSenders": ["@self"],
       "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
 ```
 
-### Subscription expiry and notes (0.5.0)
+### Subscription expiry and notes (0.5.x)
 
 Agent sessions come and go — context gets cleared, and a webhook landing days
 later in a fresh session is noise without the work that motivated it. So
-subscriptions **expire**: a topic that neither forwarded a delivery nor was
-re-subscribed within `ttlHours` (default 48; `0` disables) is pruned, at
-delivery time and on every tool call. Activity **renews** — any forwarded
-delivery bumps the entry's `lastActivityAt`, and calling `webhook_subscribe`
-again restarts the clock (and reports "renewed"). Hand-written entries without
-timestamps never expire until some write stamps them (`subscribedAt` is filled
-in on the next file write).
+subscriptions **expire**, `ttlHours` after they were last (re)subscribed
+(top-level default 24; per-entry `ttlHours` overrides it; `0` = pinned, never
+expires). Expired topics are pruned at delivery time and on every tool call.
+
+Only **re-subscribing** renews the clock — deliveries deliberately do *not*:
+a repo with steady bot traffic (dependabot, CI) would otherwise keep a dead
+subscription alive forever. `lastActivityAt` is recorded for display only.
+`webhook_subscribe` takes `ttl_hours` to set the per-topic override: longer
+when the awaited response will take days, `0` to pin the box's own repos.
+Hand-written entries without timestamps never expire until some write stamps
+them (`subscribedAt` is filled in on the next file write).
 
 `webhook_subscribe` also takes a `note` — a one-liner saying *why* the
 subscription exists ("waiting on Lio to wire the hook, issue 15"). It is echoed
@@ -110,7 +116,8 @@ under every delivery on that topic:
 ```
 
 so a session that has since lost its context still knows what the event relates
-to. Omitting `note` on re-subscribe keeps the existing one; pass `""` to clear.
+to. Omitting `note` (or `ttl_hours`) on re-subscribe keeps the existing values;
+pass `""` to clear the note.
 
 ### Per-identity filters
 

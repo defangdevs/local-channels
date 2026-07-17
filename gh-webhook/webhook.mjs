@@ -21,7 +21,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFile
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
-const VERSION = '0.5.0'
+const VERSION = '0.5.1'
 const PORT = Number(process.env.LOCAL_WEBHOOK_PORT ?? process.env.WEBHOOK_PORT ?? 8788)
 
 // All mutable state (secrets, source config, subscription filter) lives OUTSIDE
@@ -131,15 +131,18 @@ function verify(secret, sigHeader, body) {
 //
 // Subscriptions EXPIRE: sessions come and go (context gets cleared), and a
 // webhook landing days later in a fresh session is noise without the work that
-// motivated it. A topic that neither forwarded a delivery nor was re-subscribed
-// within ttlHours (default 48; 0 disables) is pruned. Activity renews — any
-// forwarded delivery bumps lastActivityAt, re-subscribing bumps subscribedAt.
+// motivated it. A topic expires ttlHours after it was last (re)subscribed —
+// per-entry ttlHours wins over the top-level default; 0 = never (pin the
+// box's own repos). Deliveries deliberately do NOT extend the clock: a chatty
+// repo (dependabot, CI) would otherwise keep a dead subscription alive
+// forever. Only an agent re-subscribing — expressing fresh interest — renews.
+// lastActivityAt is tracked for display only.
 // The optional per-topic "note" (why this subscription exists) is echoed under
 // every delivery so a fresh-context session knows what the event relates to.
-const DEFAULT_TTL_HOURS = 48
+const DEFAULT_TTL_HOURS = 24
 const FILTER_FILE = join(STATE_DIR, SELF ? `filter.${SELF}.json` : 'filter.json')
 const FILTER_COMMENT =
-  "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix 'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events like workflow_run are never sender-ignored) and expire ttlHours after their last activity (0 = never; entries without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
+  "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix 'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events like workflow_run are never sender-ignored) and expire ttlHours after subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; deliveries do NOT renew, only re-subscribing does; entries without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
 
 // Sender-ignore never applies to these: their payload sender is merely who
 // triggered the run, while the content (CI verdict, deploy status) is news.
@@ -173,6 +176,7 @@ function normalizeEntry(t) {
       topic: t.topic,
       ignoreSenders: ig,
       note: typeof t.note === 'string' ? t.note.slice(0, 300) : '',
+      ttlHours: typeof t.ttlHours === 'number' && t.ttlHours >= 0 ? t.ttlHours : null,
       subscribedAt: iso(t.subscribedAt),
       lastActivityAt: iso(t.lastActivityAt),
     }
@@ -210,6 +214,7 @@ function writeFilter(f) {
   const topics = f.topics.map((e) => {
     const o = { topic: e.topic, subscribedAt: e.subscribedAt || now }
     if (e.note) o.note = e.note
+    if (e.ttlHours != null) o.ttlHours = e.ttlHours
     if (e.ignoreSenders.length) o.ignoreSenders = e.ignoreSenders
     if (e.lastActivityAt) o.lastActivityAt = e.lastActivityAt
     return o
@@ -220,10 +225,14 @@ function writeFilter(f) {
 }
 
 // ------------------------------------------------------------------ expiry ---
-function entryExpired(e, ttlHours, nowMs) {
-  if (!ttlHours) return false
-  const last = Date.parse(e.lastActivityAt || e.subscribedAt || '')
-  return !Number.isNaN(last) && nowMs - last > ttlHours * 3600e3
+// The clock runs from subscribedAt ONLY. lastActivityAt is display metadata —
+// if deliveries renewed the TTL, any repo with steady bot traffic (dependabot,
+// CI) would keep its subscription alive forever with no one working on it.
+function entryExpired(e, defaultTtl, nowMs) {
+  const ttl = e.ttlHours ?? defaultTtl
+  if (!ttl) return false // per-entry or global 0 = pinned
+  const t = Date.parse(e.subscribedAt || '')
+  return !Number.isNaN(t) && nowMs - t > ttl * 3600e3
 }
 
 function ageStr(iso, nowMs) {
@@ -233,11 +242,12 @@ function ageStr(iso, nowMs) {
   return h < 1 ? '<1h' : h < 48 ? `${h}h` : `${Math.round(h / 24)}d`
 }
 
-function expiresStr(e, ttlHours, nowMs) {
-  if (!ttlHours) return 'never (ttlHours=0)'
-  const last = Date.parse(e.lastActivityAt || e.subscribedAt || '')
-  if (Number.isNaN(last)) return 'never (no timestamp yet)'
-  const h = (last + ttlHours * 3600e3 - nowMs) / 3600e3
+function expiresStr(e, defaultTtl, nowMs) {
+  const ttl = e.ttlHours ?? defaultTtl
+  if (!ttl) return e.ttlHours === 0 ? 'never (pinned)' : 'never (ttlHours=0)'
+  const t = Date.parse(e.subscribedAt || '')
+  if (Number.isNaN(t)) return 'never (no timestamp yet)'
+  const h = (t + ttl * 3600e3 - nowMs) / 3600e3
   return h <= 0 ? 'expired' : h < 48 ? `${Math.ceil(h)}h` : `${Math.round(h / 24)}d`
 }
 
@@ -266,10 +276,10 @@ function entryForwards(e, sender, event) {
   })
 }
 
-// Decides forwarding AND maintains the TTL clock in one pass: expired topics
-// are pruned, every entry that routed this event gets lastActivityAt bumped,
-// and the first matching entry is returned so its note/age can be echoed to
-// the session. The write only happens when something actually changed.
+// Decides forwarding AND prunes expired topics in one pass; the first matching
+// entry is returned so its note/age can be echoed to the session. Matching
+// entries get lastActivityAt stamped for display, but that does NOT feed the
+// TTL — see entryExpired. The write only happens when something changed.
 function routeEvent(source, key, sender, event) {
   const f = readFilter()
   if (!f.enabled) return { forward: false }
@@ -473,9 +483,10 @@ const INSTRUCTIONS =
   'stripe:*, or "*" for everything; a bare "owner/repo" is shorthand for github:owner/repo. Subscribe ' +
   'when you start work on something whose events you want to see and unsubscribe when you wrap up. ' +
   'Pass a short note saying WHY you subscribed — it is echoed under every delivery, so a later ' +
-  'session with cleared context knows what the event relates to. Subscriptions expire after ' +
-  `${DEFAULT_TTL_HOURS}h (filter.json ttlHours) without a forwarded delivery or re-subscribe; ` +
-  're-subscribing renews the clock. ' +
+  'session with cleared context knows what the event relates to. Subscriptions expire ' +
+  `${DEFAULT_TTL_HOURS}h after they were last (re)subscribed (deliveries do NOT extend this; ` +
+  'only re-subscribing renews). Pass ttl_hours to override per topic: longer when a response is ' +
+  'expected to take days, 0 to pin a subscription forever (reserved for this box\'s own repos). ' +
   'To mute echoes of your own actions (your comments, your issue edits) pass ignore_senders — e.g. ' +
   'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe; CI-outcome ' +
   'events (workflow_run etc.) are always delivered regardless. ' +
@@ -490,10 +501,9 @@ const TOOLS = [
       '"source:key" patterns: "github:owner/repo" (exact), "github:owner/*" (prefix), "github:*" ' +
       '(whole source), or "*" (everything); a bare "owner/repo" means github:owner/repo. Call when ' +
       'starting work on something whose events you want in real time (pushes, PR reviews, workflow ' +
-      'runs, comments, payments, ...). Subscriptions persist across sessions but EXPIRE after ' +
-      `${DEFAULT_TTL_HOURS}h (configurable via ttlHours in the filter file) without a forwarded ` +
-      'delivery or re-subscribe. Re-subscribing an existing topic renews its clock and updates ' +
-      'note / ignore_senders in place.',
+      'runs, comments, payments, ...). Subscriptions persist across sessions but EXPIRE ' +
+      `${DEFAULT_TTL_HOURS}h after the last (re)subscribe — deliveries do not extend the clock; ` +
+      're-subscribing renews it and updates note / ignore_senders / ttl_hours in place.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -507,6 +517,14 @@ const TOOLS = [
             'Short reason for subscribing ("waiting on Lio to wire the hook, issue 15"). Echoed under ' +
             'every delivery on this topic so a fresh-context session knows why the event matters. ' +
             'Omit to keep the existing note; pass "" to clear.',
+        },
+        ttl_hours: {
+          type: 'number',
+          description:
+            `Per-topic expiry override in hours (default: the filter file's ttlHours, ${DEFAULT_TTL_HOURS} ` +
+            'unless changed). Counted from the last (re)subscribe; deliveries do not extend it. Use a ' +
+            "larger value when the awaited response will take days, 0 to pin forever (this box's own " +
+            'repos). Omit to keep the existing override on renew.',
         },
         ignore_senders: {
           type: 'array',
@@ -560,6 +578,7 @@ function callTool(params) {
     const topics = f.topics.map((e) => ({
       topic: e.topic,
       ...(e.note ? { note: e.note } : {}),
+      ...(e.ttlHours != null ? { ttlHours: e.ttlHours } : {}),
       ...(e.ignoreSenders.length ? { ignoreSenders: e.ignoreSenders } : {}),
       ...(e.subscribedAt ? { subscribed: `${ageStr(e.subscribedAt, nowMs)} ago` } : {}),
       ...(e.lastActivityAt ? { lastActivity: `${ageStr(e.lastActivityAt, nowMs)} ago` } : {}),
@@ -588,30 +607,39 @@ function callTool(params) {
   if (name === 'webhook_subscribe') {
     const rawIg = params.arguments?.ignore_senders
     if (rawIg !== undefined && !Array.isArray(rawIg)) return text('error: ignore_senders must be an array of strings')
+    const rawTtl = params.arguments?.ttl_hours
+    if (rawTtl !== undefined && !(typeof rawTtl === 'number' && rawTtl >= 0)) {
+      return text('error: ttl_hours must be a number >= 0 (0 = never expire)')
+    }
     const rawNote = params.arguments?.note
     const now = new Date(nowMs).toISOString()
     const i = f.topics.findIndex((e) => eq(e.topic, topic))
-    const ttl = f.ttlHours ? `; expires ${f.ttlHours}h after last activity` : ''
+    const ttlMsg = (e) => {
+      const ttl = e.ttlHours ?? f.ttlHours
+      return ttl ? `; expires ${ttl}h after (re)subscribe` : '; pinned (never expires)'
+    }
     if (i >= 0) {
       // Re-subscribe = renew: the TTL clock restarts even if nothing changed.
       const e = { ...f.topics[i], subscribedAt: now }
       if (rawIg !== undefined) e.ignoreSenders = rawIg.map((x) => String(x).trim()).filter(Boolean)
       if (rawNote !== undefined) e.note = String(rawNote).trim().slice(0, 300)
+      if (rawTtl !== undefined) e.ttlHours = rawTtl
       const topics = [...f.topics]
       topics[i] = e
       writeFilter({ ...f, enabled: true, topics })
-      return text(`renewed subscription ${show(e)}${ttl} (current: ${list(topics)})${expiredNote}`)
+      return text(`renewed subscription ${show(e)}${ttlMsg(e)} (current: ${list(topics)})${expiredNote}`)
     }
     const entry = {
       topic,
       ignoreSenders: (rawIg ?? []).map((x) => String(x).trim()).filter(Boolean),
       note: rawNote === undefined ? '' : String(rawNote).trim().slice(0, 300),
+      ttlHours: rawTtl ?? null,
       subscribedAt: now,
       lastActivityAt: '',
     }
     const next = { ...f, enabled: true, topics: [...f.topics, entry] }
     writeFilter(next)
-    return text(`subscribed to ${show(entry)}${ttl} (current: ${list(next.topics)})${expiredNote}`)
+    return text(`subscribed to ${show(entry)}${ttlMsg(entry)} (current: ${list(next.topics)})${expiredNote}`)
   }
 
   if (name === 'webhook_unsubscribe') {
