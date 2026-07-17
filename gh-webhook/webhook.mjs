@@ -21,7 +21,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFile
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
-const VERSION = '0.5.1'
+const VERSION = '0.5.2'
 const PORT = Number(process.env.LOCAL_WEBHOOK_PORT ?? process.env.WEBHOOK_PORT ?? 8788)
 
 // All mutable state (secrets, source config, subscription filter) lives OUTSIDE
@@ -432,6 +432,22 @@ function summarizeGithub(event, p) {
       meta.action = s(p?.action)
       meta.number = s(p?.issue?.number)
       content = `comment ${s(p?.action)} on #${s(p?.issue?.number)} (${repo}) by ${sender}: body=${u(p?.comment?.body)}`
+      break
+    }
+    case 'pull_request_review': {
+      const pr = p?.pull_request
+      const rv = p?.review
+      meta.action = s(p?.action)
+      meta.number = s(pr?.number)
+      meta.state = s(rv?.state)
+      content = `review ${s(rv?.state)} (${s(p?.action)}) on PR #${s(pr?.number)} (${repo}) by ${sender}: title=${u(pr?.title)}${rv?.body ? ` body=${u(rv.body)}` : ''} ${s(rv?.html_url)}`
+      break
+    }
+    case 'pull_request_review_comment': {
+      const pr = p?.pull_request
+      meta.action = s(p?.action)
+      meta.number = s(pr?.number)
+      content = `review comment ${s(p?.action)} on PR #${s(pr?.number)} ${s(p?.comment?.path)} (${repo}) by ${sender}: body=${u(p?.comment?.body)} ${s(p?.comment?.html_url)}`
       break
     }
     case 'workflow_run': {
