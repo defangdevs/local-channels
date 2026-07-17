@@ -82,10 +82,35 @@ sender-ignore: their sender is merely who triggered the run, and muting your
 own login must not mute CI results for your own pushes.
 
 ```json
-{ "enabled": true, "topics": [
+{ "enabled": true, "ttlHours": 48, "topics": [
     "github:defangdevs/*",
-    { "topic": "github:defangdevs/claude-box", "ignoreSenders": ["@self"] } ] }
+    { "topic": "github:defangdevs/claude-box", "ignoreSenders": ["@self"],
+      "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
 ```
+
+### Subscription expiry and notes (0.5.0)
+
+Agent sessions come and go — context gets cleared, and a webhook landing days
+later in a fresh session is noise without the work that motivated it. So
+subscriptions **expire**: a topic that neither forwarded a delivery nor was
+re-subscribed within `ttlHours` (default 48; `0` disables) is pruned, at
+delivery time and on every tool call. Activity **renews** — any forwarded
+delivery bumps the entry's `lastActivityAt`, and calling `webhook_subscribe`
+again restarts the clock (and reports "renewed"). Hand-written entries without
+timestamps never expire until some write stamps them (`subscribedAt` is filled
+in on the next file write).
+
+`webhook_subscribe` also takes a `note` — a one-liner saying *why* the
+subscription exists ("waiting on Lio to wire the hook, issue 15"). It is echoed
+under every delivery on that topic:
+
+```
+[UNTRUSTED webhook:github — …] issue #15 closed on …
+[subscribed to github:owner/repo 26h ago: waiting on Lio to wire the hook, issue 15]
+```
+
+so a session that has since lost its context still knows what the event relates
+to. Omitting `note` on re-subscribe keeps the existing one; pass `""` to clear.
 
 ### Per-identity filters
 
