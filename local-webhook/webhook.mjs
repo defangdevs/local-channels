@@ -140,16 +140,31 @@ function verify(secret, sigHeader, body) {
 // trigger an expensive cold re-read. A topic expires ttlHours after it was last
 // (re)subscribed — per-entry ttlHours wins over the top-level default; 0 =
 // never (pin the box's own repos); pass a larger ttl_hours for a genuinely
-// multi-hour/day wait. Deliveries deliberately do NOT extend the clock: a
-// chatty repo (dependabot, CI) would otherwise keep a dead subscription alive
-// forever. Only an agent re-subscribing — expressing fresh interest — renews.
-// lastActivityAt is tracked for display only.
+// multi-hour/day wait.
+// A topic's clock resets on two things: (a) re-subscribing (fresh interest),
+// and (b) a "warm" delivery — an event arriving within WARM_WINDOW_MS of the
+// previous one, i.e. while the KV cache from handling that previous event is
+// still hot. Warm deliveries are cheap, so extending the window costs nothing
+// and keeps a subscription alive through a genuinely active streak. A delivery
+// arriving COLD (gap > the window, so it forced an expensive re-read) does NOT
+// reset the clock — otherwise a chatty repo (dependabot, sporadic CI) would
+// immortalise a dead subscription while every one of its stragglers billed a
+// full cold re-read. So renewal follows cache warmth, never raw event count.
+// Opt-in exception: an entry with renewOnEvent:true resets the clock on EVERY
+// delivery regardless of gap — for streams you intend to react to indefinitely
+// (pair with a generous ttlHours, or ttlHours:0 to also survive total silence).
+// lastActivityAt drives the warm/cold test and is shown for context.
 // The optional per-topic "note" (why this subscription exists) is echoed under
 // every delivery so a fresh-context session knows what the event relates to.
 const DEFAULT_TTL_HOURS = 1
+// A delivery is "warm" (and so renews the TTL) if it lands within this window
+// of the previous delivery — ~2× the ~5min prompt-cache TTL, enough slack that
+// a couple of slow turns don't break an active streak, still well short of a
+// cold re-read.
+const WARM_WINDOW_MS = 10 * 60 * 1000
 const FILTER_FILE = join(STATE_DIR, SELF ? `filter.${SELF}.json` : 'filter.json')
 const FILTER_COMMENT =
-  "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix 'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events like workflow_run are never sender-ignored) and expire ttlHours after subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; deliveries do NOT renew, only re-subscribing does; entries without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
+  "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix 'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events like workflow_run are never sender-ignored) and expire ttlHours after subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; entries without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
 
 // Sender-ignore never applies to these: their payload sender is merely who
 // triggered the run, while the content (CI verdict, deploy status) is news.
@@ -184,6 +199,7 @@ function normalizeEntry(t) {
       ignoreSenders: ig,
       note: typeof t.note === 'string' ? t.note.slice(0, 300) : '',
       ttlHours: typeof t.ttlHours === 'number' && t.ttlHours >= 0 ? t.ttlHours : null,
+      renewOnEvent: t.renewOnEvent === true,
       subscribedAt: iso(t.subscribedAt),
       lastActivityAt: iso(t.lastActivityAt),
     }
@@ -222,6 +238,7 @@ function writeFilter(f) {
     const o = { topic: e.topic, subscribedAt: e.subscribedAt || now }
     if (e.note) o.note = e.note
     if (e.ttlHours != null) o.ttlHours = e.ttlHours
+    if (e.renewOnEvent) o.renewOnEvent = true
     if (e.ignoreSenders.length) o.ignoreSenders = e.ignoreSenders
     if (e.lastActivityAt) o.lastActivityAt = e.lastActivityAt
     return o
@@ -232,9 +249,11 @@ function writeFilter(f) {
 }
 
 // ------------------------------------------------------------------ expiry ---
-// The clock runs from subscribedAt ONLY. lastActivityAt is display metadata —
-// if deliveries renewed the TTL, any repo with steady bot traffic (dependabot,
-// CI) would keep its subscription alive forever with no one working on it.
+// The clock runs from subscribedAt ONLY. routeEvent advances subscribedAt on a
+// warm delivery (or every delivery when renewOnEvent); a COLD straggler leaves
+// it untouched, so a repo with steady but sparse bot traffic (dependabot, CI)
+// still expires with no one working on it. lastActivityAt is the warm/cold
+// yardstick and display metadata — it never feeds expiry directly.
 function entryExpired(e, defaultTtl, nowMs) {
   const ttl = e.ttlHours ?? defaultTtl
   if (!ttl) return false // per-entry or global 0 = pinned
@@ -285,8 +304,11 @@ function entryForwards(e, sender, event) {
 
 // Decides forwarding AND prunes expired topics in one pass; the first matching
 // entry is returned so its note/age can be echoed to the session. Matching
-// entries get lastActivityAt stamped for display, but that does NOT feed the
-// TTL — see entryExpired. The write only happens when something changed.
+// entries get lastActivityAt stamped, and their TTL clock (subscribedAt) is
+// reset when the delivery is "warm" — within WARM_WINDOW_MS of the previous one
+// (or on every delivery when renewOnEvent). A cold straggler is forwarded but
+// does NOT renew — see the DEFAULT_TTL_HOURS comment for why. The write only
+// happens when something changed.
 function routeEvent(source, key, sender, event) {
   const f = readFilter()
   if (!f.enabled) return { forward: false }
@@ -305,6 +327,9 @@ function routeEvent(source, key, sender, event) {
       if (!matchTopic(source, key, e.topic) || !entryForwards(e, sender, event)) continue
       forward = true
       matched ??= e
+      const prev = Date.parse(e.lastActivityAt || '')
+      const warm = Number.isFinite(prev) && nowMs - prev < WARM_WINDOW_MS
+      if (e.renewOnEvent || warm) e.subscribedAt = new Date(nowMs).toISOString()
       e.lastActivityAt = new Date(nowMs).toISOString()
     }
   }
@@ -507,9 +532,11 @@ const INSTRUCTIONS =
   'when you start work on something whose events you want to see and unsubscribe when you wrap up. ' +
   'Pass a short note saying WHY you subscribed — it is echoed under every delivery, so a later ' +
   'session with cleared context knows what the event relates to. Subscriptions expire ' +
-  `${DEFAULT_TTL_HOURS}h after they were last (re)subscribed (deliveries do NOT extend this; ` +
-  'only re-subscribing renews). Pass ttl_hours to override per topic: longer when a response is ' +
-  'expected to take days, 0 to pin a subscription forever (reserved for this box\'s own repos). ' +
+  `${DEFAULT_TTL_HOURS}h after their clock was last reset — re-subscribing resets it, and so does a ` +
+  '"warm" delivery (one arriving <10min after the previous, while the cache is still hot) so an active ' +
+  'streak stays alive; a cold straggler is delivered but does not renew. Pass ttl_hours to override per ' +
+  "topic (longer for a multi-day wait, 0 to pin forever — this box's own repos), or renew_on_event:true " +
+  'to reset the clock on EVERY delivery for a stream you mean to follow indefinitely. ' +
   'To mute echoes of your own actions (your comments, your issue edits) pass ignore_senders — e.g. ' +
   'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe; CI-outcome ' +
   'events (workflow_run etc.) are always delivered regardless. ' +
@@ -525,8 +552,9 @@ const TOOLS = [
       '(whole source), or "*" (everything); a bare "owner/repo" means github:owner/repo. Call when ' +
       'starting work on something whose events you want in real time (pushes, PR reviews, workflow ' +
       'runs, comments, payments, ...). Subscriptions persist across sessions but EXPIRE ' +
-      `${DEFAULT_TTL_HOURS}h after the last (re)subscribe — deliveries do not extend the clock; ` +
-      're-subscribing renews it and updates note / ignore_senders / ttl_hours in place.',
+      `${DEFAULT_TTL_HOURS}h after the clock was last reset — re-subscribing resets it (and updates note / ` +
+      'ignore_senders / ttl_hours / renew_on_event in place), as does a "warm" delivery <10min after the ' +
+      'previous; renew_on_event:true resets it on every delivery instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -545,9 +573,19 @@ const TOOLS = [
           type: 'number',
           description:
             `Per-topic expiry override in hours (default: the filter file's ttlHours, ${DEFAULT_TTL_HOURS} ` +
-            'unless changed). Counted from the last (re)subscribe; deliveries do not extend it. Use a ' +
-            "larger value when the awaited response will take days, 0 to pin forever (this box's own " +
-            'repos). Omit to keep the existing override on renew.',
+            'unless changed). Counted from the last clock reset — re-subscribe, or a "warm" delivery ' +
+            '(one arriving <10min after the previous, while the cache is still hot). A larger value suits ' +
+            "an awaited response that will take days; 0 pins forever (this box's own repos). Omit to keep " +
+            'the existing override on renew.',
+        },
+        renew_on_event: {
+          type: 'boolean',
+          description:
+            'Default false: the TTL clock resets only on re-subscribe or a warm delivery, so a stream of ' +
+            'sporadic (cold) events still lets the subscription expire. Set true when you intend to react ' +
+            'to this topic indefinitely — every delivery then resets the clock regardless of gap, so the ' +
+            'subscription lives as long as events keep arriving within ttl_hours (pair with ttl_hours:0 to ' +
+            'also survive total silence). Omit to keep the existing setting on renew.',
         },
         ignore_senders: {
           type: 'array',
@@ -602,6 +640,7 @@ function callTool(params) {
       topic: e.topic,
       ...(e.note ? { note: e.note } : {}),
       ...(e.ttlHours != null ? { ttlHours: e.ttlHours } : {}),
+      ...(e.renewOnEvent ? { renewOnEvent: true } : {}),
       ...(e.ignoreSenders.length ? { ignoreSenders: e.ignoreSenders } : {}),
       ...(e.subscribedAt ? { subscribed: `${ageStr(e.subscribedAt, nowMs)} ago` } : {}),
       ...(e.lastActivityAt ? { lastActivity: `${ageStr(e.lastActivityAt, nowMs)} ago` } : {}),
@@ -634,12 +673,17 @@ function callTool(params) {
     if (rawTtl !== undefined && !(typeof rawTtl === 'number' && rawTtl >= 0)) {
       return text('error: ttl_hours must be a number >= 0 (0 = never expire)')
     }
+    const rawRenew = params.arguments?.renew_on_event
+    if (rawRenew !== undefined && typeof rawRenew !== 'boolean') {
+      return text('error: renew_on_event must be a boolean')
+    }
     const rawNote = params.arguments?.note
     const now = new Date(nowMs).toISOString()
     const i = f.topics.findIndex((e) => eq(e.topic, topic))
     const ttlMsg = (e) => {
       const ttl = e.ttlHours ?? f.ttlHours
-      return ttl ? `; expires ${ttl}h after (re)subscribe` : '; pinned (never expires)'
+      const base = ttl ? `; expires ${ttl}h after (re)subscribe` : '; pinned (never expires)'
+      return e.renewOnEvent ? `${base}, renews on every event` : base
     }
     if (i >= 0) {
       // Re-subscribe = renew: the TTL clock restarts even if nothing changed.
@@ -647,6 +691,7 @@ function callTool(params) {
       if (rawIg !== undefined) e.ignoreSenders = rawIg.map((x) => String(x).trim()).filter(Boolean)
       if (rawNote !== undefined) e.note = String(rawNote).trim().slice(0, 300)
       if (rawTtl !== undefined) e.ttlHours = rawTtl
+      if (rawRenew !== undefined) e.renewOnEvent = rawRenew
       const topics = [...f.topics]
       topics[i] = e
       writeFilter({ ...f, enabled: true, topics })
@@ -657,6 +702,7 @@ function callTool(params) {
       ignoreSenders: (rawIg ?? []).map((x) => String(x).trim()).filter(Boolean),
       note: rawNote === undefined ? '' : String(rawNote).trim().slice(0, 300),
       ttlHours: rawTtl ?? null,
+      renewOnEvent: rawRenew === true,
       subscribedAt: now,
       lastActivityAt: '',
     }

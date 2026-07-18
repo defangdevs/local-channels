@@ -96,19 +96,32 @@ Agent sessions come and go — context gets cleared, and a webhook landing
 later in a fresh session is noise without the work that motivated it. Worse, a
 late delivery lands after the session's KV cache has aged out, so re-reading
 the whole conversation to handle one stale event burns a large pile of tokens.
-So subscriptions **expire**, `ttlHours` after they were last (re)subscribed
+So subscriptions **expire**, `ttlHours` after their clock was last reset
 (top-level default **1** — chosen to track how long the KV cache stays warm, so
 a straggler event can't trigger an expensive cold re-read; per-entry `ttlHours`
 overrides it; `0` = pinned, never expires). Expired topics are pruned at
 delivery time and on every tool call.
 
-Only **re-subscribing** renews the clock — deliveries deliberately do *not*:
-a repo with steady bot traffic (dependabot, CI) would otherwise keep a dead
-subscription alive forever. `lastActivityAt` is recorded for display only.
-`webhook_subscribe` takes `ttl_hours` to set the per-topic override: larger
-for a genuinely multi-hour or multi-day wait, `0` to pin the box's own repos.
-Hand-written entries without timestamps never expire until some write stamps
-them (`subscribedAt` is filled in on the next file write).
+Two things reset the clock:
+
+1. **Re-subscribing** — expressing fresh interest.
+2. A **warm delivery** — an event arriving within ~10 min (`WARM_WINDOW_MS`,
+   ~2× the prompt-cache TTL) of the previous one, i.e. while the cache from
+   handling that previous event is still hot. Warm deliveries are cheap, so
+   extending the window costs nothing and keeps a subscription alive through a
+   genuinely active streak. A **cold** straggler (gap beyond the window — the
+   kind that forces the expensive re-read) is delivered but does *not* renew, so
+   a repo with sparse bot traffic (dependabot, sporadic CI) still expires with
+   no one working on it. Renewal follows cache warmth, never raw event count.
+
+For a stream you intend to react to **indefinitely**, pass
+`renew_on_event: true`: every delivery then resets the clock regardless of gap,
+so the subscription lives as long as events keep arriving within `ttl_hours`
+(pair with `ttl_hours: 0` to also survive total silence). `webhook_subscribe`
+also takes `ttl_hours` to set the per-topic override — larger for a genuinely
+multi-hour or multi-day wait, `0` to pin the box's own repos. Hand-written
+entries without timestamps never expire until some write stamps them
+(`subscribedAt` is filled in on the next file write).
 
 `webhook_subscribe` also takes a `note` — a one-liner saying *why* the
 subscription exists ("waiting on Lio to wire the hook, issue 15"). It is echoed
