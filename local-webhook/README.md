@@ -82,7 +82,7 @@ sender-ignore: their sender is merely who triggered the run, and muting your
 own login must not mute CI results for your own pushes.
 
 ```json
-{ "enabled": true, "ttlHours": 24, "topics": [
+{ "enabled": true, "ttlHours": 1, "topics": [
     "github:defangdevs/*",
     { "topic": "github:me/my-config-repo", "ttlHours": 0,
       "note": "this box's own repo — pinned", "subscribedAt": "2026-07-16T00:00:00Z" },
@@ -92,17 +92,21 @@ own login must not mute CI results for your own pushes.
 
 ### Subscription expiry and notes (0.5.x)
 
-Agent sessions come and go — context gets cleared, and a webhook landing days
-later in a fresh session is noise without the work that motivated it. So
-subscriptions **expire**, `ttlHours` after they were last (re)subscribed
-(top-level default 24; per-entry `ttlHours` overrides it; `0` = pinned, never
-expires). Expired topics are pruned at delivery time and on every tool call.
+Agent sessions come and go — context gets cleared, and a webhook landing
+later in a fresh session is noise without the work that motivated it. Worse, a
+late delivery lands after the session's KV cache has aged out, so re-reading
+the whole conversation to handle one stale event burns a large pile of tokens.
+So subscriptions **expire**, `ttlHours` after they were last (re)subscribed
+(top-level default **1** — chosen to track how long the KV cache stays warm, so
+a straggler event can't trigger an expensive cold re-read; per-entry `ttlHours`
+overrides it; `0` = pinned, never expires). Expired topics are pruned at
+delivery time and on every tool call.
 
 Only **re-subscribing** renews the clock — deliveries deliberately do *not*:
 a repo with steady bot traffic (dependabot, CI) would otherwise keep a dead
 subscription alive forever. `lastActivityAt` is recorded for display only.
-`webhook_subscribe` takes `ttl_hours` to set the per-topic override: longer
-when the awaited response will take days, `0` to pin the box's own repos.
+`webhook_subscribe` takes `ttl_hours` to set the per-topic override: larger
+for a genuinely multi-hour or multi-day wait, `0` to pin the box's own repos.
 Hand-written entries without timestamps never expire until some write stamps
 them (`subscribedAt` is filled in on the next file write).
 

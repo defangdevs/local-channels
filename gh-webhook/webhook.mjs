@@ -130,16 +130,23 @@ function verify(secret, sigHeader, body) {
 // Missing file, bad JSON, or missing keys fail OPEN (forward everything).
 //
 // Subscriptions EXPIRE: sessions come and go (context gets cleared), and a
-// webhook landing days later in a fresh session is noise without the work that
-// motivated it. A topic expires ttlHours after it was last (re)subscribed —
-// per-entry ttlHours wins over the top-level default; 0 = never (pin the
-// box's own repos). Deliveries deliberately do NOT extend the clock: a chatty
-// repo (dependabot, CI) would otherwise keep a dead subscription alive
+// webhook landing later in a fresh session is noise without the work that
+// motivated it. Worse, a late delivery lands after the session's KV cache has
+// aged out, so re-reading the whole conversation to process one stale event
+// burns a large pile of tokens — the exact cost the default TTL exists to
+// bound. It's set to ~1h to track how long the cache stays warm: while you're
+// actively working (cache hot) deliveries are cheap; once you've been idle past
+// the cache window the subscription has lapsed, so a straggler event can't
+// trigger an expensive cold re-read. A topic expires ttlHours after it was last
+// (re)subscribed — per-entry ttlHours wins over the top-level default; 0 =
+// never (pin the box's own repos); pass a larger ttl_hours for a genuinely
+// multi-hour/day wait. Deliveries deliberately do NOT extend the clock: a
+// chatty repo (dependabot, CI) would otherwise keep a dead subscription alive
 // forever. Only an agent re-subscribing — expressing fresh interest — renews.
 // lastActivityAt is tracked for display only.
 // The optional per-topic "note" (why this subscription exists) is echoed under
 // every delivery so a fresh-context session knows what the event relates to.
-const DEFAULT_TTL_HOURS = 24
+const DEFAULT_TTL_HOURS = 1
 const FILTER_FILE = join(STATE_DIR, SELF ? `filter.${SELF}.json` : 'filter.json')
 const FILTER_COMMENT =
   "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix 'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events like workflow_run are never sender-ignored) and expire ttlHours after subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; deliveries do NOT renew, only re-subscribing does; entries without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
