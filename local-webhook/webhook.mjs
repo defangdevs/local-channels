@@ -21,7 +21,16 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFile
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
-const VERSION = '0.6.0'
+const VERSION = '0.7.0'
+// One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
+// inside a Claude Code session that loaded the plugin; a codex session, a plain
+// shell, or a script has no way to reach them. Same code, same filter files, so
+// `webhook.mjs subscribe owner/repo` from any shell is exactly equivalent to the
+// agent calling webhook_subscribe. A CLI invocation must touch NO listener: it
+// is not a session peer (no IPC socket to claim, no stdio loop) and must never
+// steal the ingress from the daemon — it reads/writes the filter file and exits.
+const CLI_ARGV = process.argv.slice(2)
+const CLI = CLI_ARGV.length > 0
 // Loopback TCP ingress port for the legacy single-file setup where each session
 // serves its own HTTP receiver and races for the port. Set to 0 to run NO TCP
 // ingress — agent-box session peers do this: a separate receiver daemon (see
@@ -418,8 +427,10 @@ function broadcast(env) {
   }
 }
 
-// Only a session peer opens an inbound socket; the daemon merely broadcasts.
-if (!RECEIVER_ONLY) {
+// Only a session peer opens an inbound socket; the daemon merely broadcasts,
+// and a CLI invocation is not a peer at all (it would claim — then unlink — the
+// socket of whatever PID it happens to reuse).
+if (!RECEIVER_ONLY && !CLI) {
   try {
     unlinkSync(IPC_SOCK) // PID reuse after a crash: reclaim our own path
   } catch {}
@@ -751,8 +762,9 @@ function callTool(params) {
 
 // MCP stdio framing: one JSON-RPC message per newline-delimited line. The
 // daemon has no session on stdin (systemd wires it to /dev/null, whose
-// immediate EOF would otherwise exit us at once), so it skips this entirely.
-if (!RECEIVER_ONLY) {
+// immediate EOF would otherwise exit us at once), so it skips this entirely —
+// as does the CLI, which reads its request from argv, not from a peer.
+if (!RECEIVER_ONLY && !CLI) {
   let stdinBuf = ''
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', (chunk) => {
@@ -902,4 +914,114 @@ httpd.on('error', (e) => {
   }
   console.error(`local-webhook: HTTP listener disabled (${e?.code ?? e?.message}): another process owns ${where}; MCP tools still work, deliveries arrive over IPC`)
 })
-listenIngress()
+if (!CLI) listenIngress()
+
+// -------------------------------------------------------------------- CLI ---
+// `webhook.mjs <command>` — the same three operations as the MCP tools, for
+// callers that have no MCP client: a codex session, a shell session, a script,
+// or an agent-box `agent-box-webhook` wrapper. Deliberately a thin shim over
+// callTool() so CLI and tool paths can never drift on TTL/renew semantics.
+const CLI_USAGE = `local-webhook ${VERSION} — subscribe a session to webhook topics.
+
+usage: webhook.mjs subscribe TOPIC [--note TEXT] [--ttl HOURS]
+                                   [--renew-on-event] [--ignore-sender LOGIN]...
+       webhook.mjs unsubscribe TOPIC
+       webhook.mjs ls
+       webhook.mjs status
+
+TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix),
+"github:*" (whole source) or "*" (everything). A bare "owner/repo" means github.
+
+  --note TEXT          why you subscribed; echoed under every delivery so a
+                       fresh-context session knows what the event relates to
+  --ttl HOURS          per-topic expiry, counted from the last (re)subscribe or
+                       warm delivery (0 = pin forever). Default: the filter
+                       file's ttlHours (${DEFAULT_TTL_HOURS})
+  --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
+                       ones — for a stream you mean to follow indefinitely
+  --ignore-sender L    drop events on this topic from sender L as echoes of your
+                       own actions (repeatable; "@self" = $LOCAL_WEBHOOK_SELF).
+                       CI-outcome events are always delivered anyway.
+
+Subscriptions are per session (LOCAL_WEBHOOK_SESSION) and hot-reloaded, so this
+takes effect on the next delivery with no session restart.`
+
+function runCli(argv) {
+  const die = (msg) => {
+    console.error(`local-webhook: ${msg}`)
+    process.exit(2)
+  }
+  const cmd = argv[0]
+  if (cmd === '-h' || cmd === '--help' || cmd === 'help') return console.log(CLI_USAGE)
+  if (cmd === '-V' || cmd === '--version') return console.log(VERSION)
+
+  if (cmd === 'status') {
+    const { defaultSource, sources } = readSources()
+    const f = readFilter()
+    // Secrets stay out of this: only which sources are configured, and whether
+    // each has a usable secret (an unconfigured source rejects every delivery).
+    console.log(
+      JSON.stringify(
+        {
+          version: VERSION,
+          stateDir: STATE_DIR,
+          session: SESSION || null,
+          self: SELF || null,
+          filterFile: FILTER_FILE,
+          enabled: f.enabled,
+          topicCount: f.topics.length,
+          defaultSource,
+          sources: Object.fromEntries(
+            Object.entries(sources).map(([n, src]) => [n, { hasSecret: Boolean(sourceSecret(src)) }])
+          ),
+        },
+        null,
+        2
+      )
+    )
+    return
+  }
+
+  const toolFor = { subscribe: 'webhook_subscribe', unsubscribe: 'webhook_unsubscribe', ls: 'webhook_subscriptions', subscriptions: 'webhook_subscriptions' }
+  const tool = toolFor[cmd]
+  if (!tool) die(`unknown command "${cmd}"\n\n${CLI_USAGE}`)
+
+  const args = {}
+  const rest = argv.slice(1)
+  const ignoreSenders = []
+  let sawIgnore = false
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]
+    // A flag's value is the next argv element; missing one is an error rather
+    // than a silently-empty note/ttl.
+    const value = () => {
+      if (i + 1 >= rest.length) die(`${a} needs a value`)
+      return rest[++i]
+    }
+    if (a === '--note') args.note = value()
+    else if (a === '--ttl' || a === '--ttl-hours') {
+      const n = Number(value())
+      if (!Number.isFinite(n) || n < 0) die('--ttl must be a number >= 0 (0 = never expire)')
+      args.ttl_hours = n
+    } else if (a === '--renew-on-event') args.renew_on_event = true
+    else if (a === '--no-renew-on-event') args.renew_on_event = false
+    else if (a === '--ignore-sender' || a === '--ignore-senders') {
+      sawIgnore = true
+      // Accept both repeated flags and one comma-separated list.
+      for (const part of value().split(',')) if (part.trim()) ignoreSenders.push(part.trim())
+    } else if (a.startsWith('-')) die(`unknown option "${a}"\n\n${CLI_USAGE}`)
+    else if (args.topic === undefined) args.topic = a
+    else die(`unexpected argument "${a}"`)
+  }
+  if (sawIgnore) args.ignore_senders = ignoreSenders
+  if (tool !== 'webhook_subscriptions' && args.topic === undefined) die(`${cmd} needs a TOPIC\n\n${CLI_USAGE}`)
+
+  const res = callTool({ name: tool, arguments: args })
+  const text = res.content.map((c) => c.text).join('\n')
+  console.log(text)
+  // callTool reports argument/pattern problems in-band (the MCP convention);
+  // for a CLI those must be a non-zero exit so callers and `set -e` notice.
+  if (/^error: /.test(text)) process.exit(1)
+}
+
+if (CLI) runCli(CLI_ARGV)
