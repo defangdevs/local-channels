@@ -21,8 +21,20 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFile
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
-const VERSION = '0.5.2'
+const VERSION = '0.6.0'
+// Loopback TCP ingress port for the legacy single-file setup where each session
+// serves its own HTTP receiver and races for the port. Set to 0 to run NO TCP
+// ingress — agent-box session peers do this: a separate receiver daemon (see
+// RECEIVER_ONLY) owns the box's one ingress socket and fans events out to them.
 const PORT = Number(process.env.LOCAL_WEBHOOK_PORT ?? process.env.WEBHOOK_PORT ?? 8788)
+
+// Receiver-only (daemon) mode: run the HTTP ingress and fan out to session
+// peers, but attach to NO session of its own — no MCP stdio loop, no local
+// delivery. agent-box runs exactly one such daemon per user (systemd), so the
+// box has ONE stable webhook endpoint instead of "whichever session won the
+// port race"; if that session exited, deliveries went dark until another bound.
+// With the daemon owning the ingress, sessions always run as pure IPC peers.
+const RECEIVER_ONLY = /^(1|true|yes|on)$/i.test((process.env.LOCAL_WEBHOOK_RECEIVER_ONLY ?? '').trim())
 
 // All mutable state (secrets, source config, subscription filter) lives OUTSIDE
 // the plugin directory: plugins are installed into a managed cache that can be
@@ -31,10 +43,18 @@ const STATE_DIR = process.env.LOCAL_WEBHOOK_STATE_DIR ?? join(homedir(), '.local
 mkdirSync(STATE_DIR, { recursive: true })
 
 // Identity this session acts as (e.g. the GitHub login it uses for writes).
-// Two concurrent sessions acting as different users set different values and
-// get INDEPENDENT filter files, so each can mute its own echoes without muting
-// the other's view of the same repo. Unset → the shared default filter.json.
+// Used ONLY to resolve "@self" in a subscription's ignoreSenders — it is no
+// longer the filter-file key (see SESSION below), so two sessions acting as the
+// same login still get independent subscriptions.
 const SELF = (process.env.LOCAL_WEBHOOK_SELF ?? '').trim().replace(/[^A-Za-z0-9._-]/g, '')
+
+// Per-session subscription scope. Each session subscribes/unsubscribes on its
+// own, so its filter file must be its own: agent-box sets a unique
+// LOCAL_WEBHOOK_SESSION per session (the supervisor's session id). The daemon
+// broadcasts every verified event to all sessions; each applies its own filter.
+// Falls back to SELF, then to the shared default, so the legacy setup is
+// unchanged when neither is set.
+const SESSION = (process.env.LOCAL_WEBHOOK_SESSION ?? '').trim().replace(/[^A-Za-z0-9._-]/g, '')
 
 const s = (v) => (v == null ? '' : String(v)).slice(0, 200)
 
@@ -162,7 +182,8 @@ const DEFAULT_TTL_HOURS = 1
 // a couple of slow turns don't break an active streak, still well short of a
 // cold re-read.
 const WARM_WINDOW_MS = 10 * 60 * 1000
-const FILTER_FILE = join(STATE_DIR, SELF ? `filter.${SELF}.json` : 'filter.json')
+const FILTER_KEY = SESSION || SELF
+const FILTER_FILE = join(STATE_DIR, FILTER_KEY ? `filter.${FILTER_KEY}.json` : 'filter.json')
 const FILTER_COMMENT =
   "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix 'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events like workflow_run are never sender-ignored) and expire ttlHours after subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; entries without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
 
@@ -342,13 +363,15 @@ function routeEvent(source, key, sender, event) {
 }
 
 // ---------------------------------------------------------------- fan-out ---
-// Only one instance can own the HTTP port, but every concurrent session runs
-// its own copy of this server and deserves the deliveries — with ITS OWN
-// filter (sessions may act as different users, so what is echo-noise to one is
-// signal to another). Each instance therefore listens on a per-PID unix socket
-// under STATE_DIR/instances/; the port owner verifies HMAC once, handles the
-// event locally, and re-broadcasts the normalized envelope to every peer
-// socket. Peers apply their own filter before emitting to their session.
+// One process owns the HTTP ingress (the RECEIVER_ONLY daemon on agent-box, or
+// whichever session won the port race in the legacy setup); every session runs
+// as a peer that deserves the deliveries — with ITS OWN filter (sessions
+// subscribe independently, and may act as different users, so what is echo-noise
+// to one is signal to another). Each peer listens on a per-PID unix socket under
+// STATE_DIR/instances/; the ingress owner verifies HMAC once and re-broadcasts
+// the normalized envelope to every peer socket. Peers apply their own filter
+// before emitting to their session. The daemon has no session of its own, so it
+// only broadcasts (see deliver()) and opens no peer socket of its own.
 // Stale sockets from crashed instances are unlinked on first failed connect.
 const INSTANCE_DIR = join(STATE_DIR, 'instances')
 mkdirSync(INSTANCE_DIR, { recursive: true, mode: 0o700 })
@@ -395,35 +418,38 @@ function broadcast(env) {
   }
 }
 
-try {
-  unlinkSync(IPC_SOCK) // PID reuse after a crash: reclaim our own path
-} catch {}
-const ipc = createIpcServer((conn) => {
-  let buf = ''
-  conn.setEncoding('utf8')
-  conn.on('data', (chunk) => {
-    buf += chunk
-    let nl
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).trim()
-      buf = buf.slice(nl + 1)
-      if (!line) continue
-      try {
-        handleEvent(JSON.parse(line))
-      } catch (e) {
-        console.error(`local-webhook: bad ipc line: ${e?.message ?? e}`)
-      }
-    }
-  })
-  conn.on('error', () => {})
-})
-ipc.on('error', (e) => console.error(`local-webhook: ipc listener failed (${e?.code ?? e?.message})`))
-ipc.listen(IPC_SOCK)
-process.on('exit', () => {
+// Only a session peer opens an inbound socket; the daemon merely broadcasts.
+if (!RECEIVER_ONLY) {
   try {
-    unlinkSync(IPC_SOCK)
+    unlinkSync(IPC_SOCK) // PID reuse after a crash: reclaim our own path
   } catch {}
-})
+  const ipc = createIpcServer((conn) => {
+    let buf = ''
+    conn.setEncoding('utf8')
+    conn.on('data', (chunk) => {
+      buf += chunk
+      let nl
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim()
+        buf = buf.slice(nl + 1)
+        if (!line) continue
+        try {
+          handleEvent(JSON.parse(line))
+        } catch (e) {
+          console.error(`local-webhook: bad ipc line: ${e?.message ?? e}`)
+        }
+      }
+    })
+    conn.on('error', () => {})
+  })
+  ipc.on('error', (e) => console.error(`local-webhook: ipc listener failed (${e?.code ?? e?.message})`))
+  ipc.listen(IPC_SOCK)
+  process.on('exit', () => {
+    try {
+      unlinkSync(IPC_SOCK)
+    } catch {}
+  })
+}
 
 // ------------------------------------------------------------- formatters ---
 // Human-readable one-liner + routing meta per event. meta keys must be
@@ -723,27 +749,31 @@ function callTool(params) {
   return text(`error: unknown tool ${name}`)
 }
 
-// MCP stdio framing: one JSON-RPC message per newline-delimited line.
-let stdinBuf = ''
-process.stdin.setEncoding('utf8')
-process.stdin.on('data', (chunk) => {
-  stdinBuf += chunk
-  let nl
-  while ((nl = stdinBuf.indexOf('\n')) >= 0) {
-    const line = stdinBuf.slice(0, nl).trim()
-    stdinBuf = stdinBuf.slice(nl + 1)
-    if (!line) continue
-    let msg
-    try {
-      msg = JSON.parse(line)
-    } catch {
-      continue
+// MCP stdio framing: one JSON-RPC message per newline-delimited line. The
+// daemon has no session on stdin (systemd wires it to /dev/null, whose
+// immediate EOF would otherwise exit us at once), so it skips this entirely.
+if (!RECEIVER_ONLY) {
+  let stdinBuf = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => {
+    stdinBuf += chunk
+    let nl
+    while ((nl = stdinBuf.indexOf('\n')) >= 0) {
+      const line = stdinBuf.slice(0, nl).trim()
+      stdinBuf = stdinBuf.slice(nl + 1)
+      if (!line) continue
+      let msg
+      try {
+        msg = JSON.parse(line)
+      } catch {
+        continue
+      }
+      handleRpc(msg)
     }
-    handleRpc(msg)
-  }
-})
-// The spawning claude session closing stdin is the shutdown signal.
-process.stdin.on('end', () => process.exit(0))
+  })
+  // The spawning claude session closing stdin is the shutdown signal.
+  process.stdin.on('end', () => process.exit(0))
+}
 
 function handleRpc(msg) {
   if (msg.id === undefined || msg.id === null) return // notification — nothing to do
@@ -807,7 +837,7 @@ function deliver(req, res, body) {
   // Verified once here, then fanned out; each instance (this one included)
   // applies its own filter, so the HTTP status no longer reflects filtering.
   const env = { source: name, format, event, key, sender, delivery, payload }
-  handleEvent(env)
+  if (!RECEIVER_ONLY) handleEvent(env) // legacy: the ingress-owning session gets it too
   broadcast(env)
   return done(200, 'ok')
 }
@@ -831,10 +861,45 @@ const httpd = createServer((req, res) => {
   })
 })
 
-// Each claude session spawns its own copy of this server, but only one can own
-// the port. Losing the race must not kill the process — the MCP side (tools,
-// instructions) still works; deliveries just go to the session that won.
+// Where the ingress listens, most-specific first:
+//   1. systemd socket activation (LISTEN_FDS) — the box's .socket unit pre-binds
+//      a unix socket 0660 <user>:caddy and passes it on fd 3, so only the user
+//      and caddy can POST here. This is how agent-box runs the daemon.
+//   2. LOCAL_WEBHOOK_HTTP_SOCK — an explicit unix socket path (tests / non-systemd
+//      supervisors). We reclaim a stale socket left by a crash before binding.
+//   3. loopback TCP on PORT — the legacy single-file setup. PORT=0 disables it,
+//      leaving a session as a pure IPC peer with no ingress of its own.
+const SD_LISTEN_FDS_START = 3
+const socketActivated =
+  Number(process.env.LISTEN_FDS ?? 0) > 0 &&
+  (!process.env.LISTEN_PID || process.env.LISTEN_PID === String(process.pid))
+const INGRESS_DESC = socketActivated
+  ? 'the socket-activated fd'
+  : process.env.LOCAL_WEBHOOK_HTTP_SOCK
+    ? process.env.LOCAL_WEBHOOK_HTTP_SOCK
+    : `127.0.0.1:${PORT}`
+function listenIngress() {
+  if (socketActivated) return httpd.listen({ fd: SD_LISTEN_FDS_START })
+  const sock = process.env.LOCAL_WEBHOOK_HTTP_SOCK
+  if (sock) {
+    try {
+      unlinkSync(sock) // reclaim a stale socket from a crashed owner
+    } catch {}
+    return httpd.listen(sock)
+  }
+  if (PORT > 0) return httpd.listen(PORT, '127.0.0.1')
+  // No ingress (agent-box session peer): nothing to bind; events arrive by IPC.
+}
+
+// Losing the ingress race must not kill a session: the MCP side (tools,
+// instructions) still works and deliveries arrive over IPC from whoever owns
+// the ingress. The daemon, by contrast, exists only to serve the ingress.
 httpd.on('error', (e) => {
-  console.error(`local-webhook: HTTP listener disabled (${e?.code ?? e?.message}): another session likely owns 127.0.0.1:${PORT}; MCP tools still work, deliveries go to that session`)
+  const where = INGRESS_DESC
+  if (RECEIVER_ONLY) {
+    console.error(`local-webhook: receiver daemon could not bind ${where} (${e?.code ?? e?.message}); exiting`)
+    process.exit(1)
+  }
+  console.error(`local-webhook: HTTP listener disabled (${e?.code ?? e?.message}): another process owns ${where}; MCP tools still work, deliveries arrive over IPC`)
 })
-httpd.listen(PORT, '127.0.0.1')
+listenIngress()

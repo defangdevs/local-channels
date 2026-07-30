@@ -14,23 +14,34 @@ Single dependency-free file (`webhook.mjs`); runs under stock `node` (≥18) or
 
 ```
 GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
-                                        │ plain HTTP
+                                        │ plain HTTP (unix socket or 127.0.0.1:8788)
                                         ▼
-                              127.0.0.1:8788  webhook.mjs ──stdio/MCP──> claude session A
+                              webhook.mjs  (ingress owner: verifies HMAC once)
                                         │ unix-socket fan-out
-                                        ▼
-                    <state>/instances/<pid>.sock  webhook.mjs ──stdio/MCP──> claude session B
+                    ┌───────────────────┼───────────────────┐
+                    ▼                    ▼                    ▼
+     <state>/instances/<pid>.sock   …/<pid>.sock         …/<pid>.sock
+       webhook.mjs (session A)    webhook.mjs (B)     webhook.mjs (C)
+         ──stdio/MCP──> claude       ──> claude          ──> claude
                                         │
                           ~/.local/state/local-webhook/
-                            sources.json          (who may deliver, secrets)
-                            filter.json           (topic subscriptions)
-                            filter.<self>.json    (per-identity subscriptions)
+                            sources.json           (who may deliver, secrets)
+                            filter.json            (default subscriptions)
+                            filter.<session>.json  (per-session subscriptions)
 ```
 
-- Each claude session spawns its own copy (it's an MCP server). Only one wins
-  the HTTP port; it verifies the HMAC once and re-broadcasts the event to every
-  other live instance over per-PID unix sockets, so **all** concurrent sessions
-  receive deliveries, each applying its **own** filter.
+- The **ingress owner** verifies the HMAC once and re-broadcasts each event to
+  every live session over per-PID unix sockets, so **all** concurrent sessions
+  receive deliveries, each applying its **own** filter. Two deployment shapes:
+  - **Legacy / single-file:** each session spawns its own copy and races for the
+    loopback port; the winner is the ingress owner (and also delivers to itself).
+  - **Daemon (agent-box):** one `LOCAL_WEBHOOK_RECEIVER_ONLY=1` process owns the
+    ingress (a systemd-socket-activated unix socket) and has no session of its
+    own; every session runs with `LOCAL_WEBHOOK_PORT=0` as a pure IPC peer. This
+    keeps the box's one webhook endpoint up regardless of which sessions exist.
+- Subscriptions are **per session**: set `LOCAL_WEBHOOK_SESSION=<id>` and each
+  session gets its own `filter.<session>.json`, so a `webhook_subscribe` in one
+  session never leaks into a sibling that happens to act as the same identity.
 - Auth fails **closed** (unknown source / missing secret / bad signature →
   reject). The topic filter fails **open** (missing or corrupt `filter.json`
   → forward everything) so a botched edit degrades to noise, not silence.
@@ -163,7 +174,14 @@ header names (e.g. `x-signature`), set `signatureHeader`.
 
 | var | default | |
 |---|---|---|
-| `LOCAL_WEBHOOK_PORT` (or legacy `WEBHOOK_PORT`) | `8788` | HTTP listen port, 127.0.0.1 only |
-| `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets + filter |
-| `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; selects `filter.<self>.json` and resolves `"@self"` in ignore lists |
+| `LOCAL_WEBHOOK_PORT` (or legacy `WEBHOOK_PORT`) | `8788` | loopback TCP ingress port; `0` = no TCP ingress (pure IPC peer) |
+| `LOCAL_WEBHOOK_HTTP_SOCK` | — | listen for the HTTP ingress on this unix socket path instead of TCP (stale socket reclaimed on start) |
+| `LOCAL_WEBHOOK_RECEIVER_ONLY` | — | `1`/`true` = daemon mode: own the ingress and fan out to peers, but no session of its own (no MCP stdio, no self-delivery) |
+| `LOCAL_WEBHOOK_SESSION` | — | per-session subscription scope; selects `filter.<session>.json` (falls back to `SELF`, then default) |
+| `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets + filters (must be shared across a box's daemon + sessions for fan-out) |
+| `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; resolves `"@self"` in ignore lists (no longer the filter-file key) |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source if `sources.json` is absent |
+
+When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress
+adopts the passed fd (fd 3) and both `LOCAL_WEBHOOK_HTTP_SOCK` and
+`LOCAL_WEBHOOK_PORT` are ignored — the `.socket` unit owns the path and perms.
