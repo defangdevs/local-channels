@@ -8,8 +8,10 @@ session that spawned it. Ships MCP tools (`webhook_subscribe`,
 topics reach it — hot-reloaded per delivery, no session restart needed — plus an
 equivalent [CLI](#cli) for callers with no MCP client.
 
-Single dependency-free file (`webhook.mjs`); runs under stock `node` (≥18) or
-`bun`. No `node_modules`, no build step.
+Single dependency-free file (`webhook.py`); runs under the stock `python3`
+(≥3.9) that RHEL 9 and Ubuntu server images already ship. No pip packages, no
+build step. (Until 0.8.0 this was `webhook.mjs` under node/bun — the Python
+port removed the only runtime dependency the plugin had.)
 
 ## How it fits together
 
@@ -17,12 +19,12 @@ Single dependency-free file (`webhook.mjs`); runs under stock `node` (≥18) or
 GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
                                         │ plain HTTP (unix socket or 127.0.0.1:8788)
                                         ▼
-                              webhook.mjs  (ingress owner: verifies HMAC once)
+                              webhook.py   (ingress owner: verifies HMAC once)
                                         │ unix-socket fan-out
                     ┌───────────────────┼───────────────────┐
                     ▼                    ▼                    ▼
      <state>/instances/<pid>.sock   …/<pid>.sock         …/<pid>.sock
-       webhook.mjs (session A)    webhook.mjs (B)     webhook.mjs (C)
+       webhook.py (session A)     webhook.py (B)      webhook.py (C)
          ──stdio/MCP──> claude       ──> claude          ──> claude
                                         │
                           ~/.local/state/local-webhook/
@@ -160,17 +162,17 @@ fan-out delivers the event to both.
 
 The MCP tools only exist inside a Claude Code session that loaded the plugin. A
 Codex session, a plain shell, or a script can manage the same subscriptions by
-running `webhook.mjs` with a command — a thin shim over the very same code, so
+running `webhook.py` with a command — a thin shim over the very same code, so
 the two paths can't drift on TTL/renew semantics:
 
-    node webhook.mjs subscribe owner/repo --note "waiting on PR 146 CI" --ttl 8
-    node webhook.mjs subscribe 'github:defangdevs/*' --ignore-sender @self
-    node webhook.mjs ls
-    node webhook.mjs unsubscribe owner/repo
-    node webhook.mjs status        # state dir, session, sources (no secrets)
+    python3 webhook.py subscribe owner/repo --note "waiting on PR 146 CI" --ttl 8
+    python3 webhook.py subscribe 'github:defangdevs/*' --ignore-sender @self
+    python3 webhook.py ls
+    python3 webhook.py unsubscribe owner/repo
+    python3 webhook.py status        # state dir, session, sources (no secrets)
 
 `--note`, `--ttl`, `--renew-on-event` and `--ignore-sender` (repeatable, or one
-comma-separated list) mirror the tool arguments; `webhook.mjs --help` prints the
+comma-separated list) mirror the tool arguments; `webhook.py --help` prints the
 details. Subscriptions are per session, so export the same
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.

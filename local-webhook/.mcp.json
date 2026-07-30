@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "local-webhook": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/webhook.mjs"]
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/webhook.py"]
     }
   }
 }

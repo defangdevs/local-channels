@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "local-webhook",
-      "description": "HMAC-verified webhook channel: pushes deliveries from GitHub or any other signing sender into the session, plus webhook_subscribe / webhook_unsubscribe MCP tools (and an equivalent webhook.mjs CLI) for topic routing.",
+      "description": "HMAC-verified webhook channel: pushes deliveries from GitHub or any other signing sender into the session, plus webhook_subscribe / webhook_unsubscribe MCP tools (and an equivalent webhook.py CLI) for topic routing.",
       "source": "./local-webhook",
       "keywords": ["channel", "mcp", "webhook", "github"]
     }
