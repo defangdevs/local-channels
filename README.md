@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.8.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing |
+| [`local-webhook`](local-webhook/) | 0.8.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing |
 
 ## Requirements
 
@@ -159,7 +159,7 @@ to handle one stale event.
 - A topic expires `ttlHours` after its clock was last reset. The default is
   **1 hour** — chosen to track how long the prompt cache stays warm. A per-entry
   `ttlHours` (tool argument `ttl_hours`) overrides the file's top-level value;
-  `0` means pinned, never expires.
+  `0` means pinned, never expires — but see the warning below.
 - The clock resets on **re-subscribing** (fresh interest), and on a **warm
   delivery** — one arriving within ~10 minutes of the previous delivery on that
   topic, i.e. while the cache from handling that previous event is still hot, so
@@ -167,9 +167,17 @@ to handle one stale event.
   *not* renew, so a repo with sparse bot traffic still expires when nobody is
   working on it. Renewal follows cache warmth, never raw event count.
 - `renew_on_event: true` opts a topic into resetting the clock on *every*
-  delivery regardless of gap — for a stream you mean to follow indefinitely
-  (pair with `ttl_hours: 0` to also survive total silence).
+  delivery regardless of gap — for a stream you mean to follow indefinitely.
 - Expired topics are pruned at delivery time and on every tool call.
+
+> **Don't pin.** `ttl_hours: 0` never expires, and `renew_on_event: true` keeps
+> a busy topic alive forever in practice. A delivery lands in whichever session
+> is *active at the time*, so either one interrupts unrelated work
+> indefinitely — no session "owns" a standing watch on a repo. Scope the TTL to
+> the work in flight and let it lapse. Pinning becomes reasonable only once a
+> subscription can request delivery into a **fresh** session instead of the
+> active one ([#1](https://github.com/defangdevs/local-channels/issues/1)),
+> since a cold run has no warm cache to lose.
 
 ### Echo muting
 
@@ -246,8 +254,8 @@ sessions for fan-out and routing to work.
   ```json
   { "enabled": true, "ttlHours": 1, "topics": [
       "github:defangdevs/*",
-      { "topic": "github:me/my-config-repo", "ttlHours": 0,
-        "note": "this box's own repo — pinned", "subscribedAt": "2026-07-16T00:00:00Z" },
+      { "topic": "github:me/my-config-repo", "ttlHours": 72,
+        "note": "tracking the config migration all week", "subscribedAt": "2026-07-16T00:00:00Z" },
       { "topic": "github:defangdevs/claude-box", "ignoreSenders": ["@self"],
         "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
   ```
