@@ -5,7 +5,8 @@ HTTP (GitHub or any other sender that signs the raw body with HMAC-SHA256) and
 pushes a concise, untrusted-marked summary of each event into the Claude Code
 session that spawned it. Ships MCP tools (`webhook_subscribe`,
 `webhook_unsubscribe`, `webhook_subscriptions`) so the agent can route which
-topics reach it — hot-reloaded per delivery, no session restart needed.
+topics reach it — hot-reloaded per delivery, no session restart needed — plus an
+equivalent [CLI](#cli) for callers with no MCP client.
 
 Single dependency-free file (`webhook.mjs`); runs under stock `node` (≥18) or
 `bun`. No `node_modules`, no build step.
@@ -154,6 +155,28 @@ reads/writes `filter.<name>.json` instead of the shared `filter.json`. Two
 concurrent sessions acting as different GitHub users can then subscribe to the
 same repo with different ignore lists — each mutes only its own echoes, while
 fan-out delivers the event to both.
+
+## CLI
+
+The MCP tools only exist inside a Claude Code session that loaded the plugin. A
+Codex session, a plain shell, or a script can manage the same subscriptions by
+running `webhook.mjs` with a command — a thin shim over the very same code, so
+the two paths can't drift on TTL/renew semantics:
+
+    node webhook.mjs subscribe owner/repo --note "waiting on PR 146 CI" --ttl 8
+    node webhook.mjs subscribe 'github:defangdevs/*' --ignore-sender @self
+    node webhook.mjs ls
+    node webhook.mjs unsubscribe owner/repo
+    node webhook.mjs status        # state dir, session, sources (no secrets)
+
+`--note`, `--ttl`, `--renew-on-event` and `--ignore-sender` (repeatable, or one
+comma-separated list) mirror the tool arguments; `webhook.mjs --help` prints the
+details. Subscriptions are per session, so export the same
+`LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
+under agent-box both are already in every session's environment.
+
+A CLI invocation binds nothing: it is not a session peer and never touches the
+ingress, so it is safe to run alongside the daemon and any number of sessions.
 
 ## Wiring a GitHub repo
 

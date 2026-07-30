@@ -1,6 +1,0 @@
-{
-  "name": "gh-webhook",
-  "description": "TEMPORARY compatibility alias for local-webhook: identical code, kept so sessions launched with the baked-in --channels plugin:gh-webhook@local-channels flag receive deliveries. Delete once the nixos-defang-ca rebuild (commit 698082c) lands. Enable EITHER this OR local-webhook, never both (port 8788 single-owner).",
-  "version": "0.4.0",
-  "keywords": ["channel", "mcp", "webhook", "github", "alias"]
-}
