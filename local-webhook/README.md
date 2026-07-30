@@ -98,8 +98,8 @@ own login must not mute CI results for your own pushes.
 ```json
 { "enabled": true, "ttlHours": 1, "topics": [
     "github:defangdevs/*",
-    { "topic": "github:me/my-config-repo", "ttlHours": 0,
-      "note": "this box's own repo — pinned", "subscribedAt": "2026-07-16T00:00:00Z" },
+    { "topic": "github:me/my-config-repo", "ttlHours": 72,
+      "note": "tracking the config migration all week", "subscribedAt": "2026-07-16T00:00:00Z" },
     { "topic": "github:defangdevs/claude-box", "ignoreSenders": ["@self"],
       "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
 ```
@@ -113,8 +113,8 @@ the whole conversation to handle one stale event burns a large pile of tokens.
 So subscriptions **expire**, `ttlHours` after their clock was last reset
 (top-level default **1** — chosen to track how long the KV cache stays warm, so
 a straggler event can't trigger an expensive cold re-read; per-entry `ttlHours`
-overrides it; `0` = pinned, never expires). Expired topics are pruned at
-delivery time and on every tool call.
+overrides it; `0` = pinned, never expires — but see the warning below). Expired
+topics are pruned at delivery time and on every tool call.
 
 Two things reset the clock:
 
@@ -130,10 +130,20 @@ Two things reset the clock:
 
 For a stream you intend to react to **indefinitely**, pass
 `renew_on_event: true`: every delivery then resets the clock regardless of gap,
-so the subscription lives as long as events keep arriving within `ttl_hours`
-(pair with `ttl_hours: 0` to also survive total silence). `webhook_subscribe`
-also takes `ttl_hours` to set the per-topic override — larger for a genuinely
-multi-hour or multi-day wait, `0` to pin the box's own repos. Hand-written
+so the subscription lives as long as events keep arriving within `ttl_hours`.
+`webhook_subscribe` also takes `ttl_hours` to set the per-topic override —
+larger for a genuinely multi-hour or multi-day wait.
+
+> **Don't pin.** `ttl_hours: 0` never expires, and `renew_on_event: true` keeps
+> a busy topic alive forever in practice. A delivery lands in whichever session
+> is *active at the time*, so either one interrupts unrelated work
+> indefinitely — no session "owns" a standing watch on a repo. Scope the TTL to
+> the work in flight and let it lapse. Pinning becomes reasonable only once a
+> subscription can request delivery into a **fresh** session instead of the
+> active one ([#1](https://github.com/defangdevs/local-channels/issues/1)),
+> since a cold run has no warm cache to lose.
+
+Hand-written
 entries without timestamps never expire until some write stamps them
 (`subscribedAt` is filled in on the next file write).
 

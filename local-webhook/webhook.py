@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -257,9 +257,14 @@ def verify(secret, sig_header, body):
 # actively working (cache hot) deliveries are cheap; once you've been idle past
 # the cache window the subscription has lapsed, so a straggler event can't
 # trigger an expensive cold re-read. A topic expires ttlHours after it was last
-# (re)subscribed — per-entry ttlHours wins over the top-level default; 0 =
-# never (pin the box's own repos); pass a larger ttl_hours for a genuinely
-# multi-hour/day wait.
+# (re)subscribed — per-entry ttlHours wins over the top-level default; pass a
+# larger ttl_hours for a genuinely multi-hour/day wait.
+# ttlHours:0 pins a topic forever. Avoid it: a delivery lands in whichever
+# session is active at the time, so a pinned topic interrupts unrelated work
+# indefinitely — there is no session that "owns" a standing watch. Scope the TTL
+# to the work in flight instead and let it lapse. (Pinning becomes reasonable
+# once a subscription can ask for delivery into a FRESH session rather than the
+# active one — see issue #1 — since a cold run has no warm cache to lose.)
 # A topic's clock resets on two things: (a) re-subscribing (fresh interest),
 # and (b) a "warm" delivery — an event arriving within WARM_WINDOW_MS of the
 # previous one, i.e. while the KV cache from handling that previous event is
@@ -752,8 +757,10 @@ INSTRUCTIONS = (
     '%dh after their clock was last reset — re-subscribing resets it, and so does a '
     '"warm" delivery (one arriving <10min after the previous, while the cache is still hot) so an active '
     'streak stays alive; a cold straggler is delivered but does not renew. Pass ttl_hours to override per '
-    "topic (longer for a multi-day wait, 0 to pin forever — this box's own repos), or renew_on_event:true "
-    'to reset the clock on EVERY delivery for a stream you mean to follow indefinitely. '
+    'topic (longer for a multi-day wait), or renew_on_event:true to reset the clock on EVERY delivery '
+    'for a stream you mean to follow indefinitely. Scope the TTL to the work in flight and let it lapse: '
+    'ttl_hours:0 pins a topic forever, and since deliveries land in whichever session is active, a pinned '
+    'topic interrupts unrelated work indefinitely. '
     'To mute echoes of your own actions (your comments, your issue edits) pass ignore_senders — e.g. '
     'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe; CI-outcome '
     'events (workflow_run etc.) are always delivered regardless. '
@@ -793,7 +800,9 @@ TOOLS = [
                         "Per-topic expiry override in hours (default: the filter file's ttlHours, %d "
                         'unless changed). Counted from the last clock reset — re-subscribe, or a "warm" delivery '
                         '(one arriving <10min after the previous, while the cache is still hot). A larger value suits '
-                        "an awaited response that will take days; 0 pins forever (this box's own repos). Omit to keep "
+                        'an awaited response that will take days. Prefer a TTL scoped to the work in flight: 0 pins '
+                        'the topic forever, and deliveries land in whichever session is active, so a pinned topic '
+                        'interrupts unrelated work indefinitely. Omit to keep '
                         'the existing override on renew.' % DEFAULT_TTL_HOURS,
                 },
                 'renew_on_event': {
@@ -802,8 +811,9 @@ TOOLS = [
                         'Default false: the TTL clock resets only on re-subscribe or a warm delivery, so a stream of '
                         'sporadic (cold) events still lets the subscription expire. Set true when you intend to react '
                         'to this topic indefinitely — every delivery then resets the clock regardless of gap, so the '
-                        'subscription lives as long as events keep arriving within ttl_hours (pair with ttl_hours:0 to '
-                        'also survive total silence). Omit to keep the existing setting on renew.',
+                        'subscription lives as long as events keep arriving within ttl_hours. Note this keeps '
+                        'interrupting the active session for as long as the stream lasts, so reach for it only when '
+                        'you really will react every time. Omit to keep the existing setting on renew.',
                 },
                 'ignore_senders': {
                     'type': 'array',
@@ -1217,8 +1227,9 @@ TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix)
   --note TEXT          why you subscribed; echoed under every delivery so a
                        fresh-context session knows what the event relates to
   --ttl HOURS          per-topic expiry, counted from the last (re)subscribe or
-                       warm delivery (0 = pin forever). Default: the filter
-                       file's ttlHours (%d)
+                       warm delivery. Default: the filter file's ttlHours (%d).
+                       0 pins forever — avoid it, a pinned topic interrupts
+                       whatever session is active, indefinitely
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
