@@ -7,17 +7,19 @@ to use them, read [README.md](README.md) — don't repeat it here.
 
 ```
 .claude-plugin/marketplace.json   marketplace manifest: name, owner, plugin list
+.github/workflows/ci.yml          test suite on python 3.9 (the floor) and 3.x
 local-webhook/
   .claude-plugin/plugin.json      plugin manifest: name, description, version
   .mcp.json                       launches `python3 ${CLAUDE_PLUGIN_ROOT}/webhook.py`
   webhook.py                      the entire plugin: MCP stdio server, HTTP ingress,
-                                  IPC fan-out, filter/TTL logic, CLI — one file
+                                  IPC fan-out, filter/TTL/dispatch logic, CLI — one file
   README.md                       per-plugin reference docs
+tests/test_webhook.py             stdlib-unittest suite: unit + subprocess e2e
 ```
 
-There is no build system, no lockfile, no generated file, no CI workflow and no
-test suite. A new plugin is a new top-level directory with its own
-`.claude-plugin/plugin.json`, `.mcp.json`, `README.md` and a marketplace entry.
+There is no build system, no lockfile and no generated file. A new plugin is a
+new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
+`README.md` and a marketplace entry — plus tests under `tests/`.
 
 ## Constraints that are not negotiable
 
@@ -79,14 +81,26 @@ bump usually needs a companion PR in that repo. Mention it in the PR body.
 - PR title mirrors the commit subject; PR body restates the rationale, the
   contracts deliberately left unchanged, and a `## Verification` section with
   what was actually run. Reference the issue it closes.
-- Open the PR and stop — a human merges. Recent PRs are squash-merged, which is
-  why the subject on `main` ends in `(#4)`.
+- There is no human PR reviewer. Open the PR, wait for CI, and squash-merge it
+  yourself once green (squash is why the subject on `main` ends in `(#4)`) —
+  which is exactly why every behaviour change must land with test coverage in
+  the same PR.
 
 ## Testing
 
-Verification is manual and end-to-end; the bar set by history is a real
-signed delivery reaching a real session peer. Run it in a throwaway state dir so
-you never touch the box's live subscriptions:
+`python3 -m unittest discover -s tests` — stdlib unittest only, same
+zero-dependency constraint as the plugin itself. CI runs it on python 3.9 (the
+supported floor) and current 3.x; a PR merges only when both are green. The
+suite covers signature verification, topic matching, TTL/renewal, the MCP
+tool surface, dispatch batching, and subprocess end-to-end flows (daemon +
+session peer + CLI, real signed deliveries). Version-bump invariants (rule 1/2
+below, plus the README version tables) are themselves asserted by a test.
+
+The historical bar remains: a change to delivery behaviour is verified by a
+real signed delivery reaching a real session peer — add it to the e2e tests
+rather than running it once by hand. For interactive debugging, the manual
+flow below still works in a throwaway state dir so you never touch the box's
+live subscriptions:
 
 ```sh
 export LOCAL_WEBHOOK_STATE_DIR=$(mktemp -d) LOCAL_WEBHOOK_SESSION=test LOCAL_WEBHOOK_PORT=0

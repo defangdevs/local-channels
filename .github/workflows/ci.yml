@@ -1,0 +1,23 @@
+# Tests run on the floor interpreter the plugins promise to support (3.9, the
+# RHEL 9 / Ubuntu server baseline) and on current 3.x, so a 3.10+ism or a
+# deprecation on the new side both fail the PR.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run test suite
+        run: python -m unittest discover -s tests -v
