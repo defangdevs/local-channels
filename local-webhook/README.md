@@ -31,6 +31,9 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
                             sources.json           (who may deliver, secrets)
                             filter.json            (default subscriptions)
                             filter.<session>.json  (per-session subscriptions)
+                            filter.dispatch.json   (shared standing watches →
+                                                    spawn a fresh session, 0.9.0)
+                            receiver.json          (daemon advertisement)
 ```
 
 - The **ingress owner** verifies the HMAC once and re-broadcasts each event to
@@ -134,14 +137,17 @@ so the subscription lives as long as events keep arriving within `ttl_hours`.
 `webhook_subscribe` also takes `ttl_hours` to set the per-topic override —
 larger for a genuinely multi-hour or multi-day wait.
 
-> **Don't pin.** `ttl_hours: 0` never expires, and `renew_on_event: true` keeps
-> a busy topic alive forever in practice. A delivery lands in whichever session
-> is *active at the time*, so either one interrupts unrelated work
-> indefinitely — no session "owns" a standing watch on a repo. Scope the TTL to
-> the work in flight and let it lapse. Pinning becomes reasonable only once a
-> subscription can request delivery into a **fresh** session instead of the
-> active one ([#1](https://github.com/defangdevs/local-channels/issues/1)),
-> since a cold run has no warm cache to lose.
+> **Don't pin session-delivered topics.** `ttl_hours: 0` never expires, and
+> `renew_on_event: true` keeps a busy topic alive forever in practice. A
+> session delivery lands in whichever session is *active at the time*, so
+> either one interrupts unrelated work indefinitely — no session "owns" a
+> standing watch on a repo. Scope the TTL to the work in flight and let it
+> lapse. For a genuine standing watch, use
+> [dispatch](#dispatch-delivery-into-a-fresh-session-090) instead: with
+> `deliver_to: "subagent"` a matching event spawns a **fresh** session with no
+> warm cache to lose and nobody to interrupt, so `ttl_hours: 0` is safe there —
+> and is the default
+> ([#1](https://github.com/defangdevs/local-channels/issues/1)).
 
 Hand-written
 entries without timestamps never expire until some write stamps them
@@ -160,6 +166,42 @@ so a session that has since lost its context still knows what the event relates
 to. Omitting `note` (or `ttl_hours`) on re-subscribe keeps the existing values;
 pass `""` to clear the note.
 
+### Dispatch: delivery into a fresh session (0.9.0)
+
+Session delivery answers "tell *me* when CI for *my* PR finishes." A **standing
+watch** — "handle any new issue on this repo," with no session that owns the
+work — has no correct live session to interrupt; the right response is to
+*start* one. Pass `deliver_to: "subagent"` to `webhook_subscribe` (CLI:
+`--deliver-to subagent`) and matching events are written to the **shared**
+`filter.dispatch.json` instead of the session's own filter. The ingress owner
+routes every verified delivery against that file after the peer fan-out; a
+match makes it run `LOCAL_WEBHOOK_SPAWN_CMD` — a shell command expected to
+start a new agent session (under agent-box, a wrapper over
+`agent-box-session add --prompt`). The formatted event text (same
+`[UNTRUSTED …]` framing and note echo as a channel message) arrives on the
+command's **stdin**; routing context rides in `LOCAL_WEBHOOK_SPAWN_SOURCE`,
+`_KEY`, `_EVENT`, `_TOPIC`, `_NOTE` and `_COUNT` env vars (payload-derived —
+quote them).
+
+Differences from session routing, all deliberate:
+
+- **Fails closed.** No spawn command, no dispatch file, or a corrupt one all
+  mean *spawn nothing*. Failing open here would be a session per delivery — a
+  fork bomb, not noise. (`webhook_subscribe` warns when the receiver daemon
+  advertises no spawn command in `receiver.json`.)
+- **Shared, not per-session.** The watch outlives the session that created it;
+  every session sees the dispatch list under `dispatch` in
+  `webhook_subscriptions`.
+- **Pinned by default.** New dispatch entries get `ttlHours: 0` unless a
+  `ttl_hours` is passed — a spawned session has no warm cache to lose, which is
+  the entire cost the session-filter TTL exists to bound.
+- **Bursts coalesce.** The first event on an idle key spawns immediately;
+  events arriving while that spawn runs, or within `LOCAL_WEBHOOK_SPAWN_WINDOW`
+  (60 s) of its start, batch into one follow-up spawn — a 10-PR dependabot
+  burst costs two sessions, not ten. At most `LOCAL_WEBHOOK_SPAWN_MAX` (2)
+  spawn commands run concurrently across all keys. A failing spawn command is
+  logged and its batch dropped; the same events already reached session peers.
+
 ### Per-identity filters
 
 Set `LOCAL_WEBHOOK_SELF=<name>` in a session's environment and its instance
@@ -177,13 +219,15 @@ the two paths can't drift on TTL/renew semantics:
 
     python3 webhook.py subscribe owner/repo --note "waiting on PR 146 CI" --ttl 8
     python3 webhook.py subscribe 'github:defangdevs/*' --ignore-sender @self
+    python3 webhook.py subscribe 'github:defangdevs/*' --deliver-to subagent \
+        --note "standing watch: new issues/PRs spawn a fresh session"
     python3 webhook.py ls
     python3 webhook.py unsubscribe owner/repo
     python3 webhook.py status        # state dir, session, sources (no secrets)
 
-`--note`, `--ttl`, `--renew-on-event` and `--ignore-sender` (repeatable, or one
-comma-separated list) mirror the tool arguments; `webhook.py --help` prints the
-details. Subscriptions are per session, so export the same
+`--note`, `--ttl`, `--deliver-to`, `--renew-on-event` and `--ignore-sender`
+(repeatable, or one comma-separated list) mirror the tool arguments;
+`webhook.py --help` prints the details. Subscriptions are per session, so export the same
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.
 
@@ -215,6 +259,10 @@ header names (e.g. `x-signature`), set `signatureHeader`.
 | `LOCAL_WEBHOOK_SESSION` | — | per-session subscription scope; selects `filter.<session>.json` (falls back to `SELF`, then default) |
 | `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets + filters (must be shared across a box's daemon + sessions for fan-out) |
 | `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; resolves `"@self"` in ignore lists (no longer the filter-file key) |
+| `LOCAL_WEBHOOK_SPAWN_CMD` | — | ingress owner only: shell command run per dispatched event batch (prompt text on stdin, `LOCAL_WEBHOOK_SPAWN_*` env). Unset = dispatch subscriptions are inert |
+| `LOCAL_WEBHOOK_SPAWN_MAX` | `2` | max concurrent spawn commands across all keys |
+| `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
+| `LOCAL_WEBHOOK_SPAWN_TIMEOUT` | `600` | seconds before a running spawn command is killed (and its batch dropped) |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source if `sources.json` is absent |
 
 When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress

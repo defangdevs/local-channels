@@ -23,6 +23,7 @@ import os
 import re
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -30,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.8.1'
+VERSION = '0.9.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -259,12 +260,14 @@ def verify(secret, sig_header, body):
 # trigger an expensive cold re-read. A topic expires ttlHours after it was last
 # (re)subscribed — per-entry ttlHours wins over the top-level default; pass a
 # larger ttl_hours for a genuinely multi-hour/day wait.
-# ttlHours:0 pins a topic forever. Avoid it: a delivery lands in whichever
-# session is active at the time, so a pinned topic interrupts unrelated work
-# indefinitely — there is no session that "owns" a standing watch. Scope the TTL
-# to the work in flight instead and let it lapse. (Pinning becomes reasonable
-# once a subscription can ask for delivery into a FRESH session rather than the
-# active one — see issue #1 — since a cold run has no warm cache to lose.)
+# ttlHours:0 pins a topic forever. For session delivery, avoid it: a delivery
+# lands in whichever session is active at the time, so a pinned topic
+# interrupts unrelated work indefinitely — no session "owns" a standing watch.
+# Scope the TTL to the work in flight instead and let it lapse. DISPATCH
+# subscriptions (deliver_to:"subagent", see DISPATCH_FILE below) are the
+# opposite: a matching event spawns a FRESH session with no warm cache to lose
+# and no work to interrupt, so ttlHours:0 there is the coherent standing watch
+# issue #1 asked for — and is the default for dispatch entries.
 # A topic's clock resets on two things: (a) re-subscribing (fresh interest),
 # and (b) a "warm" delivery — an event arriving within WARM_WINDOW_MS of the
 # previous one, i.e. while the KV cache from handling that previous event is
@@ -297,6 +300,26 @@ FILTER_COMMENT = (
     "ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe and on 'warm' "
     "deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; entries "
     "without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
+)
+
+# Dispatch subscriptions (issue #1): entries in this file ask for delivery into
+# a FRESH session instead of the active one. The file is SHARED, not
+# per-session: the ingress owner routes deliveries against it after fan-out
+# (see dispatch_event), and any session may write it via deliver_to:"subagent"
+# — the watch outlives the session that created it, which is the point of a
+# standing watch. Same schema and TTL semantics as a session filter, but
+# entries created through the tools default to ttlHours:0 (pinned): a spawned
+# session has no warm cache to lose, so the interruption cost that motivates
+# session-filter expiry does not exist here.
+DISPATCH_FILE = os.path.join(STATE_DIR, 'filter.dispatch.json')
+DISPATCH_COMMENT = (
+    "Hot-reloaded per delivery by local-webhook. Managed by webhook_subscribe / webhook_unsubscribe "
+    "with deliver_to:\"subagent\" (CLI: --deliver-to subagent). SHARED across sessions: matching events "
+    "do not go to a session peer — the ingress owner runs LOCAL_WEBHOOK_SPAWN_CMD to start a FRESH "
+    "session per event batch (without a spawn command these entries are inert). Same schema and TTL "
+    "semantics as a session filter file, but entries subscribed through the tools default to ttlHours:0 "
+    "(a pinned standing watch). Unlike session routing, dispatch fails CLOSED: a missing or corrupt "
+    "file means spawn nothing."
 )
 
 # Sender-ignore never applies to these: their payload sender is merely who
@@ -350,9 +373,9 @@ def normalize_entry(t):
     return None
 
 
-def read_filter():
+def read_filter(path=FILTER_FILE):
     try:
-        with open(FILTER_FILE, encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             raw = json.load(f)
         if not isinstance(raw, dict):
             raise ValueError('not an object')
@@ -378,7 +401,7 @@ def read_filter():
 # timestamps are stamped "now" on write, so grandfathered pre-0.5.0 entries
 # enter the TTL clock the first time anything writes the file); empty optional
 # fields are omitted to keep the file hand-editable.
-def write_filter(f):
+def write_filter(f, path=FILTER_FILE):
     now = iso_at(now_ms())
     topics = []
     for e in f['topics']:
@@ -395,11 +418,12 @@ def write_filter(f):
             o['lastActivityAt'] = e['lastActivityAt']
         topics.append(o)
     ttl = f.get('ttlHours')
-    body = {'//': FILTER_COMMENT, 'enabled': f['enabled'],
+    comment = DISPATCH_COMMENT if path == DISPATCH_FILE else FILTER_COMMENT
+    body = {'//': comment, 'enabled': f['enabled'],
             'ttlHours': DEFAULT_TTL_HOURS if ttl is None else ttl, 'topics': topics}
-    with open(FILTER_FILE + '.tmp', 'w', encoding='utf-8') as fh:
+    with open(path + '.tmp', 'w', encoding='utf-8') as fh:
         fh.write(pretty(body) + '\n')
-    os.replace(FILTER_FILE + '.tmp', FILTER_FILE)
+    os.replace(path + '.tmp', path)
 
 
 # ------------------------------------------------------------------ expiry ---
@@ -476,13 +500,16 @@ def entry_forwards(e, sender, event):
 # (or on every delivery when renewOnEvent). A cold straggler is forwarded but
 # does NOT renew — see the DEFAULT_TTL_HOURS comment for why. The write only
 # happens when something changed.
-def route_event(source, key, sender, event):
+# Session routing fails OPEN (fail_open=True: no filter file → forward all, so
+# a botched edit degrades to noise); dispatch routing passes fail_open=False
+# because its worst case is not noise but a spawned session per delivery.
+def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True):
     with FILTER_LOCK:
-        f = read_filter()
+        f = read_filter(path)
         if not f['enabled']:
             return {'forward': False, 'entry': None}
         if not f['topicsConfigured']:
-            return {'forward': True, 'entry': None}  # no filter configured → forward all
+            return {'forward': fail_open, 'entry': None}  # no filter configured
         now = now_ms()
         live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
         pruned = len(live) != len(f['topics'])
@@ -507,7 +534,7 @@ def route_event(source, key, sender, event):
                 e['lastActivityAt'] = iso_at(now)
         if pruned or matched:
             try:
-                write_filter({**f, 'topics': live})
+                write_filter({**f, 'topics': live}, path)
             except OSError:
                 pass
         return {'forward': forward, 'entry': matched}
@@ -529,10 +556,10 @@ os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
 IPC_SOCK = os.path.join(INSTANCE_DIR, '%d.sock' % os.getpid())
 
 
-def handle_event(env):
-    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''), env.get('event', ''))
-    if not r['forward']:
-        return
+# One rendering for both delivery paths — the channel notification a session
+# peer emits and the prompt a dispatched (spawned) session starts from — so the
+# UNTRUSTED framing and the subscription-note echo can never drift apart.
+def format_delivery(env, entry):
     if env.get('format') == 'github':
         content, meta = summarize_github(env.get('event', ''), env.get('payload'))
     else:
@@ -544,11 +571,18 @@ def handle_event(env):
     # Subscription context for fresh sessions: the note was written by a past
     # session of this box (trusted, unlike the payload above) and says why this
     # event is being routed here at all.
-    entry = r['entry']
     if entry and (entry['note'] or entry['subscribedAt']):
         age = age_str(entry['subscribedAt'], now_ms())
         text += '\n[subscribed to %s%s%s]' % (
             entry['topic'], ' %s ago' % age if age else '', ': %s' % entry['note'] if entry['note'] else '')
+    return text, meta
+
+
+def handle_event(env):
+    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''), env.get('event', ''))
+    if not r['forward']:
+        return
+    text, meta = format_delivery(env, r['entry'])
     out({
         'jsonrpc': '2.0',
         'method': 'notifications/claude/channel',
@@ -638,6 +672,167 @@ if not RECEIVER_ONLY and not CLI:
         atexit.register(_cleanup)
     except OSError as e:
         print('local-webhook: ipc listener failed (%s)' % e, file=sys.stderr)
+
+
+# --------------------------------------------------------------- dispatch ---
+# Delivery into a FRESH session (issue #1). The ingress owner — the process
+# that verified the HMAC — routes every delivery against DISPATCH_FILE after
+# the peer fan-out; a match hands the formatted event text to
+# LOCAL_WEBHOOK_SPAWN_CMD, a shell command expected to start a new agent
+# session (agent-box points it at a wrapper over `agent-box-session add
+# --prompt`). The text arrives on the command's STDIN — never on the command
+# line, where attacker-controlled payload strings could reach shell parsing —
+# and routing context rides in LOCAL_WEBHOOK_SPAWN_* env vars (values are
+# payload-derived, so a spawn command must still quote them).
+#
+# Unlike session routing (fail open: worst case is noise), dispatch fails
+# CLOSED at every layer — no spawn command, no dispatch file, or a corrupt one
+# all mean "spawn nothing". Failing open here would mean a session per
+# delivery: a fork bomb, not noise.
+#
+# Fork-bomb control (issue #1, decision 1), per routing key so one chatty repo
+# cannot starve another:
+#   - the FIRST event on an idle key spawns immediately (a new issue should
+#     get its session now, not after a debounce);
+#   - while a spawn for the key is running, or within SPAWN_WINDOW_S of the
+#     last spawn start, further events COALESCE into one pending batch that
+#     becomes a single follow-up spawn — a 10-PR dependabot burst costs two
+#     sessions, not ten;
+#   - at most SPAWN_MAX spawn commands run concurrently across all keys;
+#     waiting batches get re-checked whenever a spawn finishes.
+# A spawn that fails (non-zero exit, unlaunchable, > SPAWN_TIMEOUT_S) is
+# logged to stderr and its batch is DROPPED — retrying a broken spawner would
+# loop; the same events already reached session peers via the normal fan-out.
+SPAWN_CMD = (os.environ.get('LOCAL_WEBHOOK_SPAWN_CMD') or '').strip()
+SPAWN_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_MAX', default=2))
+SPAWN_WINDOW_S = max(0, _int_env('LOCAL_WEBHOOK_SPAWN_WINDOW', default=60))
+SPAWN_TIMEOUT_S = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_TIMEOUT', default=600))
+
+
+class Dispatcher:
+    # State is in-memory only: an ingress-owner restart forgets pending
+    # batches. Acceptable — the same deliveries reached session peers, and a
+    # standing watch cares about the next event, not a replay of the last one.
+    def __init__(self, cmd, max_concurrent, window_s, timeout_s, clock=time.monotonic):
+        self.cmd = cmd
+        self.max = max_concurrent
+        self.window = window_s
+        self.timeout = timeout_s
+        self.clock = clock  # injectable for tests; monotonic so a clock step can't wedge a key
+        self.lock = threading.Lock()
+        self.active = 0
+        # key -> {pending: [text], meta: dict, running: bool,
+        #         last_start: float|None, timer: Timer|None}
+        self.keys = {}
+
+    def add(self, key, text, meta):
+        with self.lock:
+            st = self.keys.setdefault(key, {'pending': [], 'meta': {}, 'running': False,
+                                            'last_start': None, 'timer': None})
+            st['pending'].append(text)
+            st['meta'] = meta  # the newest event's context labels the batch
+            self._pump(key)
+
+    # Call with self.lock held. Starts a spawn for the key when allowed;
+    # otherwise arms a timer for the moment the rate window opens. Being at
+    # the concurrency cap needs no timer: _run's finally re-pumps every key
+    # when a slot frees.
+    def _pump(self, key):
+        st = self.keys[key]
+        if st['running'] or not st['pending'] or self.active >= self.max:
+            return
+        delay = 0 if st['last_start'] is None else st['last_start'] + self.window - self.clock()
+        if delay > 0:
+            if st['timer'] is None:
+                st['timer'] = threading.Timer(delay, self._on_timer, args=(key,))
+                st['timer'].daemon = True
+                st['timer'].start()
+            return
+        if st['timer'] is not None:
+            st['timer'].cancel()
+            st['timer'] = None
+        batch, st['pending'] = st['pending'], []
+        st['running'] = True
+        st['last_start'] = self.clock()
+        self.active += 1
+        threading.Thread(target=self._run, args=(key, batch, dict(st['meta'])), daemon=True).start()
+
+    def _on_timer(self, key):
+        with self.lock:
+            st = self.keys.get(key)
+            if st is not None:
+                st['timer'] = None
+                self._pump(key)
+
+    def _run(self, key, batch, meta):
+        try:
+            env = dict(os.environ)
+            env.update({
+                'LOCAL_WEBHOOK_SPAWN_SOURCE': meta.get('source', ''),
+                'LOCAL_WEBHOOK_SPAWN_KEY': meta.get('key', ''),
+                'LOCAL_WEBHOOK_SPAWN_EVENT': meta.get('event', ''),
+                'LOCAL_WEBHOOK_SPAWN_TOPIC': meta.get('topic', ''),
+                'LOCAL_WEBHOOK_SPAWN_NOTE': meta.get('note', ''),
+                'LOCAL_WEBHOOK_SPAWN_COUNT': str(len(batch)),
+            })
+            p = subprocess.run(self.cmd, shell=True, env=env,
+                               input=('\n'.join(batch) + '\n').encode('utf-8'),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=self.timeout)
+            if p.returncode != 0:
+                print('local-webhook: spawn command exited %d for %s: %s'
+                      % (p.returncode, key, p.stdout.decode('utf-8', 'replace').strip()[:500]),
+                      file=sys.stderr)
+        except subprocess.TimeoutExpired:
+            print('local-webhook: spawn command timed out (%ss) for %s' % (self.timeout, key), file=sys.stderr)
+        except OSError as e:
+            print('local-webhook: spawn command failed for %s: %s' % (key, e), file=sys.stderr)
+        finally:
+            with self.lock:
+                self.active -= 1
+                st = self.keys.get(key)
+                if st is not None:
+                    st['running'] = False
+                for k in list(self.keys):  # a freed slot may unblock any key
+                    self._pump(k)
+
+
+DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) if SPAWN_CMD else None
+
+
+def dispatch_event(env):
+    # Ingress owner only: called from deliver(), never on the peer IPC path,
+    # so one delivery can only ever dispatch once however many peers exist.
+    if DISPATCHER is None:
+        return
+    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
+                    env.get('event', ''), path=DISPATCH_FILE, fail_open=False)
+    if not r['forward']:
+        return
+    entry = r['entry']
+    text, _ = format_delivery(env, entry)
+    DISPATCHER.add(env.get('key', '') or '(none)', text, {
+        'source': env.get('source', ''),
+        'key': env.get('key', ''),
+        'event': env.get('event', ''),
+        'topic': entry['topic'] if entry else '',
+        'note': entry['note'] if entry else '',
+    })
+
+
+# Written by the receiver daemon at startup so sessions can tell whether
+# dispatch is actually wired (webhook_subscribe warns when it is not).
+# Advisory only: absent on legacy setups, stale after a crash.
+RECEIVER_FILE = os.path.join(STATE_DIR, 'receiver.json')
+
+
+def receiver_info():
+    try:
+        with open(RECEIVER_FILE, encoding='utf-8') as f:
+            info = json.load(f)
+        return info if isinstance(info, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 # ------------------------------------------------------------- formatters ---
@@ -761,6 +956,10 @@ INSTRUCTIONS = (
     'for a stream you mean to follow indefinitely. Scope the TTL to the work in flight and let it lapse: '
     'ttl_hours:0 pins a topic forever, and since deliveries land in whichever session is active, a pinned '
     'topic interrupts unrelated work indefinitely. '
+    'For a STANDING WATCH nobody is actively working on (new issues, failing CI on the box\'s own '
+    'repos), pass deliver_to:"subagent" instead: each matching event batch then spawns a FRESH session '
+    'rather than landing here — those subscriptions are shared across sessions, survive this one, and '
+    'default to pinned (ttl 0), which is safe there because nothing gets interrupted. '
     'To mute echoes of your own actions (your comments, your issue edits) pass ignore_senders — e.g. '
     'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe; CI-outcome '
     'events (workflow_run etc.) are always delivered regardless. '
@@ -779,7 +978,9 @@ TOOLS = [
             'runs, comments, payments, ...). Subscriptions persist across sessions but EXPIRE '
             '%dh after the clock was last reset — re-subscribing resets it (and updates note / '
             'ignore_senders / ttl_hours / renew_on_event in place), as does a "warm" delivery <10min after the '
-            'previous; renew_on_event:true resets it on every delivery instead.' % DEFAULT_TTL_HOURS,
+            'previous; renew_on_event:true resets it on every delivery instead. For a standing watch that '
+            'should NOT land in this session, pass deliver_to:"subagent" — each matching event batch then '
+            'spawns a fresh session.' % DEFAULT_TTL_HOURS,
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -802,8 +1003,21 @@ TOOLS = [
                         '(one arriving <10min after the previous, while the cache is still hot). A larger value suits '
                         'an awaited response that will take days. Prefer a TTL scoped to the work in flight: 0 pins '
                         'the topic forever, and deliveries land in whichever session is active, so a pinned topic '
-                        'interrupts unrelated work indefinitely. Omit to keep '
-                        'the existing override on renew.' % DEFAULT_TTL_HOURS,
+                        'interrupts unrelated work indefinitely. (With deliver_to:"subagent" the reverse holds: '
+                        'events spawn a fresh session instead of interrupting one, so 0 is safe and is the '
+                        'default there.) Omit to keep the existing override on renew.' % DEFAULT_TTL_HOURS,
+                },
+                'deliver_to': {
+                    'type': 'string',
+                    'enum': ['session', 'subagent'],
+                    'description':
+                        'Where matching events go. "session" (default): into THIS session as channel '
+                        'messages. "subagent": the receiver daemon spawns a FRESH agent session per event '
+                        'batch instead of interrupting anyone — the right shape for a standing watch (new '
+                        'issues, failing CI on a repo no session is working on). Subagent subscriptions are '
+                        'SHARED across sessions, survive this one, and default to ttl_hours 0 (pinned). '
+                        'Bursts coalesce: events arriving while a spawned session is starting are batched '
+                        'into one follow-up session rather than one each.',
                 },
                 'renew_on_event': {
                     'type': 'boolean',
@@ -832,18 +1046,26 @@ TOOLS = [
         'description':
             'Stop routing webhook events for the given topic. Call when you wrap up work and no longer need '
             "the notifications. Pattern must match exactly what was subscribed (unsubscribing 'github:owner/repo' "
-            "does not remove a 'github:owner/*' subscription). Idempotent.",
+            "does not remove a 'github:owner/*' subscription). Pass deliver_to:\"subagent\" to remove a "
+            'dispatch (standing-watch) subscription instead of one of this session\'s. Idempotent.',
         'inputSchema': {
             'type': 'object',
             'properties': {
                 'topic': {'type': 'string', 'description': 'Topic pattern previously passed to webhook_subscribe.'},
+                'deliver_to': {
+                    'type': 'string',
+                    'enum': ['session', 'subagent'],
+                    'description': 'Which list to remove from: "session" (default) = this session\'s '
+                                   'subscriptions; "subagent" = the shared dispatch standing watches.',
+                },
             },
             'required': ['topic'],
         },
     },
     {
         'name': 'webhook_subscriptions',
-        'description': 'Return the current topic subscription list and the channel-enabled flag.',
+        'description': 'Return this session\'s topic subscriptions, the shared dispatch (standing-watch) '
+                       'list if any, and the channel-enabled flag.',
         'inputSchema': {'type': 'object', 'properties': {}},
     },
 ]
@@ -856,41 +1078,67 @@ def call_tool(params):
     name = params.get('name')
     arguments = params.get('arguments') if isinstance(params.get('arguments'), dict) else {}
 
+    # deliver_to picks the subscription scope: this session's own filter file
+    # (default), or the shared dispatch file whose matches spawn a fresh
+    # session instead of landing here.
+    raw_dt = arguments.get('deliver_to', _MISSING)
+    if raw_dt not in (_MISSING, 'session', 'subagent'):
+        return text('error: deliver_to must be "session" or "subagent"')
+    dispatch = raw_dt == 'subagent'
+    path = DISPATCH_FILE if dispatch else FILTER_FILE
+
     with FILTER_LOCK:
+        now = now_ms()
+
         # Every tool call is also a pruning opportunity: expired topics drop out
         # here even if no delivery ever arrives to trigger route_event's prune.
-        f = read_filter()
-        now = now_ms()
-        expired = [e for e in f['topics'] if entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
-        if expired:
-            f['topics'] = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
-            write_filter(f)
-        expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
+        def pruned(p):
+            f = read_filter(p)
+            expired = [e for e in f['topics'] if entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
+            if expired:
+                f['topics'] = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
+                write_filter(f, p)
+            return f, expired
+
+        def render(e, default_ttl):
+            o = {'topic': e['topic']}
+            if e['note']:
+                o['note'] = e['note']
+            if e['ttlHours'] is not None:
+                o['ttlHours'] = e['ttlHours']
+            if e['renewOnEvent']:
+                o['renewOnEvent'] = True
+            if e['ignoreSenders']:
+                o['ignoreSenders'] = e['ignoreSenders']
+            if e['subscribedAt']:
+                o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
+            if e['lastActivityAt']:
+                o['lastActivity'] = '%s ago' % age_str(e['lastActivityAt'], now)
+            o['expiresIn'] = expires_str(e, default_ttl, now)
+            return o
 
         if name == 'webhook_subscriptions':
-            topics = []
-            for e in f['topics']:
-                o = {'topic': e['topic']}
-                if e['note']:
-                    o['note'] = e['note']
-                if e['ttlHours'] is not None:
-                    o['ttlHours'] = e['ttlHours']
-                if e['renewOnEvent']:
-                    o['renewOnEvent'] = True
-                if e['ignoreSenders']:
-                    o['ignoreSenders'] = e['ignoreSenders']
-                if e['subscribedAt']:
-                    o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
-                if e['lastActivityAt']:
-                    o['lastActivity'] = '%s ago' % age_str(e['lastActivityAt'], now)
-                o['expiresIn'] = expires_str(e, f['ttlHours'], now)
-                topics.append(o)
+            f, expired = pruned(FILTER_FILE)
             body = {'enabled': f['enabled'], 'ttlHours': f['ttlHours']}
             if SELF:
                 body['self'] = SELF
             body['filterFile'] = FILTER_FILE
-            body['topics'] = topics
+            body['topics'] = [render(e, f['ttlHours']) for e in f['topics']]
+            # Dispatch standing watches are shared, so every session sees them.
+            d, dexpired = pruned(DISPATCH_FILE)
+            if d['topicsConfigured']:
+                body['dispatch'] = {'filterFile': DISPATCH_FILE, 'enabled': d['enabled'],
+                                    'topics': [render(e, d['ttlHours']) for e in d['topics']]}
+                info = receiver_info()
+                if info is not None and not info.get('spawn'):
+                    body['dispatch']['warning'] = ('receiver daemon has no LOCAL_WEBHOOK_SPAWN_CMD '
+                                                   'configured; dispatch topics are inert')
+                expired = expired + dexpired
+            expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
             return text(pretty(body) + expired_note)
+
+        f, expired = pruned(path)
+        expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
 
         topic = str(arguments.get('topic') if arguments.get('topic') is not None else '').strip()
         if GH_SHORTHAND.match(topic):
@@ -907,6 +1155,21 @@ def call_tool(params):
 
         def listing(ts):
             return ', '.join(show(e) for e in ts) or '(none)'
+
+        # Dispatch subscriptions only do anything if the ingress owner has a
+        # spawn command; the daemon advertises that in receiver.json, so warn
+        # here instead of letting an inert standing watch fail silently.
+        scope = ''
+        if dispatch:
+            info = receiver_info()
+            if info is not None and not info.get('spawn'):
+                scope = (' [dispatch — WARNING: the receiver daemon reports no LOCAL_WEBHOOK_SPAWN_CMD, '
+                         'so this subscription is inert until one is configured]')
+            elif info is None:
+                scope = (' [dispatch: matching events spawn a fresh session — could not verify the '
+                         'ingress owner has a spawn command]')
+            else:
+                scope = ' [dispatch: matching events spawn a fresh session]'
 
         if name == 'webhook_subscribe':
             raw_ig = arguments.get('ignore_senders', _MISSING)
@@ -941,27 +1204,36 @@ def call_tool(params):
                     e['renewOnEvent'] = raw_renew
                 topics = list(f['topics'])
                 topics[idx] = e
-                write_filter({**f, 'enabled': True, 'topics': topics})
-                return text('renewed subscription %s%s (current: %s)%s' % (show(e), ttl_msg(e), listing(topics), expired_note))
+                write_filter({**f, 'enabled': True, 'topics': topics}, path)
+                return text('renewed subscription %s%s%s (current%s: %s)%s' % (
+                    show(e), ttl_msg(e), scope, ' dispatch' if dispatch else '', listing(topics), expired_note))
             entry = {
                 'topic': topic,
                 'ignoreSenders': [str(x).strip() for x in (raw_ig if raw_ig is not _MISSING else []) if str(x).strip()],
                 'note': '' if raw_note is _MISSING else str(raw_note).strip()[:300],
-                'ttlHours': None if raw_ttl is _MISSING else raw_ttl,
+                # A dispatch entry defaults to pinned (ttlHours 0): it is a
+                # standing watch, and a spawned session has no warm cache whose
+                # loss the session-filter TTL exists to bound.
+                'ttlHours': (0 if dispatch else None) if raw_ttl is _MISSING else raw_ttl,
                 'renewOnEvent': raw_renew is True,
                 'subscribedAt': now_iso,
                 'lastActivityAt': '',
             }
             topics = f['topics'] + [entry]
-            write_filter({**f, 'enabled': True, 'topics': topics})
-            return text('subscribed to %s%s (current: %s)%s' % (show(entry), ttl_msg(entry), listing(topics), expired_note))
+            write_filter({**f, 'enabled': True, 'topics': topics}, path)
+            return text('subscribed to %s%s%s (current%s: %s)%s' % (
+                show(entry), ttl_msg(entry), scope, ' dispatch' if dispatch else '', listing(topics), expired_note))
 
         if name == 'webhook_unsubscribe':
             filtered = [e for e in f['topics'] if not eq(e['topic'], topic)]
             if len(filtered) == len(f['topics']):
-                return text('not subscribed to %s (current: %s)%s' % (topic, listing(f['topics']), expired_note))
-            write_filter({**f, 'topics': filtered})
-            return text('unsubscribed from %s (current: %s)%s' % (topic, listing(filtered), expired_note))
+                return text('not subscribed to %s%s (current%s: %s)%s' % (
+                    topic, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
+                    listing(f['topics']), expired_note))
+            write_filter({**f, 'topics': filtered}, path)
+            return text('unsubscribed from %s%s (current%s: %s)%s' % (
+                topic, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
+                listing(filtered), expired_note))
 
         return text('error: unknown tool %s' % name)
 
@@ -1078,6 +1350,7 @@ def deliver(handler, body):
     if not RECEIVER_ONLY:
         handle_event(env)  # legacy: the ingress-owning session gets it too
     broadcast(env)
+    dispatch_event(env)  # standing watches: spawn fresh sessions (issue #1)
     return done(200, 'ok')
 
 
@@ -1215,9 +1488,9 @@ def listen_ingress():
 # call_tool() so CLI and tool paths can never drift on TTL/renew semantics.
 CLI_USAGE = '''local-webhook %s — subscribe a session to webhook topics.
 
-usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS]
+usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
                                   [--renew-on-event] [--ignore-sender LOGIN]...
-       webhook.py unsubscribe TOPIC
+       webhook.py unsubscribe TOPIC [--deliver-to MODE]
        webhook.py ls
        webhook.py status
 
@@ -1228,8 +1501,14 @@ TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix)
                        fresh-context session knows what the event relates to
   --ttl HOURS          per-topic expiry, counted from the last (re)subscribe or
                        warm delivery. Default: the filter file's ttlHours (%d).
-                       0 pins forever — avoid it, a pinned topic interrupts
-                       whatever session is active, indefinitely
+                       0 pins forever — avoid it for session delivery, a pinned
+                       topic interrupts whatever session is active,
+                       indefinitely (for --deliver-to subagent, 0 is safe and
+                       is the default)
+  --deliver-to MODE    "session" (default): events land in this session.
+                       "subagent": the receiver spawns a FRESH session per
+                       event batch — the standing-watch shape; shared across
+                       sessions, survives this one, pinned (ttl 0) by default
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
@@ -1264,6 +1543,8 @@ def run_cli(argv):
             'filterFile': FILTER_FILE,
             'enabled': f['enabled'],
             'topicCount': len(f['topics']),
+            'dispatchTopicCount': len(read_filter(DISPATCH_FILE)['topics']),
+            'receiver': receiver_info(),
             'defaultSource': cfg['defaultSource'],
             'sources': {n: {'hasSecret': bool(source_secret(src))}
                         for n, src in cfg['sources'].items() if isinstance(src, dict)},
@@ -1303,6 +1584,11 @@ def run_cli(argv):
             if not math.isfinite(n) or n < 0:
                 die('--ttl must be a number >= 0 (0 = never expire)')
             args['ttl_hours'] = int(n) if n.is_integer() else n
+        elif a == '--deliver-to':
+            v = value().strip().lower()
+            if v not in ('session', 'subagent'):
+                die('--deliver-to must be "session" or "subagent"')
+            args['deliver_to'] = v
         elif a == '--renew-on-event':
             args['renew_on_event'] = True
         elif a == '--no-renew-on-event':
@@ -1335,18 +1621,34 @@ def run_cli(argv):
 
 
 # -------------------------------------------------------------------- main ---
-if CLI:
-    run_cli(CLI_ARGV)
-elif RECEIVER_ONLY:
-    httpd = listen_ingress()
-    if httpd is None:
-        # A daemon with no ingress would be exit(1) above; PORT=0 with no
-        # socket is a misconfiguration with nothing to serve.
-        print('local-webhook: receiver daemon has no ingress configured; exiting', file=sys.stderr)
-        sys.exit(1)
-    httpd.serve_forever()
-else:
-    httpd = listen_ingress()
-    if httpd is not None:
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    stdin_loop()
+# Behind a __main__ guard so the test suite can import the module and exercise
+# its pieces; .mcp.json and the daemon run the script directly, so nothing
+# changes for real callers.
+def main():
+    if CLI:
+        run_cli(CLI_ARGV)
+    elif RECEIVER_ONLY:
+        httpd = listen_ingress()
+        if httpd is None:
+            # A daemon with no ingress would be exit(1) above; PORT=0 with no
+            # socket is a misconfiguration with nothing to serve.
+            print('local-webhook: receiver daemon has no ingress configured; exiting', file=sys.stderr)
+            sys.exit(1)
+        # Advertise the daemon so webhook_subscribe can warn when a
+        # deliver_to:"subagent" subscription has no spawn command behind it.
+        try:
+            with open(RECEIVER_FILE, 'w', encoding='utf-8') as fh:
+                fh.write(pretty({'pid': os.getpid(), 'version': VERSION,
+                                 'spawn': bool(SPAWN_CMD), 'startedAt': iso_at(now_ms())}) + '\n')
+        except OSError:
+            pass
+        httpd.serve_forever()
+    else:
+        httpd = listen_ingress()
+        if httpd is not None:
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        stdin_loop()
+
+
+if __name__ == '__main__':
+    main()
