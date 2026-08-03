@@ -96,7 +96,9 @@ sender matches are dropped as echoes of the session's own actions (pass
 `LOCAL_WEBHOOK_SELF`. **CI-outcome events** (`workflow_run`, `workflow_job`,
 `check_run`, `check_suite`, `status`, `deployment_status`) are exempt from
 sender-ignore: their sender is merely who triggered the run, and muting your
-own login must not mute CI results for your own pushes.
+own login must not mute CI results for your own pushes. On a
+`deliver_to:"subagent"` watch that exemption narrows to *failing* outcomes
+(0.10.0) — see [Dispatch](#dispatch-delivery-into-a-fresh-session-090).
 
 ```json
 { "enabled": true, "ttlHours": 1, "topics": [
@@ -201,6 +203,27 @@ Differences from session routing, all deliberate:
   burst costs two sessions, not ten. At most `LOCAL_WEBHOOK_SPAWN_MAX` (2)
   spawn commands run concurrently across all keys. A failing spawn command is
   logged and its batch dropped; the same events already reached session peers.
+- **CI events only spawn on a failure (0.10.0).** `ignoreSenders` is overridden
+  for CI-outcome events because your own build breaking is news — but a run also
+  reports itself queued, in progress and finished-fine, and none of those
+  justify a session. On this path the override applies only to a terminal
+  non-success outcome (`failure`, `timed_out`, `action_required`,
+  `startup_failure`, `stale`, and `error`/`failure` for `status` /
+  `deployment_status`); anything else from an ignored sender is dropped. Session
+  delivery keeps the unconditional exemption — "merge on green" wants exactly
+  that green run. An outcome the payload does not state counts as a failure: a
+  swallowed break is the one error worth avoiding twice over.
+- **A live owner suppresses the spawn (0.10.0).** A standing watch is for events
+  nobody owns, so before spawning for a CI event the ingress owner asks whether
+  a live session peer's own filter already covers it — if so, that session is
+  getting this delivery and a second agent on the same PR (sharing one working
+  tree) is not help. Liveness comes from the peer's `instances/<key>.<pid>.sock`
+  entry, pid-checked, so a crashed session cannot mute a watch; the probe is
+  read-only, so it never renews the subscription it consults. Suppression is
+  logged. **Scoped to CI events on purpose:** topics are repo-granular while
+  ownership is object-granular, so a session working one PR must not silence the
+  watch for every unrelated new issue in that repo — `issues.opened` and other
+  people's PRs spawn regardless of who is subscribed.
 
 ### Per-identity filters
 
