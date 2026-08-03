@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.9.0'
+VERSION = '0.10.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -246,7 +246,10 @@ def verify(secret, sig_header, body):
 # ("@self" resolves to LOCAL_WEBHOOK_SELF). CI-outcome events are EXEMPT from
 # sender-ignore: GitHub stamps workflow_run etc. with whoever triggered the
 # run, so muting your own login would also mute CI results for your own pushes
-# — the main thing the channel exists to deliver.
+# — the main thing the channel exists to deliver. That exemption is
+# unconditional for session delivery (one extra message, in a session that
+# asked for the repo) and failures-only for dispatch, where the same event
+# costs a whole spawned session — see ci_outcome_is_news.
 # Missing file, bad JSON, or missing keys fail OPEN (forward everything).
 #
 # Subscriptions EXPIRE: sessions come and go (context gets cleared), and a
@@ -290,13 +293,21 @@ DEFAULT_TTL_HOURS = 1
 # cold re-read.
 WARM_WINDOW_MS = 10 * 60 * 1000
 FILTER_KEY = SESSION or SELF
-FILTER_FILE = os.path.join(STATE_DIR, 'filter.%s.json' % FILTER_KEY if FILTER_KEY else 'filter.json')
+
+
+def filter_path_of(key):
+    """The filter file a peer with this key reads. Shared with the dispatch
+    ownership probe, which resolves other peers' filters from their keys."""
+    return os.path.join(STATE_DIR, 'filter.%s.json' % key if key else 'filter.json')
+
+
+FILTER_FILE = filter_path_of(FILTER_KEY)
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix "
     "'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, renewOnEvent, "
     "subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events "
-    "like workflow_run are never sender-ignored) and expire ttlHours after subscribedAt (per-entry "
+    "like workflow_run are never sender-ignored on this path) and expire ttlHours after subscribedAt (per-entry "
     "ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe and on 'warm' "
     "deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; entries "
     "without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
@@ -319,12 +330,18 @@ DISPATCH_COMMENT = (
     "session per event batch (without a spawn command these entries are inert). Same schema and TTL "
     "semantics as a session filter file, but entries subscribed through the tools default to ttlHours:0 "
     "(a pinned standing watch). Unlike session routing, dispatch fails CLOSED: a missing or corrupt "
-    "file means spawn nothing."
+    "file means spawn nothing. Two extra brakes apply here only, because a spawn costs a whole session: "
+    "a CI-outcome event overrides ignoreSenders only when it reports a FAILURE (a green or in-progress "
+    "run from an ignored sender is dropped), and no CI-outcome event spawns at all while a live session "
+    "peer is subscribed to the same topic — it is already getting that delivery. Non-CI events (new "
+    "issues, others' PRs) spawn regardless of who is subscribed."
 )
 
-# Sender-ignore never applies to these: their payload sender is merely who
-# triggered the run, while the content (CI verdict, deploy status) is news.
-SENDER_IGNORE_EXEMPT = {
+# CI-outcome events: their payload sender is merely who triggered the run,
+# while the content (CI verdict, deploy status) is news. Two rules key on this
+# set — the sender-ignore exemption below, and the dispatch ownership probe
+# (see dispatch_event), which only ever suppresses a spawn for one of these.
+CI_EVENTS = {
     'workflow_run',
     'workflow_job',
     'check_run',
@@ -332,6 +349,47 @@ SENDER_IGNORE_EXEMPT = {
     'status',
     'deployment_status',
 }
+# The outcomes the exemption exists FOR. A run also reports itself queued, in
+# progress and finished-fine, and "your own build passed" is not the news that
+# justifies overriding an explicit ignoreSenders — see ci_outcome_is_news.
+CI_FAILURE_STATES = {
+    'failure',
+    'timed_out',
+    'action_required',
+    'startup_failure',
+    'stale',
+    'error',
+}
+
+
+def ci_outcome_is_news(event, payload):
+    """Is this CI event a terminal, non-success outcome?
+
+    Only consulted where over-delivering is expensive (dispatch spawns a whole
+    agent session), so it answers narrowly. Non-CI events are not its business
+    and get False — callers gate on CI_EVENTS first, and the flag is inert for
+    anything else. When the payload does not say (missing conclusion, a shape
+    GitHub changed under us) it answers True: swallowing a real failure is the
+    one error this must not make.
+    """
+    if event not in CI_EVENTS:
+        return False
+    if event == 'status':
+        return s(g(payload, 'state')) in CI_FAILURE_STATES
+    if event == 'deployment_status':
+        return s(g(payload, 'deployment_status', 'state')) in CI_FAILURE_STATES
+    # workflow_run / workflow_job / check_run / check_suite all carry their
+    # verdict as .conclusion on the event's own object, valid only once
+    # .action is "completed" — anything earlier is a lifecycle ping.
+    action = s(g(payload, 'action'))
+    if action and action != 'completed':
+        return False
+    obj = (g(payload, 'workflow_run') or g(payload, 'workflow_job')
+           or g(payload, 'check_run') or g(payload, 'check_suite'))
+    conclusion = g(obj, 'conclusion')
+    if conclusion is None:
+        return True
+    return s(conclusion) in CI_FAILURE_STATES
 
 # Topics are "source:key" with the same wildcard rules the old repo filter
 # had, generalized: "*", "github:*", "github:owner/*", "github:owner/name".
@@ -480,10 +538,18 @@ def match_topic(source, key, pat):
 # An entry's sender-ignore drops the event only for non-CI events whose sender
 # matches; "@self" resolves to LOCAL_WEBHOOK_SELF. With several entries
 # matching the same topic, the most permissive one wins (any yes → forward).
-def entry_forwards(e, sender, event):
+#
+# ci_exempt is that CI carve-out, made conditional for callers that can afford
+# it less. Session delivery keeps it unconditional (True): the cost of one
+# extra message in a session that asked for the repo is nil, and "merge on
+# green" wants precisely its own successful run. Dispatch passes
+# ci_outcome_is_news(), so a standing watch overrides ignoreSenders only for an
+# actual failure — a spawned session per green build is not a notification, it
+# is a fleet.
+def entry_forwards(e, sender, event, ci_exempt=True):
     if not e['ignoreSenders'] or not sender:
         return True
-    if event in SENDER_IGNORE_EXEMPT:
+    if ci_exempt and event in CI_EVENTS:
         return True
     sl = sender.lower()
     for x in e['ignoreSenders']:
@@ -503,7 +569,7 @@ def entry_forwards(e, sender, event):
 # Session routing fails OPEN (fail_open=True: no filter file → forward all, so
 # a botched edit degrades to noise); dispatch routing passes fail_open=False
 # because its worst case is not noise but a spawned session per delivery.
-def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True):
+def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True, ci_exempt=True):
     with FILTER_LOCK:
         f = read_filter(path)
         if not f['enabled']:
@@ -522,7 +588,8 @@ def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True):
                           for e in live)
         else:
             for e in live:
-                if not match_topic(source, key, e['topic']) or not entry_forwards(e, sender, event):
+                if not match_topic(source, key, e['topic']) or \
+                        not entry_forwards(e, sender, event, ci_exempt):
                     continue
                 forward = True
                 if matched is None:
@@ -540,6 +607,35 @@ def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True):
         return {'forward': forward, 'entry': matched}
 
 
+# Read-only counterpart to route_event, for asking about SOMEONE ELSE's
+# subscription (dispatch ownership, below). Three deliberate differences:
+#   - it writes nothing. A probe must not stamp lastActivityAt, renew a TTL or
+#     prune expired entries in a file it does not own — looking at a
+#     subscription cannot be what keeps it alive.
+#   - it does not fail open. A missing or corrupt filter means "this session
+#     claims nothing", because here a yes SUPPRESSES a spawn: failing open
+#     would silently mute standing watches, the one outcome dispatch is built
+#     to avoid.
+#   - it answers about the filter as its owner would see it, so ci_exempt keeps
+#     the session default.
+# Expiry is read, never applied: an expired entry claims nothing.
+def filter_claims(path, source, key, sender, event):
+    f = read_filter(path)
+    if not f['enabled'] or not f['topicsConfigured']:
+        return False
+    now = now_ms()
+    for e in f['topics']:
+        if entry_expired(e, f['ttlHours'], now):
+            continue
+        if not key:
+            if e['topic'] == '*' or e['topic'].lower().startswith(source.lower() + ':'):
+                return True
+            continue
+        if match_topic(source, key, e['topic']) and entry_forwards(e, sender, event):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------- fan-out ---
 # One process owns the HTTP ingress (the RECEIVER_ONLY daemon on agent-box, or
 # whichever session won the port race in the legacy setup); every session runs
@@ -553,7 +649,60 @@ def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True):
 # Stale sockets from crashed instances are unlinked on first failed connect.
 INSTANCE_DIR = os.path.join(STATE_DIR, 'instances')
 os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
-IPC_SOCK = os.path.join(INSTANCE_DIR, '%d.sock' % os.getpid())
+# "<filter key>.<pid>.sock" since 0.10.0 — the pid keeps the name unique, the
+# key says WHOSE subscriptions this peer applies, which is what lets the
+# ingress owner ask "is a live session already watching this?" before spawning
+# a standing-watch session (peer_scopes_live / dispatch_event). An unscoped
+# instance yields ".<pid>.sock" (empty key = the shared filter.json), and a
+# pre-0.10.0 peer's "<pid>.sock" parses to no key at all: it claims nothing,
+# so a mixed-version state dir loses the suppression rather than misapplying
+# it. The envelope on the wire is unchanged; only the filename carries more.
+IPC_SOCK = os.path.join(INSTANCE_DIR, '%s.%d.sock' % (FILTER_KEY, os.getpid()))
+
+
+def peer_scope(name):
+    """(filter key, pid) encoded in an instance socket filename, or None when
+    the name carries no scope — a pre-0.10.0 peer, or something else entirely."""
+    if not name.endswith('.sock'):
+        return None
+    key, dot, pid = name[:-len('.sock')].rpartition('.')
+    if not dot or not pid.isdigit():
+        return None
+    return key, int(pid)
+
+
+def peer_scopes_live():
+    """Filter keys of the session peers actually running right now.
+
+    A socket file alone is not proof of life: broadcast() unlinks one only
+    after a failed connect, so a crashed peer's socket outlives it until the
+    next delivery. Since the caller turns "a live session owns this" into a
+    suppressed spawn, a dead peer left in the listing would mute a standing
+    watch until something else cleaned up — so liveness is checked against the
+    pid, not the directory entry.
+    """
+    try:
+        names = os.listdir(INSTANCE_DIR)
+    except OSError:
+        return []
+    scopes = []
+    for n in names:
+        parsed = peer_scope(n)
+        if parsed is None:
+            continue
+        key, pid = parsed
+        # Our own socket counts. In the legacy shape the ingress owner IS a
+        # session peer (deliver() self-delivers before broadcasting), so its
+        # subscription owns the event exactly like any sibling's. The
+        # RECEIVER_ONLY daemon opens no socket and so never appears here.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass  # EPERM: alive, just not ours to signal
+        scopes.append(key)
+    return scopes
 
 
 # One rendering for both delivery paths — the channel notification a session
@@ -800,15 +949,46 @@ class Dispatcher:
 DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) if SPAWN_CMD else None
 
 
+# A standing watch is for events NOBODY owns. A live session peer whose own
+# subscription covers the event is exactly the signal that somebody does — it
+# is already getting this delivery — so spawning a second agent for it just
+# puts two of them on one PR, sharing one working tree.
+#
+# Scoped to CI events on purpose. Those are what a session driving a PR is
+# already watching, and they are the whole duplicate-spawn problem. Genuinely
+# new work — issues.opened, someone else's pull_request — must still spawn its
+# own session no matter who is subscribed: topics are repo-granular while
+# ownership is object-granular, so a session working one PR would otherwise
+# silence the watch for every unrelated issue in that repo for the life of its
+# subscription.
+def owned_by_live_session(env):
+    for key in peer_scopes_live():
+        if filter_claims(filter_path_of(key), env.get('source', ''), env.get('key', ''),
+                         env.get('sender', ''), env.get('event', '')):
+            return key or '(unscoped)'
+    return None
+
+
 def dispatch_event(env):
     # Ingress owner only: called from deliver(), never on the peer IPC path,
     # so one delivery can only ever dispatch once however many peers exist.
     if DISPATCHER is None:
         return
+    event = env.get('event', '')
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
-                    env.get('event', ''), path=DISPATCH_FILE, fail_open=False)
+                    event, path=DISPATCH_FILE, fail_open=False,
+                    ci_exempt=ci_outcome_is_news(event, env.get('payload')))
     if not r['forward']:
         return
+    if event in CI_EVENTS:
+        owner = owned_by_live_session(env)
+        if owner:
+            # Said out loud: a suppressed spawn is indistinguishable from a
+            # watch that quietly stopped working, and that ambiguity is its own
+            # bug (agent-box#170).
+            print('local-webhook: not spawning for %s on %s — session %s is subscribed to it'
+                  % (event or '(none)', env.get('key', '') or '(none)', owner), file=sys.stderr)
+            return
     entry = r['entry']
     text, _ = format_delivery(env, entry)
     DISPATCHER.add(env.get('key', '') or '(none)', text, {
@@ -962,7 +1142,10 @@ INSTRUCTIONS = (
     'default to pinned (ttl 0), which is safe there because nothing gets interrupted. '
     'To mute echoes of your own actions (your comments, your issue edits) pass ignore_senders — e.g. '
     'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe; CI-outcome '
-    'events (workflow_run etc.) are always delivered regardless. '
+    'events (workflow_run etc.) are always delivered to a SESSION regardless, so "merge on green" still '
+    'works while your own comments stay muted. Standing watches are stricter, so they cannot pile up '
+    'sessions behind you: they spawn on a CI event only if it reports a failure, and never while a live '
+    'session is subscribed to that topic (a new issue or someone else\'s PR still spawns either way). '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -1035,7 +1218,8 @@ TOOLS = [
                     'description':
                         'Optional senders whose events on this topic are dropped as echoes of your own actions '
                         '(e.g. your own GitHub login; "@self" resolves to LOCAL_WEBHOOK_SELF). CI-outcome events '
-                        '(workflow_run, check_run, ...) are exempt and always delivered. Omit or pass [] to clear.',
+                        '(workflow_run, check_run, ...) are exempt and always delivered to a session; on a '
+                        'deliver_to:"subagent" watch only a FAILING one is. Omit or pass [] to clear.',
                 },
             },
             'required': ['topic'],
@@ -1508,12 +1692,17 @@ TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix)
   --deliver-to MODE    "session" (default): events land in this session.
                        "subagent": the receiver spawns a FRESH session per
                        event batch — the standing-watch shape; shared across
-                       sessions, survives this one, pinned (ttl 0) by default
+                       sessions, survives this one, pinned (ttl 0) by default.
+                       Two brakes keep a watch from piling up sessions behind
+                       you: a CI event spawns only if it reports a FAILURE, and
+                       never while a live session is subscribed to that topic.
+                       A new issue or someone else's PR spawns either way
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
                        own actions (repeatable; "@self" = $LOCAL_WEBHOOK_SELF).
-                       CI-outcome events are always delivered anyway.
+                       CI-outcome events reach a session anyway; a standing
+                       watch takes only the failing ones.
 
 Subscriptions are per session (LOCAL_WEBHOOK_SESSION) and hot-reloaded, so this
 takes effect on the next delivery with no session restart.''' % (VERSION, DEFAULT_TTL_HOURS)
