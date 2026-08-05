@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.10.0'
+VERSION = '0.10.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -248,8 +248,9 @@ def verify(secret, sig_header, body):
 # run, so muting your own login would also mute CI results for your own pushes
 # — the main thing the channel exists to deliver. That exemption is
 # unconditional for session delivery (one extra message, in a session that
-# asked for the repo) and failures-only for dispatch, where the same event
-# costs a whole spawned session — see ci_outcome_is_news.
+# asked for the repo). Dispatch is stricter than an exemption: there a CI event
+# spawns only on a FAILURE, sender irrelevant, because the same event costs a
+# whole spawned session — see ci_outcome_is_news and dispatch_event.
 # Missing file, bad JSON, or missing keys fail OPEN (forward everything).
 #
 # Subscriptions EXPIRE: sessions come and go (context gets cleared), and a
@@ -331,16 +332,17 @@ DISPATCH_COMMENT = (
     "semantics as a session filter file, but entries subscribed through the tools default to ttlHours:0 "
     "(a pinned standing watch). Unlike session routing, dispatch fails CLOSED: a missing or corrupt "
     "file means spawn nothing. Two extra brakes apply here only, because a spawn costs a whole session: "
-    "a CI-outcome event overrides ignoreSenders only when it reports a FAILURE (a green or in-progress "
-    "run from an ignored sender is dropped), and no CI-outcome event spawns at all while a live session "
-    "peer is subscribed to the same topic — it is already getting that delivery. Non-CI events (new "
-    "issues, others' PRs) spawn regardless of who is subscribed."
+    "a CI-outcome event spawns ONLY when it reports a FAILURE — a green, queued or in-progress run is "
+    "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
+    "at all while a live session peer is subscribed to the same topic, since it is already getting that "
+    "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed."
 )
 
 # CI-outcome events: their payload sender is merely who triggered the run,
-# while the content (CI verdict, deploy status) is news. Two rules key on this
-# set — the sender-ignore exemption below, and the dispatch ownership probe
-# (see dispatch_event), which only ever suppresses a spawn for one of these.
+# while the content (CI verdict, deploy status) is news. Three rules key on this
+# set — the sender-ignore exemption below, the dispatch failure-only spawn gate,
+# and the dispatch ownership probe (both in dispatch_event, and both only ever
+# suppress a spawn for one of these).
 CI_EVENTS = {
     'workflow_run',
     'workflow_job',
@@ -366,11 +368,12 @@ def ci_outcome_is_news(event, payload):
     """Is this CI event a terminal, non-success outcome?
 
     Only consulted where over-delivering is expensive (dispatch spawns a whole
-    agent session), so it answers narrowly. Non-CI events are not its business
-    and get False — callers gate on CI_EVENTS first, and the flag is inert for
-    anything else. When the payload does not say (missing conclusion, a shape
-    GitHub changed under us) it answers True: swallowing a real failure is the
-    one error this must not make.
+    agent session), so it answers narrowly: on that path it decides the spawn
+    outright, not merely whether a CI event may override an ignored sender.
+    Non-CI events are not its business and get False — callers gate on
+    CI_EVENTS first, and the flag is inert for anything else. When the payload
+    does not say (missing conclusion, a shape GitHub changed under us) it
+    answers True: swallowing a real failure is the one error this must not make.
     """
     if event not in CI_EVENTS:
         return False
@@ -545,7 +548,9 @@ def match_topic(source, key, pat):
 # green" wants precisely its own successful run. Dispatch passes
 # ci_outcome_is_news(), so a standing watch overrides ignoreSenders only for an
 # actual failure — a spawned session per green build is not a notification, it
-# is a fleet.
+# is a fleet. Note this flag alone does not make dispatch failures-only: it
+# decides who may override an ignore list, and an unignored sender never needed
+# one. dispatch_event owns that verdict.
 def entry_forwards(e, sender, event, ci_exempt=True):
     if not e['ignoreSenders'] or not sender:
         return True
@@ -975,12 +980,26 @@ def dispatch_event(env):
     if DISPATCHER is None:
         return
     event = env.get('event', '')
+    news = ci_outcome_is_news(event, env.get('payload'))
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
-                    event, path=DISPATCH_FILE, fail_open=False,
-                    ci_exempt=ci_outcome_is_news(event, env.get('payload')))
+                    event, path=DISPATCH_FILE, fail_open=False, ci_exempt=news)
     if not r['forward']:
         return
     if event in CI_EVENTS:
+        # A green (or queued, or in-progress) run is not news for a watch on
+        # events NOBODY owns, whoever triggered it. 0.10.0 only reached this
+        # verdict through ignoreSenders — the outcome merely decided whether a
+        # CI event could override an ignored sender — so a watch whose ignore
+        # list didn't happen to name the pusher spawned a session per green
+        # build anyway: one merge to master emitted check_run.completed,
+        # workflow_run success and a Pages deployment, and each took a hook
+        # session slot to conclude "nothing to do". The sender is the wrong
+        # question here; the outcome is the whole question.
+        if not news:
+            print('local-webhook: not spawning for %s on %s — no failing outcome, '
+                  'and a standing watch is not a build log'
+                  % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
+            return
         owner = owned_by_live_session(env)
         if owner:
             # Said out loud: a suppressed spawn is indistinguishable from a

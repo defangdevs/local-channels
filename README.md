@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.10.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch |
+| [`local-webhook`](local-webhook/) | 0.10.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch |
 
 ## Requirements
 
@@ -188,11 +188,14 @@ CI-outcome events (`workflow_run`, `workflow_job`, `check_run`, `check_suite`,
 triggered the run, and muting your own login must not mute CI results for your
 own pushes. Where several entries match one event, the most permissive wins.
 
-On a `deliver_to:"subagent"` standing watch the exemption is narrower (0.10.0):
-it applies only to a *failing* outcome, and no CI event spawns at all while a
-live session is subscribed to that topic — a session driving a PR is already
-watching its CI, and a second agent on the same branch is not help. Non-CI
-events (a new issue, someone else's PR) spawn regardless of who is subscribed.
+A `deliver_to:"subagent"` standing watch is stricter than an exemption: a CI
+event spawns a session only when it reports a *failing* outcome, whoever
+triggered it (0.10.1 — through 0.10.0 the outcome only decided whether a CI
+event could override an ignored sender, so a green run from an unignored sender
+still spawned). And no CI event spawns at all while a live session is subscribed
+to that topic — a session driving a PR is already watching its CI, and a second
+agent on the same branch is not help. Non-CI events (a new issue, someone else's
+PR) spawn regardless of who is subscribed.
 
 ### Per-session filters
 
