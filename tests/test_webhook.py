@@ -435,8 +435,9 @@ class TestDispatchEvent(StateDirCase):
 
 
 class TestDispatchBrakes(StateDirCase):
-    """0.10.0: a standing watch spawns for CI only on a failure, and never
-    while a live session peer is already subscribed to the topic."""
+    """A standing watch spawns for CI only on a failure (0.10.0, made
+    sender-independent in 0.10.1), and never while a live session peer is
+    already subscribed to the topic (0.10.0)."""
 
     def setUp(self):
         StateDirCase.setUp(self)
@@ -504,11 +505,44 @@ class TestDispatchBrakes(StateDirCase):
         self.mod.dispatch_event(self.run_env(None, action='requested'))
         self.spawned(False)
 
-    def test_green_run_from_another_sender_still_spawns(self):
-        # The narrowing only lets ignoreSenders apply; it is not a global mute.
+    def test_green_run_from_an_unignored_sender_does_not_spawn(self):
+        # 0.10.1 reversal: through 0.10.0 the outcome only decided whether a CI
+        # event could override ignoreSenders, so a green run from a sender the
+        # watch did not name spawned a session — and a watch on a repo whose
+        # humans push under their own logins names nobody. The sender was never
+        # the question: no green build is worth an agent, whoever triggered it.
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
                   ignore_senders=['me'])
         self.mod.dispatch_event(self.run_env('success', sender='someone'))
+        self.spawned(False)
+
+    def test_green_run_spawns_nothing_with_no_ignore_list_at_all(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.mod.dispatch_event(self.run_env('success', sender='someone'))
+        self.spawned(False)
+
+    def test_cancelled_and_lifecycle_from_an_unignored_sender_do_not_spawn(self):
+        # One merge emits a supersede-cancelled run and several lifecycle pings;
+        # a cancelled run is not a failure — its successor reports the verdict.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.mod.dispatch_event(self.run_env('cancelled', sender='someone'))
+        self.spawned(False)
+        self.mod.dispatch_event(self.run_env(None, action='in_progress', sender='someone'))
+        self.spawned(False)
+
+    def test_green_check_run_from_an_unignored_sender_does_not_spawn(self):
+        # The exact shape that spawned a session on this box: a merge to master
+        # fanned out check_run.completed/success per job.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.mod.dispatch_event(self.env('check_run', {
+            'action': 'completed',
+            'check_run': {'name': 'build', 'status': 'completed', 'conclusion': 'success'},
+        }, sender='someone'))
+        self.spawned(False)
+
+    def test_failing_run_from_an_unignored_sender_spawns(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.mod.dispatch_event(self.run_env('failure', sender='someone'))
         self.spawned(True, 'workflow "CI"')
 
     # -- brake 2: a live session that owns the topic suppresses the spawn ----
@@ -811,9 +845,9 @@ class TestEndToEnd(unittest.TestCase):
                                  'head_branch': 'main', 'html_url': 'https://x/run/1'}}
 
     def test_dispatch_ci_brakes_end_to_end(self):
-        """0.10.0, real signed deliveries: a standing watch must not spawn for a
-        green run behind an ignored sender, nor for a failure a live session is
-        already subscribed to — but must spawn once that session is gone."""
+        """Real signed deliveries: a standing watch must not spawn for a green
+        run — from an ignored sender or any other (0.10.1) — nor for a failure a
+        live session is already subscribed to, but must spawn once it is gone."""
         r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent',
                      '--ignore-sender', 'someone', '--note', 'standing watch')
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -821,6 +855,16 @@ class TestEndToEnd(unittest.TestCase):
         r = self.cli('subscribe', 'o/r', '--note', 'driving PR 1', session='ownersess')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.start_daemon()
+
+        # Brake 1, the 0.10.1 half: a green run from a sender the watch does NOT
+        # ignore. No peer is live yet, so the outcome is the only thing that can
+        # be suppressing this spawn.
+        self.assertEqual(self.post(self.run_payload('success', sender='outsider'),
+                                   event='workflow_run')[0], 200)
+        time.sleep(1)
+        self.assertFalse(os.path.exists(self.spawn_log),
+                         'green run from an unignored sender spawned a session')
+
         peer = self.start_peer('ownersess')
 
         # Brake 1: green run from the ignored sender — nothing to spawn for.
