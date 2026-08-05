@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.10.1'
+VERSION = '0.11.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -306,12 +306,15 @@ FILTER_FILE = filter_path_of(FILTER_KEY)
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix "
-    "'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, ttlHours, renewOnEvent, "
-    "subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; CI-outcome events "
-    "like workflow_run are never sender-ignored on this path) and expire ttlHours after subscribedAt (per-entry "
-    "ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe and on 'warm' "
-    "deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; entries "
-    "without timestamps don't expire until a write stamps them). Delete file to fail open (forward all)."
+    "'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, when, drop, ttlHours, "
+    "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; "
+    "CI-outcome events like workflow_run are never sender-ignored on this path) and expire ttlHours after "
+    "subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe "
+    "and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; "
+    "entries without timestamps don't expire until a write stamps them). Optional when/drop are payload "
+    "predicates ({any/all: [...]} over {path, in/notIn} leaves): drop refuses matching events, when accepts "
+    "ONLY matching ones, and an entry carrying either opts out of the built-in CI carve-outs — the "
+    "predicate is authoritative. Delete file to fail open (forward all)."
 )
 
 # Dispatch subscriptions (issue #1): entries in this file ask for delivery into
@@ -335,7 +338,9 @@ DISPATCH_COMMENT = (
     "a CI-outcome event spawns ONLY when it reports a FAILURE — a green, queued or in-progress run is "
     "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
     "at all while a live session peer is subscribed to the same topic, since it is already getting that "
-    "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed."
+    "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed. An entry "
+    "with when/drop payload predicates replaces the failures-only brake with its own rules (the live-peer "
+    "brake still applies); see the session filter comment for the predicate shape."
 )
 
 # CI-outcome events: their payload sender is merely who triggered the run,
@@ -425,6 +430,11 @@ def normalize_entry(t):
         return {
             'topic': t['topic'],
             'ignoreSenders': ig,
+            # Kept as written, even if malformed: match_predicate answers False
+            # (loudly) for a bad node, and normalizing a typo'd `when` AWAY
+            # would fail open — the wrong direction for a dispatch entry.
+            'when': t.get('when', None),
+            'drop': t.get('drop', None),
             'note': t['note'][:300] if isinstance(t.get('note'), str) else '',
             'ttlHours': ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else None,
             'renewOnEvent': t.get('renewOnEvent') is True,
@@ -475,6 +485,10 @@ def write_filter(f, path=FILTER_FILE):
             o['renewOnEvent'] = True
         if e['ignoreSenders']:
             o['ignoreSenders'] = e['ignoreSenders']
+        if e['when'] is not None:
+            o['when'] = e['when']
+        if e['drop'] is not None:
+            o['drop'] = e['drop']
         if e['lastActivityAt']:
             o['lastActivityAt'] = e['lastActivityAt']
         topics.append(o)
@@ -538,6 +552,84 @@ def match_topic(source, key, pat):
     return key.lower() == pk.lower()
 
 
+# ------------------------------------------------- payload predicates (#14) ---
+# Per-entry `when`/`drop` let a subscription decide on payload CONTENT, not just
+# topic and sender — the event-agnostic filter that keeps consumer policy
+# ("spawn on issues.opened, drop closed-PR echoes") out of this file's code.
+# Same seam keyPath/senderPath established: config supplies a dot-path, the
+# daemon supplies the evaluator. The language is deliberately tiny — {any:[…]},
+# {all:[…]}, and leaves {path, in:[…]} / {path, notIn:[…]} — because anything
+# richer belongs in the consumer, not the wire format.
+def get_path(obj, path):
+    for k in path.split('.'):
+        if obj is None or not isinstance(obj, dict):
+            return None
+        obj = obj.get(k)
+    return obj
+
+
+def scalar_eq(a, b):
+    # JSON true/false must not match 1/0 (Python bool is an int subclass);
+    # everything else compares as JSON would. None == None lets a predicate
+    # list null to match an ABSENT path.
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return a == b
+
+
+def match_predicate(pred, payload):
+    """True iff the predicate matches the payload.
+
+    A malformed node matches NOTHING, loudly: for `when` that mutes, for `drop`
+    that forwards, and either way a stderr line keeps the misconfiguration
+    distinguishable from a watch that quietly stopped working (agent-box#170).
+    The tools reject malformed predicates at subscribe time (predicate_error),
+    so this only triggers on a hand-edited filter file.
+    """
+    if isinstance(pred, dict):
+        if 'any' in pred and isinstance(pred['any'], list):
+            return any(match_predicate(x, payload) for x in pred['any'])
+        if 'all' in pred and isinstance(pred['all'], list):
+            return all(match_predicate(x, payload) for x in pred['all'])
+        neg = 'notIn' in pred and 'in' not in pred
+        vals = pred.get('notIn') if neg else pred.get('in')
+        if isinstance(pred.get('path'), str) and pred['path'] and isinstance(vals, list) \
+                and not ('in' in pred and 'notIn' in pred):
+            v = get_path(payload, pred['path'])
+            hit = any(scalar_eq(v, x) for x in vals)
+            return not hit if neg else hit
+    print('local-webhook: malformed predicate node %.200r — matching nothing' % (pred,),
+          file=sys.stderr)
+    return False
+
+
+def predicate_error(pred, where='predicate'):
+    """None if well-formed, else what is wrong and where — the subscribe-time
+    mirror of match_predicate, so a typo is an error now, not a mute later."""
+    if not isinstance(pred, dict):
+        return '%s must be an object' % where
+    if 'any' in pred or 'all' in pred:
+        k = 'any' if 'any' in pred else 'all'
+        if not isinstance(pred[k], list):
+            return '%s.%s must be an array of predicates' % (where, k)
+        for i, x in enumerate(pred[k]):
+            err = predicate_error(x, '%s.%s[%d]' % (where, k, i))
+            if err:
+                return err
+        return None
+    if not isinstance(pred.get('path'), str) or not pred.get('path'):
+        return '%s needs "any", "all", or a leaf with a "path" string' % where
+    if ('in' in pred) == ('notIn' in pred):
+        return '%s (path %s) needs exactly one of "in" / "notIn"' % (where, pred['path'])
+    vals = pred['in'] if 'in' in pred else pred['notIn']
+    if not isinstance(vals, list):
+        return '%s (path %s): "in"/"notIn" must be an array' % (where, pred['path'])
+    for x in vals:
+        if not (x is None or isinstance(x, (str, int, float, bool))):
+            return '%s (path %s): values must be JSON scalars' % (where, pred['path'])
+    return None
+
+
 # An entry's sender-ignore drops the event only for non-CI events whose sender
 # matches; "@self" resolves to LOCAL_WEBHOOK_SELF. With several entries
 # matching the same topic, the most permissive one wins (any yes → forward).
@@ -551,10 +643,25 @@ def match_topic(source, key, pat):
 # is a fleet. Note this flag alone does not make dispatch failures-only: it
 # decides who may override an ignore list, and an unignored sender never needed
 # one. dispatch_event owns that verdict.
-def entry_forwards(e, sender, event, ci_exempt=True):
+#
+# An entry carrying when/drop predicates is DECLARATIVE: its rules were written
+# by whoever configured it, so the built-in CI carve-out steps aside — a
+# predicate entry that wants "CI failures override my mute" says so positionally
+# ({path: workflow_run.conclusion, in: [failure, …]} under `when`) instead of
+# inheriting the welded-on exemption whose entanglement with ignoreSenders is
+# what this field exists to end. ignoreSenders still applies to such an entry,
+# but as a PURE sender mute (it now silences even that sender's CI failures —
+# prefer expressing sender rules inside the predicate).
+def entry_forwards(e, sender, event, payload=None, ci_exempt=True):
+    declarative = e['when'] is not None or e['drop'] is not None
+    if declarative:
+        if e['drop'] is not None and match_predicate(e['drop'], payload):
+            return False
+        if e['when'] is not None and not match_predicate(e['when'], payload):
+            return False
     if not e['ignoreSenders'] or not sender:
         return True
-    if ci_exempt and event in CI_EVENTS:
+    if not declarative and ci_exempt and event in CI_EVENTS:
         return True
     sl = sender.lower()
     for x in e['ignoreSenders']:
@@ -574,18 +681,19 @@ def entry_forwards(e, sender, event, ci_exempt=True):
 # Session routing fails OPEN (fail_open=True: no filter file → forward all, so
 # a botched edit degrades to noise); dispatch routing passes fail_open=False
 # because its worst case is not noise but a spawned session per delivery.
-def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True, ci_exempt=True):
+def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail_open=True, ci_exempt=True):
     with FILTER_LOCK:
         f = read_filter(path)
         if not f['enabled']:
-            return {'forward': False, 'entry': None}
+            return {'forward': False, 'entry': None, 'refused': False}
         if not f['topicsConfigured']:
-            return {'forward': fail_open, 'entry': None}  # no filter configured
+            return {'forward': fail_open, 'entry': None, 'refused': False}  # no filter configured
         now = now_ms()
         live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
         pruned = len(live) != len(f['topics'])
         forward = False
         matched = None
+        topic_hit = False  # some entry matched the topic, whatever it then said
         if not key:
             # Keyless payloads (github ping, generic events without a keyPath):
             # let them through if anything from this source is subscribed at all.
@@ -593,8 +701,10 @@ def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True, ci
                           for e in live)
         else:
             for e in live:
-                if not match_topic(source, key, e['topic']) or \
-                        not entry_forwards(e, sender, event, ci_exempt):
+                if not match_topic(source, key, e['topic']):
+                    continue
+                topic_hit = True
+                if not entry_forwards(e, sender, event, payload, ci_exempt):
                     continue
                 forward = True
                 if matched is None:
@@ -609,7 +719,11 @@ def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True, ci
                 write_filter({**f, 'topics': live}, path)
             except OSError:
                 pass
-        return {'forward': forward, 'entry': matched}
+        # refused: subscribed to the topic, but every matching entry said no
+        # (predicates or ignoreSenders). Distinct from "not subscribed" so the
+        # dispatch path can log the suppression (agent-box#170) without
+        # narrating every delivery for a repo nobody watches.
+        return {'forward': forward, 'entry': matched, 'refused': topic_hit and not forward}
 
 
 # Read-only counterpart to route_event, for asking about SOMEONE ELSE's
@@ -624,7 +738,7 @@ def route_event(source, key, sender, event, path=FILTER_FILE, fail_open=True, ci
 #   - it answers about the filter as its owner would see it, so ci_exempt keeps
 #     the session default.
 # Expiry is read, never applied: an expired entry claims nothing.
-def filter_claims(path, source, key, sender, event):
+def filter_claims(path, source, key, sender, event, payload=None):
     f = read_filter(path)
     if not f['enabled'] or not f['topicsConfigured']:
         return False
@@ -636,7 +750,7 @@ def filter_claims(path, source, key, sender, event):
             if e['topic'] == '*' or e['topic'].lower().startswith(source.lower() + ':'):
                 return True
             continue
-        if match_topic(source, key, e['topic']) and entry_forwards(e, sender, event):
+        if match_topic(source, key, e['topic']) and entry_forwards(e, sender, event, payload):
             return True
     return False
 
@@ -733,7 +847,8 @@ def format_delivery(env, entry):
 
 
 def handle_event(env):
-    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''), env.get('event', ''))
+    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''), env.get('event', ''),
+                    env.get('payload'))
     if not r['forward']:
         return
     text, meta = format_delivery(env, r['entry'])
@@ -969,7 +1084,7 @@ DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) i
 def owned_by_live_session(env):
     for key in peer_scopes_live():
         if filter_claims(filter_path_of(key), env.get('source', ''), env.get('key', ''),
-                         env.get('sender', ''), env.get('event', '')):
+                         env.get('sender', ''), env.get('event', ''), env.get('payload')):
             return key or '(unscoped)'
     return None
 
@@ -982,9 +1097,23 @@ def dispatch_event(env):
     event = env.get('event', '')
     news = ci_outcome_is_news(event, env.get('payload'))
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
-                    event, path=DISPATCH_FILE, fail_open=False, ci_exempt=news)
+                    event, env.get('payload'), path=DISPATCH_FILE, fail_open=False, ci_exempt=news)
     if not r['forward']:
+        if r['refused']:
+            # A watch covers this topic and turned the event down. Said out
+            # loud, like every other suppressed spawn: a deliberate drop must
+            # stay distinguishable from a watch that broke (agent-box#170).
+            print('local-webhook: not spawning for %s on %s — the subscribed watch '
+                  'declined it (when/drop rules or ignoreSenders)'
+                  % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
         return
+    # A declarative entry (when/drop) already ruled on this event inside
+    # entry_forwards — its rules REPLACE the hardcoded failures-only brake, or
+    # the consumer could never spawn on anything the brake drops. The live-peer
+    # probe below is NOT policy, it is session coordination, so it applies to
+    # every entry alike.
+    declarative = r['entry'] is not None and (
+        r['entry']['when'] is not None or r['entry']['drop'] is not None)
     if event in CI_EVENTS:
         # A green (or queued, or in-progress) run is not news for a watch on
         # events NOBODY owns, whoever triggered it. 0.10.0 only reached this
@@ -995,7 +1124,7 @@ def dispatch_event(env):
         # workflow_run success and a Pages deployment, and each took a hook
         # session slot to conclude "nothing to do". The sender is the wrong
         # question here; the outcome is the whole question.
-        if not news:
+        if not news and not declarative:
             print('local-webhook: not spawning for %s on %s — no failing outcome, '
                   'and a standing watch is not a build log'
                   % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
@@ -1118,14 +1247,6 @@ def summarize_generic(event, key, p):
     return content, meta
 
 
-def get_path(obj, path):
-    for k in path.split('.'):
-        if obj is None or not isinstance(obj, dict):
-            return None
-        obj = obj.get(k)
-    return obj
-
-
 # ------------------------------------------------------------ MCP (stdio) ---
 _STDOUT_LOCK = threading.Lock()
 
@@ -1165,6 +1286,9 @@ INSTRUCTIONS = (
     'works while your own comments stay muted. Standing watches are stricter, so they cannot pile up '
     'sessions behind you: they spawn on a CI event only if it reports a failure, and never while a live '
     'session is subscribed to that topic (a new issue or someone else\'s PR still spawns either way). '
+    'Subscriptions can also filter on payload CONTENT with when/drop predicates (see webhook_subscribe) — '
+    'e.g. deliver only issues/PRs being opened, or drop close/merge echoes without muting their sender; an '
+    'entry carrying them sets its own policy and the built-in CI carve-outs step aside for it. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -1240,6 +1364,27 @@ TOOLS = [
                         '(workflow_run, check_run, ...) are exempt and always delivered to a session; on a '
                         'deliver_to:"subagent" watch only a FAILING one is. Omit or pass [] to clear.',
                 },
+                'when': {
+                    'type': 'object',
+                    'description':
+                        'Optional payload predicate: deliver ONLY events matching it. Shape: {"any": [...]} / '
+                        '{"all": [...]} over leaves {"path": "dot.path", "in": [values]} or {"path": ..., '
+                        '"notIn": [values]}; null in a list matches an ABSENT path. Example — opened issues/PRs '
+                        'plus failing CI: {"any": [{"path": "action", "in": ["opened", "reopened"]}, '
+                        '{"path": "workflow_run.conclusion", "in": ["failure", "timed_out"]}]}. An entry with '
+                        'when/drop is declarative: the built-in CI carve-outs step aside and these rules are the '
+                        'whole policy (express sender muting inside the predicate, e.g. {"path": "sender.login", '
+                        '"notIn": [...]}, rather than combining with ignore_senders). Omit to keep on renew; '
+                        'pass {} to clear.',
+                },
+                'drop': {
+                    'type': 'object',
+                    'description':
+                        'Optional payload predicate: NEVER deliver events matching it (evaluated before "when", '
+                        'wins over it). Same shape as "when". E.g. {"path": "action", "in": ["closed", "merged"]} '
+                        'silences close/merge echoes without muting the sender. Omit to keep on renew; pass {} '
+                        'to clear.',
+                },
             },
             'required': ['topic'],
         },
@@ -1313,6 +1458,10 @@ def call_tool(params):
                 o['renewOnEvent'] = True
             if e['ignoreSenders']:
                 o['ignoreSenders'] = e['ignoreSenders']
+            if e['when'] is not None:
+                o['when'] = e['when']
+            if e['drop'] is not None:
+                o['drop'] = e['drop']
             if e['subscribedAt']:
                 o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
             if e['lastActivityAt']:
@@ -1353,8 +1502,10 @@ def call_tool(params):
             return a.lower() == b.lower()
 
         def show(e):
+            rules = [k for k, v in (('when', e['when']), ('drop', e['drop'])) if v is not None]
             return e['topic'] + (' "%s"' % e['note'] if e['note'] else '') + \
-                (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '')
+                (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
+                (' [%s rules]' % '+'.join(rules) if rules else '')
 
         def listing(ts):
             return ', '.join(show(e) for e in ts) or '(none)'
@@ -1386,6 +1537,16 @@ def call_tool(params):
             if raw_renew is not _MISSING and not isinstance(raw_renew, bool):
                 return text('error: renew_on_event must be a boolean')
             raw_note = arguments.get('note', _MISSING)
+            # Predicates are validated NOW, not at delivery time: a typo that
+            # only surfaced as a match-nothing predicate would read as a watch
+            # that quietly went dark (agent-box#170). null and {} mean "clear".
+            raw_when = arguments.get('when', _MISSING)
+            raw_drop = arguments.get('drop', _MISSING)
+            for label, raw in (('when', raw_when), ('drop', raw_drop)):
+                if raw is not _MISSING and raw is not None and raw != {}:
+                    err = predicate_error(raw, label)
+                    if err:
+                        return text('error: %s' % err)
             now_iso = iso_at(now)
 
             def ttl_msg(e):
@@ -1405,6 +1566,10 @@ def call_tool(params):
                     e['ttlHours'] = raw_ttl
                 if raw_renew is not _MISSING:
                     e['renewOnEvent'] = raw_renew
+                if raw_when is not _MISSING:
+                    e['when'] = raw_when or None
+                if raw_drop is not _MISSING:
+                    e['drop'] = raw_drop or None
                 topics = list(f['topics'])
                 topics[idx] = e
                 write_filter({**f, 'enabled': True, 'topics': topics}, path)
@@ -1413,6 +1578,8 @@ def call_tool(params):
             entry = {
                 'topic': topic,
                 'ignoreSenders': [str(x).strip() for x in (raw_ig if raw_ig is not _MISSING else []) if str(x).strip()],
+                'when': (raw_when or None) if raw_when is not _MISSING else None,
+                'drop': (raw_drop or None) if raw_drop is not _MISSING else None,
                 'note': '' if raw_note is _MISSING else str(raw_note).strip()[:300],
                 # A dispatch entry defaults to pinned (ttlHours 0): it is a
                 # standing watch, and a spawned session has no warm cache whose
@@ -1693,6 +1860,7 @@ CLI_USAGE = '''local-webhook %s — subscribe a session to webhook topics.
 
 usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
                                   [--renew-on-event] [--ignore-sender LOGIN]...
+                                  [--when JSON] [--drop JSON]
        webhook.py unsubscribe TOPIC [--deliver-to MODE]
        webhook.py ls
        webhook.py status
@@ -1722,6 +1890,16 @@ TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix)
                        own actions (repeatable; "@self" = $LOCAL_WEBHOOK_SELF).
                        CI-outcome events reach a session anyway; a standing
                        watch takes only the failing ones.
+  --when JSON          deliver ONLY events whose payload matches this predicate:
+                       {"any"/"all": [...]} over {"path": "a.b.c", "in"/"notIn":
+                       [values]} leaves; null in a list matches an absent path.
+                       An entry with --when/--drop is declarative — the built-in
+                       CI carve-outs step aside and these rules are the whole
+                       policy (put sender rules IN the predicate, e.g.
+                       {"path": "sender.login", "notIn": [...]})
+  --drop JSON          never deliver events matching this predicate (evaluated
+                       first, wins over --when). Same shape. Pass '{}' to clear
+                       either on re-subscribe
 
 Subscriptions are per session (LOCAL_WEBHOOK_SESSION) and hot-reloaded, so this
 takes effect on the next delivery with no session restart.''' % (VERSION, DEFAULT_TTL_HOURS)
@@ -1807,6 +1985,13 @@ def run_cli(argv):
             for part in value().split(','):
                 if part.strip():
                     ignore_senders.append(part.strip())
+        elif a in ('--when', '--drop'):
+            # Parse errors die here; SHAPE errors are call_tool's to report
+            # (predicate_error), same as every other argument problem.
+            try:
+                args[a[2:]] = json.loads(value())
+            except ValueError:
+                die('%s needs a JSON predicate object' % a)
         elif a.startswith('-'):
             die('unknown option "%s"\n\n%s' % (a, CLI_USAGE))
         elif 'topic' not in args:
