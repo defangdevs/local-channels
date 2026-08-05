@@ -685,9 +685,9 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail
     with FILTER_LOCK:
         f = read_filter(path)
         if not f['enabled']:
-            return {'forward': False, 'entry': None}
+            return {'forward': False, 'entry': None, 'refused': False}
         if not f['topicsConfigured']:
-            return {'forward': fail_open, 'entry': None}  # no filter configured
+            return {'forward': fail_open, 'entry': None, 'refused': False}  # no filter configured
         now = now_ms()
         live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
         pruned = len(live) != len(f['topics'])
