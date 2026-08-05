@@ -110,6 +110,49 @@ a *failing* outcome, sender irrelevant (0.10.1) — see
       "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
 ```
 
+### `when` / `drop` payload predicates (0.11.0)
+
+Topic and sender are sometimes the wrong granularity: "their new issues, not
+their close buttons" is not expressible with `ignoreSenders`, which can only
+mute the whole person. An entry may therefore carry two predicates over the
+**payload**, using the same dot-path convention as `keyPath`/`senderPath` — an
+event-agnostic mechanism, so a stripe source gates on `data.object.status`
+exactly like github gates on `action`:
+
+- `drop` — events matching it are refused by this entry. Evaluated first, wins.
+- `when` — if present, the entry accepts **only** matching events.
+
+The predicate language is deliberately tiny: `{"any": [...]}` / `{"all": [...]}`
+over leaves `{"path": "a.b.c", "in": [values]}` or
+`{"path": "a.b.c", "notIn": [values]}`. Values are JSON scalars; `null` in an
+`in` list matches an *absent* path. JSON booleans only match booleans (`true`
+never matches `1`).
+
+```json
+{ "topic": "github:defangdevs/*",
+  "when": { "any": [
+      { "all": [ { "path": "action", "in": ["opened", "reopened"] },
+                 { "path": "sender.login", "notIn": ["defangdevs"] } ] },
+      { "path": "workflow_run.conclusion", "in": ["failure", "timed_out", "startup_failure"] } ] },
+  "drop": { "path": "action", "in": ["closed", "merged"] } }
+```
+
+An entry carrying `when`/`drop` is **declarative**: its rules were written by
+whoever configured it, so the built-in CI carve-outs step aside for that entry —
+the sender-ignore exemption here, and on the dispatch path the failures-only
+brake (the live-session suppression is coordination, not policy, and still
+applies). Express sender muting *inside* the predicate (as above) rather than
+combining with `ignoreSenders`, which on a declarative entry is a pure mute
+that would silence even that sender's CI failures.
+
+`webhook_subscribe` takes the predicates as `when` / `drop` (CLI: `--when` /
+`--drop` with a JSON argument) and rejects a malformed one at subscribe time.
+A malformed node that reaches delivery anyway (hand-edited file) matches
+**nothing** and logs to stderr — for `when` that mutes the entry, for `drop` it
+forwards, and either way the misconfiguration is distinguishable from a watch
+that quietly stopped working. Omit both on re-subscribe to keep them; pass
+`{}` to clear.
+
 ### Subscription expiry and notes (0.5.x)
 
 Agent sessions come and go — context gets cleared, and a webhook landing
@@ -218,7 +261,9 @@ Differences from session routing, all deliberate:
   "nothing to do". Session delivery keeps the unconditional exemption — "merge on
   green" wants exactly that green run. An outcome the payload does not state
   counts as a failure: a swallowed break is the one error worth avoiding twice
-  over.
+  over. A watch carrying [`when`/`drop` predicates](#when--drop-payload-predicates-0110)
+  replaces this brake with its own rules (0.11.0): the consumer owns the whole
+  spawn decision, including whether a green run is news to it.
 - **A live owner suppresses the spawn (0.10.0).** A standing watch is for events
   nobody owns, so before spawning for a CI event the ingress owner asks whether
   a live session peer's own filter already covers it — if so, that session is
@@ -254,8 +299,9 @@ the two paths can't drift on TTL/renew semantics:
     python3 webhook.py unsubscribe owner/repo
     python3 webhook.py status        # state dir, session, sources (no secrets)
 
-`--note`, `--ttl`, `--deliver-to`, `--renew-on-event` and `--ignore-sender`
-(repeatable, or one comma-separated list) mirror the tool arguments;
+`--note`, `--ttl`, `--deliver-to`, `--renew-on-event`, `--ignore-sender`
+(repeatable, or one comma-separated list), `--when` and `--drop` (JSON
+predicate objects) mirror the tool arguments;
 `webhook.py --help` prints the details. Subscriptions are per session, so export the same
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.

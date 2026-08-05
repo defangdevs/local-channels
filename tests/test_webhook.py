@@ -115,6 +115,61 @@ class TestMatchTopic(StateDirCase):
         self.assertFalse(m('github', 'o/r', 'plainstring'))   # no colon → no match
 
 
+class TestPredicates(StateDirCase):
+    """The when/drop payload predicate language (0.11.0): any/all over
+    {path, in/notIn} leaves, evaluated with get_path."""
+
+    P = {'action': 'opened', 'sender': {'login': 'bot'},
+         'workflow_run': {'conclusion': 'failure'}, 'draft': False, 'number': 5}
+
+    def m(self, pred, payload=None):
+        return self.mod.match_predicate(pred, self.P if payload is None else payload)
+
+    def test_leaf_in_and_notin(self):
+        self.assertTrue(self.m({'path': 'action', 'in': ['opened', 'reopened']}))
+        self.assertFalse(self.m({'path': 'action', 'in': ['closed']}))
+        self.assertFalse(self.m({'path': 'action', 'notIn': ['opened']}))
+        self.assertTrue(self.m({'path': 'sender.login', 'notIn': ['human']}))
+
+    def test_nested_path_and_absent_path(self):
+        self.assertTrue(self.m({'path': 'workflow_run.conclusion', 'in': ['failure']}))
+        # An absent path is None; null in the list matches it, nothing else does.
+        self.assertFalse(self.m({'path': 'no.such.path', 'in': ['failure']}))
+        self.assertTrue(self.m({'path': 'no.such.path', 'in': [None]}))
+        # ...and notIn on an absent path matches (fails toward delivering).
+        self.assertTrue(self.m({'path': 'no.such.path', 'notIn': ['x']}))
+
+    def test_any_all_compose(self):
+        self.assertTrue(self.m({'any': [{'path': 'action', 'in': ['closed']},
+                                        {'path': 'workflow_run.conclusion', 'in': ['failure']}]}))
+        self.assertFalse(self.m({'all': [{'path': 'action', 'in': ['opened']},
+                                         {'path': 'sender.login', 'notIn': ['bot']}]}))
+        self.assertTrue(self.m({'all': []}))   # vacuous
+        self.assertFalse(self.m({'any': []}))
+
+    def test_json_booleans_are_not_numbers(self):
+        self.assertTrue(self.m({'path': 'draft', 'in': [False]}))
+        self.assertFalse(self.m({'path': 'draft', 'in': [0]}))
+        self.assertTrue(self.m({'path': 'number', 'in': [5]}))
+        self.assertFalse(self.m({'path': 'number', 'in': [True]}))
+
+    def test_malformed_nodes_match_nothing(self):
+        for bad in ('nope', {'path': 'action'}, {'path': 'action', 'in': 'opened'},
+                    {'path': 'action', 'in': ['a'], 'notIn': ['b']}, {'any': 'x'}, {}, None):
+            self.assertFalse(self.m(bad), 'matched malformed node %r' % (bad,))
+        # ...including nested inside a well-formed combinator.
+        self.assertFalse(self.m({'any': [{'path': 'action'}]}))
+
+    def test_predicate_error_mirrors_the_evaluator(self):
+        ok = self.mod.predicate_error
+        self.assertIsNone(ok({'path': 'a.b', 'in': ['x', 1, True, None]}))
+        self.assertIsNone(ok({'any': [{'all': [{'path': 'a', 'notIn': []}]}]}))
+        for bad in ('nope', {}, {'path': 'a'}, {'path': 'a', 'in': 'x'},
+                    {'path': 'a', 'in': ['x'], 'notIn': ['y']}, {'any': 'x'},
+                    {'any': [{'path': ''}]}, {'path': 'a', 'in': [{'nested': 1}]}):
+            self.assertIsNotNone(ok(bad), 'accepted malformed predicate %r' % (bad,))
+
+
 class TestRouteEvent(StateDirCase):
     def entry(self, topic, **kw):
         e = {'topic': topic}
@@ -198,6 +253,61 @@ class TestRouteEvent(StateDirCase):
         # ...while somebody else's green build is not an echo of anything.
         self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
                                              ci_exempt=False)['forward'])
+
+    # -- when/drop payload predicates (0.11.0) -------------------------------
+    def test_when_accepts_only_matching_payloads(self):
+        self.write([self.entry('github:o/*', when={'path': 'action', 'in': ['opened']})])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues',
+                                             {'action': 'opened'})['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues',
+                                              {'action': 'closed'})['forward'])
+
+    def test_drop_wins_over_when(self):
+        self.write([self.entry('github:o/*',
+                               when={'path': 'action', 'in': ['opened', 'closed']},
+                               drop={'path': 'action', 'in': ['closed']})])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues',
+                                             {'action': 'opened'})['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues',
+                                              {'action': 'closed'})['forward'])
+
+    def test_declarative_entry_loses_the_ci_sender_exemption(self):
+        # The carve-out ("CI overrides a mute") is welded to ignoreSenders for
+        # legacy entries; a predicate entry writes its own policy, so the mute
+        # becomes a pure sender mute — even for a CI event.
+        self.write([self.entry('github:o/*', ignoreSenders=['me'],
+                               when={'path': 'action', 'in': ['completed']})])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
+                                              {'action': 'completed'})['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
+                                             {'action': 'completed'})['forward'])
+
+    def test_sender_rules_expressed_positionally(self):
+        # "Their opens, not their close buttons" — the trade ignoreSenders
+        # could not express without muting the person outright.
+        self.write([self.entry('github:o/*', when={'all': [
+            {'path': 'action', 'in': ['opened']},
+            {'path': 'sender.login', 'notIn': ['box']}]})])
+        opened = {'action': 'opened', 'sender': {'login': 'human'}}
+        echo = {'action': 'opened', 'sender': {'login': 'box'}}
+        closed = {'action': 'closed', 'sender': {'login': 'human'}}
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'human', 'issues', opened)['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'box', 'issues', echo)['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'human', 'issues', closed)['forward'])
+
+    def test_malformed_when_mutes_rather_than_floods(self):
+        # A typo'd hand-edited predicate matches nothing: for `when` the entry
+        # goes quiet (and stderr says so) instead of forwarding everything.
+        self.write([self.entry('github:o/*', when={'oops': True})])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues',
+                                              {'action': 'opened'})['forward'])
+
+    def test_most_permissive_entry_still_wins(self):
+        # Predicates are per-entry; a sibling entry without them forwards as ever.
+        self.write([self.entry('github:o/*', when={'path': 'action', 'in': ['opened']}),
+                    self.entry('github:o/r')])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues',
+                                             {'action': 'closed'})['forward'])
 
 
 class TestCiOutcomeIsNews(StateDirCase):
@@ -385,6 +495,37 @@ class TestCallTool(StateDirCase):
         self.assertEqual(saved['topics'][0]['note'], 'first')
         self.assertEqual(saved['topics'][0]['ttlHours'], 0)
 
+    # -- when/drop payload predicates (0.11.0) -------------------------------
+    def test_predicates_persist_and_roundtrip(self):
+        when = {'path': 'action', 'in': ['opened']}
+        drop = {'path': 'action', 'in': ['closed']}
+        out = self.call('webhook_subscribe', topic='o/r', when=when, drop=drop)
+        self.assertIn('[when+drop rules]', out)
+        saved = self.read_json('filter.testsess.json')
+        self.assertEqual(saved['topics'][0]['when'], when)
+        self.assertEqual(saved['topics'][0]['drop'], drop)
+        # ...surviving an unrelated write (write_filter round-trip).
+        self.call('webhook_subscribe', topic='p/q')
+        saved = self.read_json('filter.testsess.json')
+        self.assertEqual(saved['topics'][0]['when'], when)
+        # ...and listed by webhook_subscriptions.
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertEqual(body['topics'][0]['when'], when)
+
+    def test_malformed_predicate_rejected_at_subscribe_time(self):
+        for bad in ({'path': 'a'}, {'any': 'x'}, 'nope', {'path': 'a', 'in': 'x'}):
+            out = self.call('webhook_subscribe', topic='o/r', when=bad)
+            self.assertTrue(out.startswith('error:'), 'accepted %r: %s' % (bad, out))
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.testsess.json')))
+
+    def test_renew_keeps_or_clears_predicates(self):
+        when = {'path': 'action', 'in': ['opened']}
+        self.call('webhook_subscribe', topic='o/r', when=when)
+        self.call('webhook_subscribe', topic='o/r')  # omitted → kept
+        self.assertEqual(self.read_json('filter.testsess.json')['topics'][0]['when'], when)
+        self.call('webhook_subscribe', topic='o/r', when={})  # {} → cleared
+        self.assertNotIn('when', self.read_json('filter.testsess.json')['topics'][0])
+
 
 class TestDispatchEvent(StateDirCase):
     """route → Dispatcher wiring, with the spawn command replaced by a recorder."""
@@ -434,10 +575,9 @@ class TestDispatchEvent(StateDirCase):
         self.assertFalse(os.path.exists(out))
 
 
-class TestDispatchBrakes(StateDirCase):
-    """A standing watch spawns for CI only on a failure (0.10.0, made
-    sender-independent in 0.10.1), and never while a live session peer is
-    already subscribed to the topic (0.10.0)."""
+class DispatchCase(StateDirCase):
+    """Shared harness for dispatch-policy tests: a recorder spawn command,
+    envelope builders, and a fake live peer."""
 
     def setUp(self):
         StateDirCase.setUp(self)
@@ -485,6 +625,12 @@ class TestDispatchBrakes(StateDirCase):
             time.sleep(0.05)
         self.assertTrue(text, 'expected a spawn, got none')
         self.assertIn(needle, text)
+
+
+class TestDispatchBrakes(DispatchCase):
+    """A standing watch spawns for CI only on a failure (0.10.0, made
+    sender-independent in 0.10.1), and never while a live session peer is
+    already subscribed to the topic (0.10.0)."""
 
     # -- brake 1: CI events spawn only on a failure --------------------------
     def test_failing_run_spawns(self):
@@ -573,6 +719,59 @@ class TestDispatchBrakes(StateDirCase):
         self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'subscribedAt': old}])
         self.mod.dispatch_event(self.run_env('failure'))
         self.spawned(True, 'workflow "CI"')
+
+
+class TestDispatchDeclarative(DispatchCase):
+    """A watch carrying when/drop predicates (0.11.0) owns its spawn policy:
+    the failures-only CI brake steps aside for it, while the live-peer
+    suppression — coordination, not policy — still applies."""
+
+    RULES = {'when': {'any': [
+        {'all': [{'path': 'action', 'in': ['opened', 'reopened']},
+                 {'path': 'sender.login', 'notIn': ['box']}]},
+        {'path': 'workflow_run.conclusion', 'in': ['failure', 'timed_out']}]},
+        'drop': {'path': 'action', 'in': ['closed', 'merged']}}
+
+    def watch(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', **self.RULES)
+
+    def test_opened_issue_spawns_closed_does_not(self):
+        self.watch()
+        self.mod.dispatch_event(self.env('issues', {'action': 'closed',
+                                                    'issue': {'number': 3, 'title': 't'}}))
+        self.spawned(False)
+        self.mod.dispatch_event(self.env('issues', {'action': 'opened',
+                                                    'issue': {'number': 9, 'title': 't'}}))
+        self.spawned(True, 'issue #9 opened')
+
+    def test_own_echo_dropped_by_positional_sender_rule(self):
+        self.watch()
+        self.mod.dispatch_event(self.env('issues', {'action': 'opened',
+                                                    'issue': {'number': 3, 'title': 't'}},
+                                         sender='box'))
+        self.spawned(False)
+
+    def test_declared_ci_failure_spawns_undeclared_green_does_not(self):
+        self.watch()
+        self.mod.dispatch_event(self.run_env('success', sender='box'))
+        self.spawned(False)
+        # A failure spawns whoever triggered it — via the rules, not the brake.
+        self.mod.dispatch_event(self.run_env('failure', sender='box'))
+        self.spawned(True, 'workflow "CI"')
+
+    def test_rules_may_spawn_what_the_brake_would_drop(self):
+        # The proof the predicate REPLACES the failures-only brake: a watch
+        # that explicitly asks for green runs gets them.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  when={'path': 'workflow_run.conclusion', 'in': ['success']})
+        self.mod.dispatch_event(self.run_env('success'))
+        self.spawned(True, 'workflow "CI"')
+
+    def test_live_peer_still_suppresses_a_declarative_ci_spawn(self):
+        self.watch()
+        self.fake_live_peer('peer1', ['github:o/*'])
+        self.mod.dispatch_event(self.run_env('failure'))
+        self.spawned(False)
 
 
 class TestDispatcher(StateDirCase):
@@ -919,8 +1118,59 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(self.cli('subscribe', ':::').returncode, 1)        # in-band error
         self.assertEqual(self.cli('subscribe', 'o/r', '--deliver-to', 'nope').returncode, 2)
         self.assertEqual(self.cli('subscribe', 'o/r', '--ttl', '-1').returncode, 2)
+        self.assertEqual(self.cli('subscribe', 'o/r', '--when', '{not json').returncode, 2)
+        self.assertEqual(self.cli('subscribe', 'o/r', '--when', '{"path": "a"}').returncode, 1)
         self.assertEqual(self.cli('ls').returncode, 0)
         self.assertEqual(self.cli('status').returncode, 0)
+
+    def test_declarative_watch_end_to_end(self):
+        """Real signed deliveries against a when/drop watch: an opened issue
+        spawns, a close echo does not, and a session peer's own drop predicate
+        mutes without touching its other topics."""
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'rules watch',
+                     '--when', json.dumps({'any': [
+                         {'path': 'action', 'in': ['opened', 'reopened']},
+                         {'path': 'workflow_run.conclusion', 'in': ['failure']}]}),
+                     '--drop', json.dumps({'path': 'action', 'in': ['closed']}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b'[when+drop rules]', r.stdout)
+        # A session peer that dropped close echoes on its repo.
+        r = self.cli('subscribe', 'peer/only', '--drop',
+                     json.dumps({'path': 'action', 'in': ['closed']}), session='predsess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer = self.start_peer('predsess')
+
+        # Dispatch: the close echo is dropped, the green run is not declared,
+        # the opened issue spawns. Ordering matters — the suppressed events go
+        # first so the spawn log staying clean of them is meaningful.
+        closed = dict(self.ISSUE, action='closed',
+                      issue={'number': 6, 'title': 'bye', 'html_url': 'https://x/6'})
+        self.assertEqual(self.post(closed)[0], 200)
+        self.assertEqual(self.post(self.run_payload('success'), event='workflow_run')[0], 200)
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+        self.assertTrue(self.wait_file(self.spawn_log, contains='issue #5 opened'),
+                        'declared opened issue never spawned')
+        with open(self.spawn_log, encoding='utf-8') as f:
+            text = f.read()
+        self.assertNotIn('issue #6', text)
+        self.assertNotIn('workflow', text)
+
+        # Session path: closed on the peer repo is dropped, opened arrives.
+        self.assertEqual(self.post(dict(closed, repository={'full_name': 'peer/only'}))[0], 200)
+        self.assertEqual(self.post(dict(self.ISSUE, repository={'full_name': 'peer/only'}))[0], 200)
+        line = [None]
+
+        def read_line():
+            line[0] = peer.stdout.readline()
+        t = threading.Thread(target=read_line)
+        t.daemon = True
+        t.start()
+        t.join(15)
+        self.assertTrue(line[0], 'peer never got the opened issue')
+        content = json.loads(line[0].decode())['params']['content']
+        self.assertIn('issue #5 opened', content)
+        self.assertNotIn('closed', content)
 
     def test_cli_status_shape(self):
         self.cli('subscribe', 'o/r', '--deliver-to', 'subagent')
