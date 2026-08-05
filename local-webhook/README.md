@@ -263,7 +263,9 @@ Differences from session routing, all deliberate:
   counts as a failure: a swallowed break is the one error worth avoiding twice
   over. A watch carrying [`when`/`drop` predicates](#when--drop-payload-predicates-0110)
   replaces this brake with its own rules (0.11.0): the consumer owns the whole
-  spawn decision, including whether a green run is news to it.
+  spawn decision, including whether a green run is news to it. Either way an
+  event a watch declines is logged to stderr — a deliberate drop must stay
+  distinguishable from a watch that quietly broke.
 - **A live owner suppresses the spawn (0.10.0).** A standing watch is for events
   nobody owns, so before spawning for a CI event the ingress owner asks whether
   a live session peer's own filter already covers it — if so, that session is

@@ -309,6 +309,20 @@ class TestRouteEvent(StateDirCase):
         self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues',
                                              {'action': 'closed'})['forward'])
 
+    def test_refused_distinguishes_declined_from_unsubscribed(self):
+        # 'refused' is what lets dispatch log a deliberate drop (agent-box#170)
+        # without narrating deliveries for repos nobody watches.
+        self.write([self.entry('github:o/*', when={'path': 'action', 'in': ['opened']})])
+        r = self.mod.route_event('github', 'o/r', 'x', 'issues', {'action': 'closed'})
+        self.assertFalse(r['forward'])
+        self.assertTrue(r['refused'])
+        r = self.mod.route_event('github', 'else/r', 'x', 'issues', {'action': 'closed'})
+        self.assertFalse(r['forward'])
+        self.assertFalse(r['refused'])
+        r = self.mod.route_event('github', 'o/r', 'x', 'issues', {'action': 'opened'})
+        self.assertTrue(r['forward'])
+        self.assertFalse(r['refused'])
+
 
 class TestCiOutcomeIsNews(StateDirCase):
     """Only a terminal, non-success CI outcome overrides ignoreSenders on the

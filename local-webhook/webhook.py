@@ -693,6 +693,7 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail
         pruned = len(live) != len(f['topics'])
         forward = False
         matched = None
+        topic_hit = False  # some entry matched the topic, whatever it then said
         if not key:
             # Keyless payloads (github ping, generic events without a keyPath):
             # let them through if anything from this source is subscribed at all.
@@ -700,8 +701,10 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail
                           for e in live)
         else:
             for e in live:
-                if not match_topic(source, key, e['topic']) or \
-                        not entry_forwards(e, sender, event, payload, ci_exempt):
+                if not match_topic(source, key, e['topic']):
+                    continue
+                topic_hit = True
+                if not entry_forwards(e, sender, event, payload, ci_exempt):
                     continue
                 forward = True
                 if matched is None:
@@ -716,7 +719,11 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail
                 write_filter({**f, 'topics': live}, path)
             except OSError:
                 pass
-        return {'forward': forward, 'entry': matched}
+        # refused: subscribed to the topic, but every matching entry said no
+        # (predicates or ignoreSenders). Distinct from "not subscribed" so the
+        # dispatch path can log the suppression (agent-box#170) without
+        # narrating every delivery for a repo nobody watches.
+        return {'forward': forward, 'entry': matched, 'refused': topic_hit and not forward}
 
 
 # Read-only counterpart to route_event, for asking about SOMEONE ELSE's
@@ -1092,6 +1099,13 @@ def dispatch_event(env):
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
                     event, env.get('payload'), path=DISPATCH_FILE, fail_open=False, ci_exempt=news)
     if not r['forward']:
+        if r['refused']:
+            # A watch covers this topic and turned the event down. Said out
+            # loud, like every other suppressed spawn: a deliberate drop must
+            # stay distinguishable from a watch that broke (agent-box#170).
+            print('local-webhook: not spawning for %s on %s — the subscribed watch '
+                  'declined it (when/drop rules or ignoreSenders)'
+                  % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
         return
     # A declarative entry (when/drop) already ruled on this event inside
     # entry_forwards — its rules REPLACE the hardcoded failures-only brake, or
