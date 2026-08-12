@@ -247,6 +247,16 @@ Differences from session routing, all deliberate:
   burst costs two sessions, not ten. At most `LOCAL_WEBHOOK_SPAWN_MAX` (2)
   spawn commands run concurrently across all keys. A failing spawn command is
   logged and its batch dropped; the same events already reached session peers.
+- **A waiting batch is re-checked before it spawns (0.11.1).** CI lines in a
+  follow-up batch are put to the live-peer question again the moment the batch
+  starts, and dropped if a session now owns them. One failing run emits both
+  `check_run.completed` and `workflow_run.completed`; the second arrives while
+  the first spawn's session is still booting, so the arrival-time answer is
+  "nobody owns this" and the window then defers it for a full 60 s — long after
+  that session opened its peer socket and claimed the topic. Without the
+  re-check every failing run cost exactly two sessions, ~60 s apart. Only CI
+  lines are re-examined, and only in a follow-up batch: the first event on an
+  idle key still spawns immediately.
 - **CI events only spawn on a failure (0.10.0, sender-independent since
   0.10.1).** A run reports itself queued, in progress, cancelled and
   finished-fine, and none of those justify a whole session — so on this path a CI
