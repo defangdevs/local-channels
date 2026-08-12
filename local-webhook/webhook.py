@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.11.0'
+VERSION = '0.11.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -967,6 +967,12 @@ if not RECEIVER_ONLY and not CLI:
 #     last spawn start, further events COALESCE into one pending batch that
 #     becomes a single follow-up spawn — a 10-PR dependabot burst costs two
 #     sessions, not ten;
+#   - a CI line in that follow-up batch is re-checked against live session
+#     ownership the moment the batch starts, and dropped if the session the
+#     first spawn just started now claims it (0.11.1, issue #17): the whole
+#     point of waiting is that the answer changes while you wait — the
+#     session takes seconds to open its peer socket, the window is 60s, so
+#     the arrival-time answer is stale exactly when it matters;
 #   - at most SPAWN_MAX spawn commands run concurrently across all keys;
 #     waiting batches get re-checked whenever a spawn finishes.
 # A spawn that fails (non-zero exit, unlaunchable, > SPAWN_TIMEOUT_S) is
@@ -982,24 +988,30 @@ class Dispatcher:
     # State is in-memory only: an ingress-owner restart forgets pending
     # batches. Acceptable — the same deliveries reached session peers, and a
     # standing watch cares about the next event, not a replay of the last one.
-    def __init__(self, cmd, max_concurrent, window_s, timeout_s, clock=time.monotonic):
+    def __init__(self, cmd, max_concurrent, window_s, timeout_s, clock=time.monotonic,
+                 owner_of=None):
         self.cmd = cmd
         self.max = max_concurrent
         self.window = window_s
         self.timeout = timeout_s
         self.clock = clock  # injectable for tests; monotonic so a clock step can't wedge a key
+        # Who owns a queued line NOW, asked again when its batch starts.
+        # Injectable for tests; None means the real probe (ci_owner_now).
+        self.owner_of = owner_of
         self.lock = threading.Lock()
         self.active = 0
-        # key -> {pending: [text], meta: dict, running: bool,
+        # key -> {pending: [(text, meta, env)], running: bool,
         #         last_start: float|None, timer: Timer|None}
         self.keys = {}
 
-    def add(self, key, text, meta):
+    # env is the routing envelope the line came from, kept per line so a
+    # coalesced batch can be re-examined line by line before it spawns;
+    # callers with nothing to re-check (tests, non-github paths) may omit it.
+    def add(self, key, text, meta, env=None):
         with self.lock:
-            st = self.keys.setdefault(key, {'pending': [], 'meta': {}, 'running': False,
+            st = self.keys.setdefault(key, {'pending': [], 'running': False,
                                             'last_start': None, 'timer': None})
-            st['pending'].append(text)
-            st['meta'] = meta  # the newest event's context labels the batch
+            st['pending'].append((text, meta, env))
             self._pump(key)
 
     # Call with self.lock held. Starts a spawn for the key when allowed;
@@ -1021,10 +1033,46 @@ class Dispatcher:
             st['timer'].cancel()
             st['timer'] = None
         batch, st['pending'] = st['pending'], []
+        if st['last_start'] is not None:
+            # A follow-up batch only: the first event on an idle key was
+            # checked microseconds ago in dispatch_event and must never be
+            # gated a second time, or an unowned key could never start.
+            batch = self._still_unowned(key, batch)
+            if not batch:
+                return
         st['running'] = True
         st['last_start'] = self.clock()
         self.active += 1
-        threading.Thread(target=self._run, args=(key, batch, dict(st['meta'])), daemon=True).start()
+        # The newest SURVIVING event's context labels the batch — labelling it
+        # with a line that was just dropped would name a run nobody is here for.
+        meta = dict(batch[-1][1] or {})
+        threading.Thread(target=self._run, args=(key, [t for t, _, _ in batch], meta),
+                         daemon=True).start()
+
+    # Call with self.lock held. Drops the lines a live session peer has come
+    # to own since they were queued. Fails in the safe direction: a probe that
+    # raises leaves the batch alone, because a missed drop costs one session
+    # and a wrong drop loses the event entirely.
+    def _still_unowned(self, key, batch):
+        probe = self.owner_of or ci_owner_now
+        kept = []
+        for item in batch:
+            text, meta, env = item
+            try:
+                owner = probe(env)
+            except Exception:  # noqa: BLE001 — a broken probe must not eat events
+                owner = None
+            if owner:
+                # Said out loud, like every other suppressed spawn: a
+                # deliberate drop must stay distinguishable from a watch that
+                # quietly stopped working (agent-box#170).
+                print('local-webhook: not spawning for %s on %s — session %s claimed it '
+                      'while the batch waited'
+                      % ((env or {}).get('event', '') or '(none)', key or '(none)', owner),
+                      file=sys.stderr)
+                continue
+            kept.append(item)
+        return kept
 
     def _on_timer(self, key):
         with self.lock:
@@ -1089,6 +1137,18 @@ def owned_by_live_session(env):
     return None
 
 
+# The same question dispatch_event asks on arrival, asked again when a
+# coalesced batch finally starts (Dispatcher._still_unowned). Same scope, same
+# answer shape — only the moment differs, and the moment is the whole bug:
+# session 1's peer socket appears seconds after its spawn command runs, so the
+# events that arrived in that gap were judged unowned and then waited a full
+# window for a verdict nobody revisited.
+def ci_owner_now(env):
+    if not env or env.get('event', '') not in CI_EVENTS:
+        return None
+    return owned_by_live_session(env)
+
+
 def dispatch_event(env):
     # Ingress owner only: called from deliver(), never on the peer IPC path,
     # so one delivery can only ever dispatch once however many peers exist.
@@ -1145,7 +1205,7 @@ def dispatch_event(env):
         'event': env.get('event', ''),
         'topic': entry['topic'] if entry else '',
         'note': entry['note'] if entry else '',
-    })
+    }, env)
 
 
 # Written by the receiver daemon at startup so sessions can tell whether

@@ -788,6 +788,63 @@ class TestDispatchDeclarative(DispatchCase):
         self.spawned(False)
 
 
+class TestDispatchFollowupOwnership(DispatchCase):
+    """The duplicate one failing run always cost (#17), through the real path:
+    GitHub emits check_run.completed and workflow_run.completed for the same
+    run. The first spawns a session; the second arrives before that session's
+    peer socket exists, so it is queued — and when its batch starts a window
+    later, the session it is a duplicate of has been claiming the topic for
+    most of that window."""
+
+    def setUp(self):
+        StateDirCase.setUp(self)
+        self.log = os.path.join(self.state, 'spawns.log')
+        self.mod = self.load(
+            LOCAL_WEBHOOK_SPAWN_CMD='{ echo RUN; cat; } >> %s' % self.log,
+            LOCAL_WEBHOOK_SPAWN_WINDOW='2')
+
+    def spawns(self):
+        if not os.path.exists(self.log):
+            return 0
+        with open(self.log, encoding='utf-8') as f:
+            return f.read().count('RUN')
+
+    def wait_for_spawns(self, n, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.spawns() < n:
+            time.sleep(0.05)
+        self.assertEqual(self.spawns(), n)
+
+    def check_run_failure(self):
+        return self.env('check_run', {
+            'action': 'completed',
+            'check_run': {'name': 'deploy', 'status': 'completed', 'conclusion': 'failure'},
+        })
+
+    def test_one_failing_run_costs_one_session_not_two(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.mod.dispatch_event(self.run_env('failure'))     # nobody owns it: spawn 1
+        self.wait_for_spawns(1)
+        self.mod.dispatch_event(self.check_run_failure())    # same run, peer not up yet
+        self.fake_live_peer('peer1', ['github:o/*'])         # spawn 1's session claims it
+        time.sleep(3.5)                                      # window opens; batch re-checked
+        self.assertEqual(self.spawns(), 1)
+
+    def test_a_queued_non_ci_event_still_spawns_its_own_session(self):
+        # Ownership is object-granular and topics are repo-granular, so the
+        # re-check must stay scoped to CI exactly like the arrival check: a new
+        # issue arriving in the same burst is new work, not a duplicate.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.mod.dispatch_event(self.run_env('failure'))
+        self.wait_for_spawns(1)
+        self.mod.dispatch_event(self.env('issues', {'action': 'opened',
+                                                    'issue': {'number': 9, 'title': 't'}}))
+        self.fake_live_peer('peer1', ['github:o/*'])
+        self.wait_for_spawns(2)
+        with open(self.log, encoding='utf-8') as f:
+            self.assertIn('issue #9 opened', f.read())
+
+
 class TestDispatcher(StateDirCase):
     """Fork-bomb control: immediate first spawn, coalescing, cap, failure."""
 
@@ -854,6 +911,54 @@ class TestDispatcher(StateDirCase):
         keys = ' '.join(self.runs(path_a))
         self.assertIn('key=a', keys)
         self.assertIn('key=b', keys)
+
+    def test_followup_batch_drops_lines_owned_by_then(self):
+        # The bug of issue #17: ownership was decided when the line arrived and
+        # never again, so the 60s wait — the one interval in which the answer
+        # is guaranteed to change — ended in an unconditional spawn.
+        path, cmd = self.recorder('owned')
+        owned = {'now': False}
+        d = self.mod.Dispatcher(cmd, 2, 1, 30,
+                                owner_of=lambda env: 'peer1' if owned['now'] else None)
+        d.add('k', 'e1', {'key': 'k'}, {'event': 'workflow_run'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        owned['now'] = True                       # session 1's peer socket appears
+        d.add('k', 'e2', {'key': 'k'}, {'event': 'workflow_run'})
+        time.sleep(2.5)                           # window opens, timer fires, nothing spawns
+        self.assertEqual(len(self.runs(path)), 1)
+
+    def test_followup_batch_keeps_the_lines_still_unowned(self):
+        path, cmd = self.recorder('mixed')
+        d = self.mod.Dispatcher(cmd, 2, 1, 30,
+                                owner_of=lambda env: 'peer1' if env['event'] == 'ci' else None)
+        d.add('k', 'e1', {'key': 'k'}, {'event': 'ci'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        d.add('k', 'owned-line', {'key': 'k'}, {'event': 'ci'})
+        d.add('k', 'new-issue', {'key': 'k'}, {'event': 'issues'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 2, timeout=10))
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('count=1', self.runs(path)[1])   # the batch shrank to what survived
+        self.assertIn('new-issue', text)
+        self.assertNotIn('owned-line', text)
+
+    def test_first_event_on_an_idle_key_is_never_re_gated(self):
+        # dispatch_event checked this line microseconds ago; asking a second
+        # time here would let a stale claim keep an unowned key from starting.
+        path, cmd = self.recorder('idle')
+        d = self.mod.Dispatcher(cmd, 2, 1, 30, owner_of=lambda env: 'peer1')
+        d.add('k', 'e1', {'key': 'k'}, {'event': 'workflow_run'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+
+    def test_a_probe_that_raises_keeps_the_batch(self):
+        def boom(env):
+            raise RuntimeError('probe is broken')
+        path, cmd = self.recorder('boom')
+        d = self.mod.Dispatcher(cmd, 2, 1, 30, owner_of=boom)
+        d.add('k', 'e1', {'key': 'k'}, {'event': 'workflow_run'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        d.add('k', 'e2', {'key': 'k'}, {'event': 'workflow_run'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 2, timeout=10))
 
     def test_failing_spawn_drops_batch_but_recovers(self):
         path, ok_cmd = self.recorder('rec')
