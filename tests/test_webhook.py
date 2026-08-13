@@ -976,6 +976,45 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(batch_arrived))
 
 
+class TestResolveIngress(StateDirCase):
+    """emit's ingress discovery: caller's env > receiver.json advertisement >
+    the legacy loopback TCP port (whose owner writes no receiver.json)."""
+
+    def setUp(self):
+        super().setUp()
+        # The runner's own environment must not leak into call-time resolution.
+        self._sock = os.environ.pop('LOCAL_WEBHOOK_HTTP_SOCK', None)
+        if self._sock is not None:
+            self.addCleanup(os.environ.__setitem__, 'LOCAL_WEBHOOK_HTTP_SOCK', self._sock)
+
+    def write_receiver(self, ingress):
+        with open(os.path.join(self.state, 'receiver.json'), 'w', encoding='utf-8') as f:
+            json.dump({'pid': 1, 'version': 'x', 'ingress': ingress}, f)
+
+    def test_advertised_unix_and_tcp(self):
+        self.write_receiver({'path': '/run/in.sock'})
+        self.assertEqual(self.mod.resolve_ingress(), ('unix', '/run/in.sock'))
+        self.write_receiver({'port': 8123})
+        self.assertEqual(self.mod.resolve_ingress(), ('tcp', 8123))
+
+    def test_env_sock_wins_over_advertisement(self):
+        self.write_receiver({'path': '/run/other.sock'})
+        os.environ['LOCAL_WEBHOOK_HTTP_SOCK'] = '/run/mine.sock'
+        try:
+            self.assertEqual(self.mod.resolve_ingress(), ('unix', '/run/mine.sock'))
+        finally:
+            del os.environ['LOCAL_WEBHOOK_HTTP_SOCK']
+
+    def test_port_is_last_resort_and_zero_means_none(self):
+        self.assertIsNone(self.mod.resolve_ingress())  # PORT=0, nothing else
+        mod = self.load(LOCAL_WEBHOOK_PORT='8123')
+        self.assertEqual(mod.resolve_ingress(), ('tcp', 8123))
+        # A malformed advertisement falls through rather than erroring.
+        self.write_receiver({'garbage': True})
+        self.assertIsNone(self.mod.resolve_ingress())
+        self.assertEqual(mod.resolve_ingress(), ('tcp', 8123))
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, path):
         http.client.HTTPConnection.__init__(self, 'local')
@@ -1056,10 +1095,22 @@ class TestEndToEnd(unittest.TestCase):
             time.sleep(0.05)
         self.fail('peer never registered its IPC socket')
 
-    def cli(self, *args, session='testsess'):
+    def cli(self, *args, session='testsess', stdin=None):
         env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0')
-        return subprocess.run([PYTHON, WEBHOOK_PY] + list(args), env=env,
+        return subprocess.run([PYTHON, WEBHOOK_PY] + list(args), env=env, input=stdin,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def add_source(self, name, **cfg):
+        # Same shared secret; a distinct per-source file is what production uses.
+        secret_file = '%s.secret' % name
+        with open(os.path.join(self.state, secret_file), 'w', encoding='utf-8') as f:
+            f.write(self.SECRET)
+        path = os.path.join(self.state, 'sources.json')
+        with open(path, encoding='utf-8') as f:
+            sources = json.load(f)
+        sources['sources'][name] = dict(cfg, secretFile=secret_file)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(sources, f)
 
     def post(self, body, event='issues', source='github', sig=None, method='POST'):
         import hashlib
@@ -1112,6 +1163,8 @@ class TestEndToEnd(unittest.TestCase):
             info = json.load(f)
         self.assertTrue(info['spawn'])
         self.assertTrue(info['version'])
+        # emit finds a socket-activated / unix ingress only through this field.
+        self.assertEqual(info['ingress'], {'path': self.http_sock})
 
     def test_dispatch_spawns_and_peer_fanout_and_isolation(self):
         # Standing watch via CLI (what a session's tool call writes).
@@ -1290,6 +1343,84 @@ class TestEndToEnd(unittest.TestCase):
         content = json.loads(line[0].decode())['params']['content']
         self.assertIn('issue #5 opened', content)
         self.assertNotIn('closed', content)
+
+    def test_emit_reaches_sessions_and_standing_watches(self):
+        """A box-local event enters through the ingress, so it gets the whole
+        pipeline: fan-out to subscribed peers AND standing-watch dispatch —
+        exactly like an external delivery (and a non-CI event spawns even while
+        a live session is subscribed)."""
+        self.add_source('budget', keyPath='window')
+        r = self.cli('subscribe', 'budget:*', '--note', 'usage-limit warnings', session='peersess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'budget:*', '--deliver-to', 'subagent', '--note', 'budget watch')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer = self.start_peer('peersess')
+
+        r = self.cli('emit', 'budget', '{"used_pct":92,"window":"5h"}', '--event', 'budget_warning')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b'delivered budget event', r.stdout)
+
+        line = [None]
+
+        def read_line():
+            line[0] = peer.stdout.readline()
+        t = threading.Thread(target=read_line)
+        t.daemon = True
+        t.start()
+        t.join(15)
+        self.assertTrue(line[0], 'peer never emitted a channel message')
+        msg = json.loads(line[0].decode())
+        self.assertEqual(msg['method'], 'notifications/claude/channel')
+        self.assertIn('[UNTRUSTED webhook:budget', msg['params']['content'])
+        self.assertIn('used_pct=', msg['params']['content'])
+        self.assertIn('usage-limit warnings', msg['params']['content'])
+        self.assertEqual(msg['params']['meta']['event'], 'budget_warning')
+        self.assertEqual(msg['params']['meta']['key'], '5h')
+        self.assertTrue(msg['params']['meta']['delivery'].startswith('emit-'))
+
+        self.assertTrue(self.wait_file(self.spawn_log, contains='budget_warning'),
+                        'standing watch never spawned for the emitted event')
+        with open(self.spawn_log, encoding='utf-8') as f:
+            self.assertIn('budget watch', f.read())
+
+    def test_emit_over_tcp_and_stdin(self):
+        """The legacy/TCP shape: the daemon advertises its port, emit reads the
+        payload from stdin and delivers as a plain HTTP client."""
+        self.add_source('budget', keyPath='window')
+        s = socket.socket()
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+        s.close()
+        env = self.base_env(LOCAL_WEBHOOK_RECEIVER_ONLY='1', LOCAL_WEBHOOK_PORT=str(port))
+        p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.procs.append(p)
+        self.assertTrue(self.wait_file(os.path.join(self.state, 'receiver.json'), contains='"port"'))
+        r = self.cli('emit', 'budget', '-', stdin=b'{"used_pct":95,"window":"weekly"}')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(('delivered budget event to 127.0.0.1:%d' % port).encode(), r.stdout)
+
+    def test_emit_cli_contract(self):
+        # Usage errors exit 2, operational failures exit 1 — same split as the
+        # subscription commands, so `set -e` producers notice either way.
+        self.add_source('budget', keyPath='window')
+        r = self.cli('emit', 'nosuch', '{}')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(b'unknown source', r.stderr)
+        r = self.cli('emit', 'budget', 'not json')
+        self.assertEqual(r.returncode, 2)
+        r = self.cli('emit')
+        self.assertEqual(r.returncode, 2)
+        r = self.cli('emit', 'budget', '{}')  # no daemon, no advertisement, PORT=0
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(b'no ingress', r.stderr)
+        # A stale advertisement (daemon crashed) is a prompt error, not a hang.
+        with open(os.path.join(self.state, 'receiver.json'), 'w', encoding='utf-8') as f:
+            json.dump({'ingress': {'path': os.path.join(self.state, 'gone.sock')}}, f)
+        r = self.cli('emit', 'budget', '{}')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(b'could not reach', r.stderr)
 
     def test_cli_status_shape(self):
         self.cli('subscribe', 'o/r', '--deliver-to', 'subagent')

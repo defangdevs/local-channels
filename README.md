@@ -1,17 +1,17 @@
 # local-channels
 
 A [Claude Code](https://claude.com/claude-code) **plugin marketplace** of local
-*channel* plugins: plugins that push events from the outside world into a
-running Claude Code session as `<channel …>` messages, so the agent learns about
-a PR review, a failing CI run or a payment the moment it happens instead of
-polling for it.
+*channel* plugins: plugins that push events from outside the session — off-box
+or from the box itself — into a running Claude Code session as `<channel …>`
+messages, so the agent learns about a PR review, a failing CI run, a payment or
+an imminent token-budget limit the moment it happens instead of polling for it.
 
 A channel is one-way. Deliveries arrive as untrusted data the session reads and
 acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.11.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, and per-subscription `when`/`drop` payload predicates |
+| [`local-webhook`](local-webhook/) | 0.12.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `when`/`drop` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
 
 ## Requirements
 
@@ -226,6 +226,7 @@ python3 webhook.py subscribe 'github:defangdevs/*' --ignore-sender @self
 python3 webhook.py ls
 python3 webhook.py unsubscribe owner/repo
 python3 webhook.py status        # state dir, session, sources (no secrets)
+python3 webhook.py emit budget '{"used_pct":92,"window":"5h"}' --event budget_warning
 python3 webhook.py --help
 ```
 
@@ -234,6 +235,15 @@ comma-separated list) mirror the tool arguments. Usage and argument errors exit
 2, in-band tool errors (an invalid topic pattern) exit 1, so `set -e` callers
 notice. Export the same `LOCAL_WEBHOOK_SESSION` and `LOCAL_WEBHOOK_STATE_DIR`
 the session runs with, or you will edit a different filter file.
+
+`emit` (0.12.0) is the producer side of the CLI: it signs a JSON payload with
+the named source's secret and POSTs it to the local ingress, so a box-local
+signal — an imminent token-budget limit, a filling disk, an OOM kill — travels
+the exact same verified path as an external webhook and can reach every
+subscribed session, or spawn a fresh one via a standing watch. See the
+[local-webhook README](local-webhook/README.md#wiring-box-local-sources-emit-0120)
+and [#19](https://github.com/defangdevs/local-channels/issues/19) for the
+planned sensor set.
 
 A CLI invocation binds nothing — no stdio loop, no peer socket, never the
 ingress — so it is safe to run alongside the daemon and any number of sessions.

@@ -310,6 +310,8 @@ the two paths can't drift on TTL/renew semantics:
     python3 webhook.py ls
     python3 webhook.py unsubscribe owner/repo
     python3 webhook.py status        # state dir, session, sources (no secrets)
+    python3 webhook.py emit budget '{"used_pct":92,"window":"5h"}' \
+        --event budget_warning       # put a box-local event on the bus
 
 `--note`, `--ttl`, `--deliver-to`, `--renew-on-event`, `--ignore-sender`
 (repeatable, or one comma-separated list), `--when` and `--drop` (JSON
@@ -318,8 +320,9 @@ predicate objects) mirror the tool arguments;
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.
 
-A CLI invocation binds nothing: it is not a session peer and never touches the
-ingress, so it is safe to run alongside the daemon and any number of sessions.
+A CLI invocation binds nothing: it is not a session peer and never owns the
+ingress (`emit` connects to it as a client), so it is safe to run alongside the
+daemon and any number of sessions.
 
 ## Wiring a GitHub repo
 
@@ -335,6 +338,37 @@ Any sender that can POST JSON and sign the raw body with HMAC-SHA256 works.
 Add a source to `sources.json`, point the sender at `POST /<source>`, and put
 the hex digest in the signature header. For senders with fixed non-GitHub
 header names (e.g. `x-signature`), set `signatureHeader`.
+
+## Wiring box-local sources (`emit`, 0.12.0)
+
+The box's own signals — an imminent token-budget limit, a filling disk, an OOM
+kill — are exactly as invisible to a session as a GitHub PR, and `webhook.py
+emit SOURCE [JSON] [--event NAME]` puts them on the same bus. The payload (an
+argument, or stdin when omitted or `-`) is signed with the source's secret from
+`sources.json` and POSTed to the local ingress, entering through the front door
+so verification, normalization, fan-out **and** standing-watch dispatch all
+apply. Everything downstream works unchanged: `budget:5h` or `disk:/var` are
+ordinary topics, `when`/`drop` predicates gate on `used_pct` like any other
+payload field, and a `deliver_to:"subagent"` watch can spawn a fresh session
+for a signal nobody is live to see.
+
+```sh
+printf '%s' "$(openssl rand -hex 32)" > <state-dir>/budget.secret
+# in sources.json:  "budget": { "secretFile": "budget.secret", "keyPath": "window" }
+python3 webhook.py emit budget '{"used_pct":92,"window":"5h","resets_at":"..."}' \
+    --event budget_warning
+```
+
+`emit` finds the ingress via `LOCAL_WEBHOOK_HTTP_SOCK`, then the daemon's
+`receiver.json` advertisement (the only place a systemd-socket-activated path
+is knowable — sessions run with `LOCAL_WEBHOOK_PORT=0` and no socket env), then
+loopback `LOCAL_WEBHOOK_PORT`. Signing a same-box loop is plumbing reuse, not
+security — the trust boundary is state-dir file permissions either way — but it
+means the ingress needs no second, unauthenticated entry path. Producers should
+fire on threshold *crossings* with hysteresis, never per poll: every event
+lands in every subscribed session. The sensor set itself (budget / disk / OOM
+timers calling `emit`) is
+[#19](https://github.com/defangdevs/local-channels/issues/19).
 
 ## Env
 

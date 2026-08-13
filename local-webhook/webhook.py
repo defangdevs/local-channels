@@ -17,6 +17,7 @@
 import atexit
 import hashlib
 import hmac
+import http.client
 import json
 import math
 import os
@@ -31,7 +32,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.11.1'
+VERSION = '0.12.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1209,7 +1210,9 @@ def dispatch_event(env):
 
 
 # Written by the receiver daemon at startup so sessions can tell whether
-# dispatch is actually wired (webhook_subscribe warns when it is not).
+# dispatch is actually wired (webhook_subscribe warns when it is not), and so
+# `emit` can find the ingress — under socket activation the bound path exists
+# nowhere in a session's environment, only in the daemon's adopted fd.
 # Advisory only: absent on legacy setups, stale after a crash.
 RECEIVER_FILE = os.path.join(STATE_DIR, 'receiver.json')
 
@@ -1916,12 +1919,14 @@ def listen_ingress():
 # callers that have no MCP client: a codex session, a shell session, a script,
 # or an agent-box `agent-box-webhook` wrapper. Deliberately a thin shim over
 # call_tool() so CLI and tool paths can never drift on TTL/renew semantics.
-CLI_USAGE = '''local-webhook %s — subscribe a session to webhook topics.
+CLI_USAGE = '''local-webhook %s — subscribe a session to webhook topics, or
+emit a box-local event onto the same bus.
 
 usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
                                   [--renew-on-event] [--ignore-sender LOGIN]...
                                   [--when JSON] [--drop JSON]
        webhook.py unsubscribe TOPIC [--deliver-to MODE]
+       webhook.py emit SOURCE [JSON] [--event NAME]
        webhook.py ls
        webhook.py status
 
@@ -1961,8 +1966,132 @@ TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix)
                        first, wins over --when). Same shape. Pass '{}' to clear
                        either on re-subscribe
 
+emit puts a BOX-LOCAL event (a budget warning, a full disk, an OOM kill) on the
+same bus as any webhook: the JSON payload — an argument, or stdin when omitted
+or "-" — is signed with SOURCE's secret from sources.json and POSTed to the
+local ingress, so it is verified, fanned out to every subscribed session and
+can trigger standing watches exactly like an external delivery. SOURCE must be
+declared in sources.json; the ingress is found via LOCAL_WEBHOOK_HTTP_SOCK, the
+daemon's receiver.json advertisement, or loopback LOCAL_WEBHOOK_PORT.
+
+  --event NAME         event name for the delivery; when absent the payload's
+                       "event"/"type" field applies, per normal normalization
+
 Subscriptions are per session (LOCAL_WEBHOOK_SESSION) and hot-reloaded, so this
 takes effect on the next delivery with no session restart.''' % (VERSION, DEFAULT_TTL_HOURS)
+
+
+# `emit` is the local producer path onto the bus: box-local signals (a token
+# budget nearly exhausted, a filling disk, an OOM kill) are exactly as
+# invisible to a session as a GitHub PR, and by entering through the HTTP
+# ingress — not the peer sockets — they get the whole pipeline: signature
+# verification, normalization, fan-out to every subscribed session AND
+# standing-watch dispatch, which only the ingress owner evaluates. Signing with
+# the source's own secret is plumbing reuse, not security — the trust boundary
+# is state-dir file permissions either way (whoever can read the secret can
+# sign) — but it means the ingress needs no second, unauthenticated entry path.
+def resolve_ingress():
+    # Most-explicit first: env the caller set > what the daemon advertises in
+    # receiver.json (the only place a socket-activated path is knowable) > the
+    # legacy single-file TCP port, whose owner writes no receiver.json.
+    sock = os.environ.get('LOCAL_WEBHOOK_HTTP_SOCK')
+    if sock:
+        return ('unix', sock)
+    ing = (receiver_info() or {}).get('ingress')
+    if isinstance(ing, dict):
+        if isinstance(ing.get('path'), str) and ing['path']:
+            return ('unix', ing['path'])
+        if isinstance(ing.get('port'), int) and ing['port'] > 0:
+            return ('tcp', ing['port'])
+    if PORT > 0:
+        return ('tcp', PORT)
+    return None
+
+
+def run_emit(rest, die):
+    def fail(msg):
+        # Operational failure, not a usage error: exit 1, mirroring the in-band
+        # error convention of the other commands (die/exit 2 is for bad argv).
+        print('local-webhook: %s' % msg, file=sys.stderr)
+        sys.exit(1)
+
+    source = payload = event = None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == '--event':
+            if i + 1 >= len(rest):
+                die('--event needs a value')
+            i += 1
+            event = rest[i]
+        elif a.startswith('--'):
+            die('unknown option "%s"\n\n%s' % (a, CLI_USAGE))
+        elif source is None:
+            source = a
+        elif payload is None:
+            payload = a
+        else:
+            die('unexpected argument "%s"' % a)
+        i += 1
+    if not source:
+        die('emit needs a SOURCE\n\n%s' % CLI_USAGE)
+    raw = sys.stdin.read() if payload in (None, '-') else payload
+    try:
+        json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        die('emit payload must be valid JSON')
+
+    cfg = read_sources()
+    src = cfg['sources'].get(source)
+    if not isinstance(src, dict):
+        fail('unknown source "%s": declare it in %s first' % (source, SOURCES_FILE))
+    secret = source_secret(src)
+    if not secret:
+        fail('source "%s" has no usable secret' % source)
+
+    # Same per-source header defaults deliver() applies, so what we send is
+    # exactly what an external sender for this source would send.
+    fmt = src.get('format') if src.get('format') in ('generic', 'github') else \
+        ('github' if source == 'github' else 'generic')
+    sig_header = src.get('signatureHeader') if isinstance(src.get('signatureHeader'), str) else 'x-hub-signature-256'
+    event_header = src.get('eventHeader') if isinstance(src.get('eventHeader'), str) else \
+        ('x-github-event' if fmt == 'github' else 'x-webhook-event')
+    delivery_header = src.get('deliveryHeader') if isinstance(src.get('deliveryHeader'), str) else \
+        ('x-github-delivery' if fmt == 'github' else 'x-webhook-delivery')
+
+    body = raw.encode('utf-8')  # sign the exact bytes that go on the wire
+    headers = {
+        'Content-Type': 'application/json',
+        sig_header: 'sha256=' + hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest(),
+        delivery_header: 'emit-' + os.urandom(8).hex(),
+    }
+    if event:
+        headers[event_header] = event
+
+    target = resolve_ingress()
+    if target is None:
+        fail('no ingress to deliver to: start the receiver daemon, or set '
+             'LOCAL_WEBHOOK_HTTP_SOCK / LOCAL_WEBHOOK_PORT to where one listens')
+    kind, where = target
+    desc = where if kind == 'unix' else '127.0.0.1:%d' % where
+    try:
+        if kind == 'unix':
+            conn = http.client.HTTPConnection('local', timeout=10)
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(10)
+            s.connect(where)
+            conn.sock = s  # pre-connected: HTTPConnection only knows how to dial TCP
+        else:
+            conn = http.client.HTTPConnection('127.0.0.1', where, timeout=10)
+        conn.request('POST', '/' + source, body, headers)
+        resp = conn.getresponse()
+        status, text = resp.status, resp.read().decode('utf-8', 'replace')
+        conn.close()
+    except OSError as e:
+        fail('could not reach ingress at %s: %s' % (desc, getattr(e, 'strerror', None) or e))
+    if status != 200:
+        fail('ingress at %s rejected the event: %d %s' % (desc, status, text.strip()))
+    print('delivered %s event to %s' % (source, desc))
 
 
 def run_cli(argv):
@@ -1996,6 +2125,9 @@ def run_cli(argv):
                         for n, src in cfg['sources'].items() if isinstance(src, dict)},
         }))
         return
+
+    if cmd == 'emit':
+        return run_emit(argv[1:], die)
 
     tool_for = {'subscribe': 'webhook_subscribe', 'unsubscribe': 'webhook_unsubscribe',
                 'ls': 'webhook_subscriptions', 'subscriptions': 'webhook_subscriptions'}
@@ -2088,10 +2220,25 @@ def main():
             print('local-webhook: receiver daemon has no ingress configured; exiting', file=sys.stderr)
             sys.exit(1)
         # Advertise the daemon so webhook_subscribe can warn when a
-        # deliver_to:"subagent" subscription has no spawn command behind it.
+        # deliver_to:"subagent" subscription has no spawn command behind it,
+        # and so `emit` can find the ingress. getsockname() is the only place
+        # a socket-activated path is visible — the .socket unit owns it and no
+        # session env carries it.
+        try:
+            addr = httpd.socket.getsockname()
+            if isinstance(addr, bytes):
+                addr = addr.decode('utf-8', 'replace')
+            if isinstance(addr, str) and addr:
+                ingress = {'path': addr}
+            elif isinstance(addr, tuple) and len(addr) >= 2:
+                ingress = {'port': addr[1]}
+            else:
+                ingress = None
+        except OSError:
+            ingress = None
         try:
             with open(RECEIVER_FILE, 'w', encoding='utf-8') as fh:
-                fh.write(pretty({'pid': os.getpid(), 'version': VERSION,
+                fh.write(pretty({'pid': os.getpid(), 'version': VERSION, 'ingress': ingress,
                                  'spawn': bool(SPAWN_CMD), 'startedAt': iso_at(now_ms())}) + '\n')
         except OSError:
             pass
