@@ -51,6 +51,9 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
 - Auth fails **closed** (unknown source / missing secret / bad signature →
   reject). The topic filter fails **open** (missing or corrupt `filter.json`
   → forward everything) so a botched edit degrades to noise, not silence.
+  Because that state also lists **no** topics, `webhook_subscriptions` says so
+  explicitly — `failOpen: true` plus a warning (0.12.1). An empty `topics` list
+  in the file is the opposite state: configured, so nothing is delivered.
 - All payload free-text is truncated and wrapped in `⟪UNTRUSTED:…⟫` markers,
   and every channel message is prefixed `[UNTRUSTED webhook:<source>]`.
 

@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.12.0'
+VERSION = '0.12.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1539,6 +1539,17 @@ def call_tool(params):
                 body['self'] = SELF
             body['filterFile'] = FILTER_FILE
             body['topics'] = [render(e, f['ttlHours']) for e in f['topics']]
+            # An empty topics list means two OPPOSITE things depending on why it
+            # is empty, and the caller cannot tell them apart from the list: an
+            # explicit [] mutes the session, while a missing/corrupt file makes
+            # route_event fail open and forward EVERYTHING. Say which one it is.
+            if not f['topicsConfigured']:
+                body['failOpen'] = True
+                body['warning'] = (
+                    'no readable filter file: session routing fails OPEN, so EVERY event of every '
+                    'wired source lands in this session — not none, as the empty topics list above '
+                    'suggests. Subscribe to a topic, or write {"topics": []} to filterFile to '
+                    'receive nothing.')
             # Dispatch standing watches are shared, so every session sees them.
             d, dexpired = pruned(DISPATCH_FILE)
             if d['topicsConfigured']:
