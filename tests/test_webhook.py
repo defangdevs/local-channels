@@ -492,6 +492,21 @@ class TestCallTool(StateDirCase):
         self.assertEqual(body['dispatch']['topics'][0]['topic'], 'github:p/q')
         self.assertEqual(body['dispatch']['topics'][0]['expiresIn'], 'never (pinned)')
 
+    def test_subscriptions_flags_fail_open_when_no_filter_file(self):
+        # No filter file yet: route_event forwards everything, so the empty
+        # topics list must not read as "nothing is delivered here".
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertEqual(body['topics'], [])
+        self.assertTrue(body['failOpen'])
+        self.assertIn('fails OPEN', body['warning'])
+        # An explicit empty list is the opposite state: configured, muted.
+        self.call('webhook_subscribe', topic='o/r')
+        self.call('webhook_unsubscribe', topic='o/r')
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertEqual(body['topics'], [])
+        self.assertNotIn('failOpen', body)
+        self.assertNotIn('warning', body)
+
     def test_subscriptions_warns_on_spawnless_receiver(self):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
         with open(os.path.join(self.state, 'receiver.json'), 'w', encoding='utf-8') as f:
