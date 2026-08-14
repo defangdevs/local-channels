@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.12.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `when`/`drop` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
+| [`local-webhook`](local-webhook/) | 0.13.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `when`/`drop` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
 
 ## Requirements
 
@@ -139,10 +139,17 @@ restarting the session. The agent calls:
 | `webhook_subscriptions` | list current topics with their notes, age, last activity and time to expiry |
 
 **Topics** are `source:key` patterns, matched case-insensitively:
-`github:owner/repo` (exact), `github:owner/*` (prefix), `github:*` (whole
-source), or `*` (everything). A bare `owner/repo` or `owner/*` is shorthand for
-the `github:` form. Keyless payloads (a GitHub `ping`, a generic source with no
-`keyPath`) are forwarded if anything from that source is subscribed at all.
+`github:owner/repo` (exact) or `github:owner/*` (prefix). A bare `owner/repo` or
+`owner/*` is shorthand for the `github:` form.
+
+There is deliberately **no way to subscribe to everything** (0.13.0). The
+whole-source form `github:*` and the whole-bus form `*` were both removed, so
+the widest topic expressible is a prefix under one source. Keyless payloads —
+an org-level GitHub `ping`, or every event of a source wired without a
+`keyPath` — used to reach anyone subscribed to anything from that source, which
+was the same thing by another route; they now reach nobody. A source whose
+events carry no key cannot be addressed, so give it a `keyPath` rather than a
+way to subscribe to all of it.
 
 **Notes.** `note` is a one-liner saying *why* the subscription exists ("waiting
 on Lio to wire the hook, issue 15"). It is echoed under every delivery on that
@@ -274,9 +281,12 @@ sessions for fan-out and routing to work.
 
 - **`filter.json` / `filter.<session>.json`** — the subscription list, managed by
   the tools and CLI but safe to hand-edit; hot-reloaded per delivery and written
-  atomically. `enabled: false` mutes everything. Missing file or unparseable
-  JSON fails **open** (forward everything) so a botched edit degrades to noise,
-  not silence; an explicit empty `topics` array is a valid "mute all".
+  atomically. `enabled: false` mutes everything. A missing file, unparseable
+  JSON and an explicit empty `topics` array all forward **nothing** (0.13.0):
+  a session receives what it subscribed to and nothing else. Through 0.12.x the
+  first two forwarded everything instead, on the reasoning that a botched edit
+  should degrade to noise — which also handed the whole bus to every session
+  that had simply never subscribed.
 
   ```json
   { "enabled": true, "ttlHours": 1, "topics": [

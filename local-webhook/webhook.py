@@ -12,8 +12,9 @@
 # forwards the public hostname here. The per-source HMAC check is the only
 # trust boundary, so a missing/invalid signature is dropped before anything
 # reaches Claude. Auth fails CLOSED (unknown source or no secret → reject);
-# the topic filter fails OPEN (bad/missing filter.json → forward everything)
-# so a botched edit degrades to noise rather than going silently dark.
+# topic routing fails CLOSED too since 0.13.0 (missing, unparseable or empty
+# filter.json → forward nothing), so a session only ever receives what it
+# actually subscribed to.
 import atexit
 import hashlib
 import hmac
@@ -32,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.12.1'
+VERSION = '0.13.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -252,7 +253,8 @@ def verify(secret, sig_header, body):
 # asked for the repo). Dispatch is stricter than an exemption: there a CI event
 # spawns only on a FAILURE, sender irrelevant, because the same event costs a
 # whole spawned session — see ci_outcome_is_news and dispatch_event.
-# Missing file, bad JSON, or missing keys fail OPEN (forward everything).
+# Missing file, bad JSON, or missing keys forward NOTHING (0.13.0); the two
+# error states stay distinguishable for reporting — see read_filter.
 #
 # Subscriptions EXPIRE: sessions come and go (context gets cleared), and a
 # webhook landing later in a fresh session is noise without the work that
@@ -306,8 +308,9 @@ def filter_path_of(key):
 FILTER_FILE = filter_path_of(FILTER_KEY)
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
-    "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key', prefix "
-    "'source:prefix/*', 'source:*', and '*'; entries {topic, note, ignoreSenders, when, drop, ttlHours, "
+    "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
+    "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; entries {topic, note, "
+    "ignoreSenders, when, drop, ttlHours, "
     "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; "
     "CI-outcome events like workflow_run are never sender-ignored on this path) and expire ttlHours after "
     "subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe "
@@ -401,10 +404,34 @@ def ci_outcome_is_news(event, payload):
     return s(conclusion) in CI_FAILURE_STATES
 
 # Topics are "source:key" with the same wildcard rules the old repo filter
-# had, generalized: "*", "github:*", "github:owner/*", "github:owner/name".
-TOPIC_PATTERN = re.compile(r'^(\*|[A-Za-z0-9._-]+:(\*|[!-~]+))$')
+# had, generalized: "github:owner/*", "github:owner/name".
+#
+# 0.13.0 removed the two wildcard forms that meant "everything" — a bare "*"
+# (the whole bus) and "source:*" (a whole source). Subscribing to everything is
+# now unexpressible rather than merely discouraged: the widest topic is a prefix
+# under one source, e.g. "github:defangdevs/*". The negative lookahead is what
+# rejects a key of exactly "*"; "owner/*" stays legal because the wildcard is a
+# prefix within the key, not the whole of it.
+TOPIC_PATTERN = re.compile(r'^[A-Za-z0-9._-]+:(?!\*$)[!-~]+$')
 # Muscle-memory shorthand: a bare "owner/name" or "owner/*" is a github topic.
 GH_SHORTHAND = re.compile(r'^[A-Za-z0-9._-]+/(\*|[A-Za-z0-9._-]+)$')
+
+
+# An entry whose topic no longer parses is KEPT and never matches, rather than
+# rejected at load or dropped silently. Same rule normalize_entry already
+# applies to a malformed when/drop, and for the same reason: a 0.12.x filter
+# holding "github:*" survives the upgrade as a visible dead row its owner can
+# re-point, where dropping it would lose a subscription somebody wanted and
+# rejecting the file would take the session's other topics down with it.
+# webhook_subscriptions marks these, so a consumer never has to re-derive the
+# grammar to find them (defangdevs/agent-box#227).
+def topic_invalid_reason(pat):
+    if TOPIC_PATTERN.match(pat):
+        return ''
+    if pat == '*' or pat.endswith(':*'):
+        return ('subscribing to a whole source or the whole bus was removed in 0.13.0; '
+                'name a key or a prefix, e.g. "github:owner/*"')
+    return 'not a valid topic pattern; expected "source:key" or "source:prefix/*"'
 
 # Node is single-threaded; here the HTTP/IPC threads and the stdio loop can
 # race on the filter's read-modify-write, so one lock serializes them.
@@ -460,10 +487,20 @@ def read_filter(path=FILTER_FILE):
             'enabled': raw.get('enabled') is not False,
             'ttlHours': ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else DEFAULT_TTL_HOURS,
             'topicsConfigured': topics is not None,
+            'state': 'ok' if topics is not None else 'unconfigured',
             'topics': [e for e in map(normalize_entry, topics or []) if e],
         }
-    except (OSError, ValueError):
-        return {'enabled': True, 'ttlHours': DEFAULT_TTL_HOURS, 'topicsConfigured': False, 'topics': []}
+    except OSError:
+        # No file: this session never subscribed. Distinct from the case below,
+        # and the whole point of 0.13.0 — see route_event.
+        return {'enabled': True, 'ttlHours': DEFAULT_TTL_HOURS, 'topicsConfigured': False,
+                'state': 'absent', 'topics': []}
+    except ValueError:
+        # File present but unparseable: a botched edit, or a read that raced a
+        # non-atomic writer. Also routes nothing now, but it is an error to
+        # report rather than an ordinary starting state.
+        return {'enabled': True, 'ttlHours': DEFAULT_TTL_HOURS, 'topicsConfigured': False,
+                'state': 'invalid', 'topics': []}
 
 
 # Atomic replace: the filter is re-read on every delivery, so a partial write
@@ -536,16 +573,15 @@ def expires_str(e, default_ttl, now):
 
 
 def match_topic(source, key, pat):
-    if pat == '*':
-        return True
+    # A topic that does not parse matches nothing — see topic_invalid_reason.
+    if not TOPIC_PATTERN.match(pat):
+        return False
     i = pat.find(':')
     if i < 0:
         return False
     if pat[:i].lower() != source.lower():
         return False
     pk = pat[i + 1:]
-    if pk == '*':
-        return True
     if not key:
         return False
     if pk.endswith('/*'):
@@ -679,16 +715,29 @@ def entry_forwards(e, sender, event, payload=None, ci_exempt=True):
 # (or on every delivery when renewOnEvent). A cold straggler is forwarded but
 # does NOT renew — see the DEFAULT_TTL_HOURS comment for why. The write only
 # happens when something changed.
-# Session routing fails OPEN (fail_open=True: no filter file → forward all, so
-# a botched edit degrades to noise); dispatch routing passes fail_open=False
-# because its worst case is not noise but a spawned session per delivery.
-def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail_open=True, ci_exempt=True):
+# Nothing fails open any more (0.13.0). A session receives what it subscribed
+# to and nothing else, whether the filter is missing, unparseable or empty.
+#
+# Until 0.12.x, a missing filter forwarded EVERYTHING, on the reasoning that a
+# botched edit should degrade to noise rather than silently lose events. That
+# reasoning held for a botched edit and was wrong for the common case it also
+# covered: a session that had simply never subscribed. Most sessions never
+# subscribe, so most sessions drank the whole bus — which is what made "one
+# session's subscription fans out to everyone" look like a scoping bug (#21)
+# when no subscription was involved at all.
+#
+# The trade is now the other way, deliberately: an unwanted delivery interrupts
+# a live session and spends its context, while a missed one costs a
+# re-subscribe and still reached dispatch and every configured session. Losing
+# events is the cheaper failure, so both error states take it. read_filter
+# still tells the two apart, and webhook_subscriptions reports which.
+def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, ci_exempt=True):
     with FILTER_LOCK:
         f = read_filter(path)
         if not f['enabled']:
             return {'forward': False, 'entry': None, 'refused': False}
         if not f['topicsConfigured']:
-            return {'forward': fail_open, 'entry': None, 'refused': False}  # no filter configured
+            return {'forward': False, 'entry': None, 'refused': False}
         now = now_ms()
         live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
         pruned = len(live) != len(f['topics'])
@@ -696,10 +745,19 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, fail
         matched = None
         topic_hit = False  # some entry matched the topic, whatever it then said
         if not key:
-            # Keyless payloads (github ping, generic events without a keyPath):
-            # let them through if anything from this source is subscribed at all.
-            forward = any(e['topic'] == '*' or e['topic'].lower().startswith(source.lower() + ':')
-                          for e in live)
+            # Keyless payloads (an org-level github ping; every event of a
+            # source wired without a keyPath) are no longer deliverable to a
+            # session. They used to reach anyone subscribed to anything from
+            # that source — the third implicit "subscribe to everything", and
+            # the one that bites hardest for a keyless source, where it silently
+            # promoted one subscription into all of them.
+            #
+            # There is deliberately no wildcard left to catch them: a source
+            # whose events carry no key cannot be addressed, so give it a
+            # keyPath (or a synthetic key) rather than a way to subscribe to all
+            # of it. See defangdevs/local-channels#19 for the local sources this
+            # matters to.
+            forward = False
         else:
             for e in live:
                 if not match_topic(source, key, e['topic']):
@@ -748,8 +806,9 @@ def filter_claims(path, source, key, sender, event, payload=None):
         if entry_expired(e, f['ttlHours'], now):
             continue
         if not key:
-            if e['topic'] == '*' or e['topic'].lower().startswith(source.lower() + ':'):
-                return True
+            # Keyless payloads reach no session (route_event), so no session
+            # can claim one either — otherwise a keyless event would suppress
+            # its own spawn on behalf of a session that will never see it.
             continue
         if match_topic(source, key, e['topic']) and entry_forwards(e, sender, event, payload):
             return True
@@ -1158,7 +1217,7 @@ def dispatch_event(env):
     event = env.get('event', '')
     news = ci_outcome_is_news(event, env.get('payload'))
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
-                    event, env.get('payload'), path=DISPATCH_FILE, fail_open=False, ci_exempt=news)
+                    event, env.get('payload'), path=DISPATCH_FILE, ci_exempt=news)
     if not r['forward']:
         if r['refused']:
             # A watch covers this topic and turned the event down. Said out
@@ -1327,8 +1386,9 @@ INSTRUCTIONS = (
     'sender (e.g. github). They are one-way and already HMAC-verified. Read them and act (e.g. investigate '
     'a failing check, review a new PR, note a push); no reply is expected or possible on this channel. '
     'Routing is controlled by the tools webhook_subscribe / webhook_unsubscribe / webhook_subscriptions, '
-    'which manage topic patterns of the form "source:key" — e.g. github:owner/repo, github:owner/*, '
-    'stripe:*, or "*" for everything; a bare "owner/repo" is shorthand for github:owner/repo. Subscribe '
+    'which manage topic patterns of the form "source:key" — e.g. github:owner/repo or github:owner/*; a '
+    'bare "owner/repo" is shorthand for github:owner/repo. There is no pattern for a whole source or the '
+    'whole bus, so name what you actually want. Subscribe '
     'when you start work on something whose events you want to see and unsubscribe when you wrap up. '
     'Pass a short note saying WHY you subscribed — it is echoed under every delivery, so a later '
     'session with cleared context knows what the event relates to. Subscriptions expire '
@@ -1361,8 +1421,9 @@ TOOLS = [
         'name': 'webhook_subscribe',
         'description':
             'Route webhook events matching the given topic into this Claude Code session. Topics are '
-            '"source:key" patterns: "github:owner/repo" (exact), "github:owner/*" (prefix), "github:*" '
-            '(whole source), or "*" (everything); a bare "owner/repo" means github:owner/repo. Call when '
+            '"source:key" patterns: "github:owner/repo" (exact) or "github:owner/*" (prefix); a bare '
+            '"owner/repo" means github:owner/repo. Subscribing to a whole source ("github:*") or to '
+            'everything ("*") is NOT possible — name a key or a prefix. Call when '
             'starting work on something whose events you want in real time (pushes, PR reviews, workflow '
             'runs, comments, payments, ...). Subscriptions persist across sessions but EXPIRE '
             '%dh after the clock was last reset — re-subscribing resets it (and updates note / '
@@ -1375,7 +1436,7 @@ TOOLS = [
             'properties': {
                 'topic': {
                     'type': 'string',
-                    'description': 'Topic pattern: "source:key", "source:prefix/*", "source:*", or "*". Bare "owner/repo" implies github.',
+                    'description': 'Topic pattern: "source:key" or "source:prefix/*". Bare "owner/repo" implies github. There is no pattern for a whole source or for everything.',
                 },
                 'note': {
                     'type': 'string',
@@ -1513,6 +1574,14 @@ def call_tool(params):
 
         def render(e, default_ttl):
             o = {'topic': e['topic']}
+            # Kept, never matching, and SAID so — a consumer must not have to
+            # re-derive the grammar to spot a dead row, and could not do it
+            # safely anyway: the same string is legal on a 0.12.x daemon, so
+            # only the daemon serving the row knows whether it still parses.
+            reason = topic_invalid_reason(e['topic'])
+            if reason:
+                o['invalid'] = True
+                o['reason'] = reason
             if e['note']:
                 o['note'] = e['note']
             if e['ttlHours'] is not None:
@@ -1539,17 +1608,20 @@ def call_tool(params):
                 body['self'] = SELF
             body['filterFile'] = FILTER_FILE
             body['topics'] = [render(e, f['ttlHours']) for e in f['topics']]
-            # An empty topics list means two OPPOSITE things depending on why it
-            # is empty, and the caller cannot tell them apart from the list: an
-            # explicit [] mutes the session, while a missing/corrupt file makes
-            # route_event fail open and forward EVERYTHING. Say which one it is.
-            if not f['topicsConfigured']:
-                body['failOpen'] = True
+            # All three empty cases now route the same (nothing), so the list is
+            # no longer misleading on its own — 0.12.1's failOpen field is gone
+            # with the behaviour it warned about. What still differs is whether
+            # the emptiness is a starting state or an error, so report that.
+            body['filterState'] = f['state']
+            if f['state'] == 'invalid':
                 body['warning'] = (
-                    'no readable filter file: session routing fails OPEN, so EVERY event of every '
-                    'wired source lands in this session — not none, as the empty topics list above '
-                    'suggests. Subscribe to a topic, or write {"topics": []} to filterFile to '
-                    'receive nothing.')
+                    'filter file is present but unparseable, so this session receives NOTHING. '
+                    'Since 0.13.0 a broken filter no longer falls back to forwarding everything. '
+                    'Fix the JSON at filterFile, or subscribe again to rewrite it.')
+            elif f['state'] == 'absent':
+                body['warning'] = (
+                    'no filter file: this session receives nothing until it subscribes. Before '
+                    '0.13.0 this state forwarded EVERY event of every wired source instead.')
             # Dispatch standing watches are shared, so every session sees them.
             d, dexpired = pruned(DISPATCH_FILE)
             if d['topicsConfigured']:
@@ -1570,7 +1642,9 @@ def call_tool(params):
         if GH_SHORTHAND.match(topic):
             topic = 'github:%s' % topic
         if not TOPIC_PATTERN.match(topic):
-            return text('error: topic "%s" is not a valid pattern; expected "source:key", "source:*", or "*"' % topic)
+            return text('error: topic "%s" is not a valid pattern; expected "source:key" or '
+                        '"source:prefix/*". Subscribing to a whole source or to everything was '
+                        'removed in 0.13.0 — name what you want.' % topic)
 
         def eq(a, b):
             return a.lower() == b.lower()
@@ -1941,8 +2015,9 @@ usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE
        webhook.py ls
        webhook.py status
 
-TOPIC is "source:key" — "github:owner/repo" (exact), "github:owner/*" (prefix),
-"github:*" (whole source) or "*" (everything). A bare "owner/repo" means github.
+TOPIC is "source:key" — "github:owner/repo" (exact) or "github:owner/*"
+(prefix). A bare "owner/repo" means github. There is no wildcard for a whole
+source or for everything: name a key or a prefix.
 
   --note TEXT          why you subscribed; echoed under every delivery so a
                        fresh-context session knows what the event relates to

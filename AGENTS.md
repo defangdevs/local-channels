@@ -33,9 +33,14 @@ new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
   codes (agent-box's fail2ban keys on the `401`) are consumed outside this repo.
   Changing any of them is a breaking change that needs a companion change
   downstream, not a silent edit.
-- **Auth fails closed, routing fails open.** Unknown source / missing secret /
-  bad signature must reject; a missing or corrupt filter file must forward
-  everything. Keep new code on the right side of that split.
+- **Everything fails closed.** Unknown source / missing secret / bad signature
+  must reject, and since 0.13.0 a missing, corrupt or empty filter file must
+  forward NOTHING. Routing used to fail open; it stopped because the state that
+  triggered it was overwhelmingly "this session never subscribed", not "someone
+  botched an edit". Keep new code on the closed side, and keep "subscribe to
+  everything" unexpressible — there is no whole-source or whole-bus topic, and
+  keyless payloads reach nobody. Anything that reintroduces an implicit
+  everything is a regression, however convenient.
 - **Payload text is hostile.** Anything from a delivery that reaches the session
   goes through `s()`/`u()` (truncate + `⟪UNTRUSTED:…⟫`) and the
   `[UNTRUSTED webhook:<source>]` prefix.

@@ -104,15 +104,35 @@ class TestVerify(StateDirCase):
 class TestMatchTopic(StateDirCase):
     def test_patterns(self):
         m = self.mod.match_topic
-        self.assertTrue(m('github', 'o/r', '*'))
-        self.assertTrue(m('github', 'o/r', 'github:*'))
         self.assertTrue(m('github', 'o/r', 'github:o/*'))
         self.assertTrue(m('github', 'o/r', 'github:o/r'))
         self.assertTrue(m('GitHub', 'O/R', 'github:o/r'))     # case-insensitive
-        self.assertFalse(m('github', 'o/r', 'stripe:*'))
         self.assertFalse(m('github', 'other/r', 'github:o/*'))
         self.assertFalse(m('github', '', 'github:o/r'))       # keyless never exact-matches
         self.assertFalse(m('github', 'o/r', 'plainstring'))   # no colon → no match
+
+    def test_wildcards_removed(self):
+        """0.13.0: "everything" is unexpressible. Both forms match nothing,
+        wherever they came from — a hand-edited file or a 0.12.x filter that
+        survived the upgrade."""
+        m = self.mod.match_topic
+        self.assertFalse(m('github', 'o/r', '*'))
+        self.assertFalse(m('github', 'o/r', 'github:*'))
+        self.assertFalse(m('stripe', 'ch_1', 'stripe:*'))
+        # The prefix form is NOT a wildcard in this sense and stays legal: the
+        # star is inside the key, so it still names one source and one owner.
+        self.assertTrue(m('github', 'o/r', 'github:o/*'))
+
+    def test_invalid_topics_are_reported_not_guessed(self):
+        """Consumers must not re-derive the grammar to spot a dead row: the
+        same string is legal on a 0.12.x daemon, so only the daemon serving it
+        knows. (defangdevs/agent-box#227)"""
+        why = self.mod.topic_invalid_reason
+        self.assertEqual(why('github:o/r'), '')
+        self.assertEqual(why('github:o/*'), '')
+        self.assertIn('removed in 0.13.0', why('*'))
+        self.assertIn('removed in 0.13.0', why('github:*'))
+        self.assertIn('not a valid topic pattern', why('plainstring'))
 
 
 class TestPredicates(StateDirCase):
@@ -183,20 +203,47 @@ class TestRouteEvent(StateDirCase):
         with open(path or self.mod.FILTER_FILE, 'w', encoding='utf-8') as f:
             json.dump(body, f)
 
-    def test_session_fails_open_dispatch_fails_closed(self):
-        # No filter file at all.
-        r = self.mod.route_event('github', 'o/r', 'x', 'issues')
-        self.assertTrue(r['forward'])
-        r = self.mod.route_event('github', 'o/r', 'x', 'issues',
-                                 path=self.mod.DISPATCH_FILE, fail_open=False)
-        self.assertFalse(r['forward'])
-        # Corrupt file: same split.
+    def test_nothing_fails_open(self):
+        """0.13.0: a session receives what it subscribed to and nothing else.
+        Before it, a missing filter forwarded the whole bus -- and since most
+        sessions never subscribe, most sessions got it."""
+        # No filter file at all: the common case, a session that never subscribed.
+        for path in (self.mod.FILTER_FILE, self.mod.DISPATCH_FILE):
+            r = self.mod.route_event('github', 'o/r', 'x', 'issues', path=path)
+            self.assertFalse(r['forward'])
+        # Present but unparseable: a botched edit no longer buys the firehose.
         for p in (self.mod.FILTER_FILE, self.mod.DISPATCH_FILE):
             with open(p, 'w', encoding='utf-8') as f:
                 f.write('{nope')
+            self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues', path=p)['forward'])
+
+    def test_absent_and_invalid_stay_distinguishable(self):
+        """Both route nothing, but one is a starting state and the other an
+        error. read_filter keeps them apart so subscriptions can say which."""
+        self.assertEqual(self.mod.read_filter(self.mod.FILTER_FILE)['state'], 'absent')
+        with open(self.mod.FILTER_FILE, 'w', encoding='utf-8') as f:
+            f.write('{nope')
+        self.assertEqual(self.mod.read_filter(self.mod.FILTER_FILE)['state'], 'invalid')
+        self.write([])
+        self.assertEqual(self.mod.read_filter(self.mod.FILTER_FILE)['state'], 'ok')
+
+    def test_keyless_payloads_reach_nobody(self):
+        """The third implicit "everything": a keyless payload used to reach
+        anyone subscribed to anything from that source. For a source wired
+        without a keyPath that promoted one subscription into all of them."""
+        self.write([self.entry('github:o/r')])
+        self.assertFalse(self.mod.route_event('github', '', 'x', 'ping')['forward'])
+        # ...and no session can claim one for dispatch either, or a keyless
+        # event would suppress its own spawn on behalf of a session that will
+        # never see it.
+        self.assertFalse(self.mod.filter_claims(self.mod.FILTER_FILE, 'github', '', 'x', 'ping'))
+
+    def test_surviving_wildcard_entry_is_kept_and_inert(self):
+        """An upgraded box keeps a 0.12.x wildcard as a visible dead row: it
+        matches nothing, and the other topics in the file still work."""
+        self.write([self.entry('github:*'), self.entry('github:o/r')])
+        self.assertFalse(self.mod.route_event('github', 'other/repo', 'x', 'issues')['forward'])
         self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
-        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues',
-                                              path=self.mod.DISPATCH_FILE, fail_open=False)['forward'])
 
     def test_subscribed_topic_forwards_and_stamps(self):
         self.write([self.entry('github:o/*')])
@@ -492,20 +539,51 @@ class TestCallTool(StateDirCase):
         self.assertEqual(body['dispatch']['topics'][0]['topic'], 'github:p/q')
         self.assertEqual(body['dispatch']['topics'][0]['expiresIn'], 'never (pinned)')
 
-    def test_subscriptions_flags_fail_open_when_no_filter_file(self):
-        # No filter file yet: route_event forwards everything, so the empty
-        # topics list must not read as "nothing is delivered here".
+    def test_subscriptions_reports_why_the_list_is_empty(self):
+        # All three empty states now route the same (nothing), so the list is
+        # no longer misleading on its own -- 0.12.1's failOpen field went with
+        # the behaviour it warned about. What still differs is whether the
+        # emptiness is an ordinary starting state or an error.
         body = json.loads(self.call('webhook_subscriptions'))
         self.assertEqual(body['topics'], [])
-        self.assertTrue(body['failOpen'])
-        self.assertIn('fails OPEN', body['warning'])
-        # An explicit empty list is the opposite state: configured, muted.
+        self.assertNotIn('failOpen', body)
+        self.assertEqual(body['filterState'], 'absent')
+        self.assertIn('receives nothing until it subscribes', body['warning'])
+        # An explicit empty list means the same thing, and needs no warning.
         self.call('webhook_subscribe', topic='o/r')
         self.call('webhook_unsubscribe', topic='o/r')
         body = json.loads(self.call('webhook_subscriptions'))
         self.assertEqual(body['topics'], [])
-        self.assertNotIn('failOpen', body)
+        self.assertEqual(body['filterState'], 'ok')
         self.assertNotIn('warning', body)
+        # A botched edit is the one worth shouting about.
+        with open(self.mod.FILTER_FILE, 'w', encoding='utf-8') as f:
+            f.write('{nope')
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertEqual(body['filterState'], 'invalid')
+        self.assertIn('unparseable', body['warning'])
+
+    def test_subscriptions_marks_a_surviving_wildcard_entry(self):
+        """A 0.12.x filter carried across the upgrade shows its dead rows as
+        dead, so a consumer never re-derives the grammar to find them."""
+        with open(self.mod.FILTER_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'topics': ['github:*', 'github:o/r']}, f)
+        body = json.loads(self.call('webhook_subscriptions'))
+        dead, live = body['topics'][0], body['topics'][1]
+        self.assertEqual(dead['topic'], 'github:*')
+        self.assertTrue(dead['invalid'])
+        self.assertIn('removed in 0.13.0', dead['reason'])
+        self.assertEqual(live['topic'], 'github:o/r')
+        self.assertNotIn('invalid', live)
+
+    def test_subscribe_refuses_both_wildcards(self):
+        for topic in ('*', 'github:*'):
+            out = self.call('webhook_subscribe', topic=topic)
+            self.assertIn('not a valid pattern', out)
+            self.assertIn('removed in 0.13.0', out)
+        # The prefix form is still how you follow a whole org.
+        self.assertNotIn('not a valid pattern',
+                         self.call('webhook_subscribe', topic='github:defangdevs/*'))
 
     def test_subscriptions_warns_on_spawnless_receiver(self):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
@@ -1364,10 +1442,14 @@ class TestEndToEnd(unittest.TestCase):
         pipeline: fan-out to subscribed peers AND standing-watch dispatch —
         exactly like an external delivery (and a non-CI event spawns even while
         a live session is subscribed)."""
+        # Keyed on the payload's own window, because 0.13.0 removed "budget:*"
+        # along with every other way to subscribe to a whole source. A local
+        # source therefore needs a real keyPath to be addressable at all —
+        # see defangdevs/local-channels#19.
         self.add_source('budget', keyPath='window')
-        r = self.cli('subscribe', 'budget:*', '--note', 'usage-limit warnings', session='peersess')
+        r = self.cli('subscribe', 'budget:5h', '--note', 'usage-limit warnings', session='peersess')
         self.assertEqual(r.returncode, 0, r.stderr)
-        r = self.cli('subscribe', 'budget:*', '--deliver-to', 'subagent', '--note', 'budget watch')
+        r = self.cli('subscribe', 'budget:5h', '--deliver-to', 'subagent', '--note', 'budget watch')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.start_daemon()
         peer = self.start_peer('peersess')

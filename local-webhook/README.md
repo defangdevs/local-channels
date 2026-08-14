@@ -49,11 +49,12 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
   session gets its own `filter.<session>.json`, so a `webhook_subscribe` in one
   session never leaks into a sibling that happens to act as the same identity.
 - Auth fails **closed** (unknown source / missing secret / bad signature →
-  reject). The topic filter fails **open** (missing or corrupt `filter.json`
-  → forward everything) so a botched edit degrades to noise, not silence.
-  Because that state also lists **no** topics, `webhook_subscriptions` says so
-  explicitly — `failOpen: true` plus a warning (0.12.1). An empty `topics` list
-  in the file is the opposite state: configured, so nothing is delivered.
+  reject), and since 0.13.0 so does the topic filter: a missing `filter.json`,
+  a corrupt one and an explicit empty `topics` list all forward **nothing**.
+  Through 0.12.x the first two forwarded everything, so any session that had
+  never subscribed received the whole bus. All three states list no topics, so
+  `webhook_subscriptions` reports `filterState` (`absent` / `invalid` / `ok`)
+  to say which, and warns on the two that are not an ordinary empty list.
 - All payload free-text is truncated and wrapped in `⟪UNTRUSTED:…⟫` markers,
   and every channel message is prefixed `[UNTRUSTED webhook:<source>]`.
 
@@ -92,7 +93,11 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 ### filter.json
 
 Managed by the MCP tools; safe to hand-edit. Topics are `source:key` patterns:
-`github:owner/repo` (exact), `github:owner/*` (prefix), `github:*`, or `*`.
+`github:owner/repo` (exact) or `github:owner/*` (prefix). Since 0.13.0 there is
+no wildcard for a whole source (`github:*`) or for everything (`*`); an entry
+holding one is **kept and never matches**, and `webhook_subscriptions` marks it
+`invalid` with a reason, so an upgraded filter shows a visible dead row its
+owner can re-point rather than silently losing a subscription.
 An entry may also be an object with `ignoreSenders`: events on that topic whose
 sender matches are dropped as echoes of the session's own actions (pass
 `ignore_senders` to `webhook_subscribe`, or hand-edit). `"@self"` resolves to
