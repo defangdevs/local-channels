@@ -137,10 +137,12 @@ class TestMatchTopic(StateDirCase):
 
 class TestPredicates(StateDirCase):
     """The when/drop payload predicate language (0.11.0): any/all over
-    {path, in/notIn} leaves, evaluated with get_path."""
+    {path, in/notIn} leaves plus {path, contains/notContains} substring leaves
+    (0.14.0), evaluated with get_path."""
 
     P = {'action': 'opened', 'sender': {'login': 'bot'},
-         'workflow_run': {'conclusion': 'failure'}, 'draft': False, 'number': 5}
+         'workflow_run': {'conclusion': 'failure'}, 'draft': False, 'number': 5,
+         'comment': {'body': 'please @DefangDevs rebase this'}}
 
     def m(self, pred, payload=None):
         return self.mod.match_predicate(pred, self.P if payload is None else payload)
@@ -173,9 +175,40 @@ class TestPredicates(StateDirCase):
         self.assertTrue(self.m({'path': 'number', 'in': [5]}))
         self.assertFalse(self.m({'path': 'number', 'in': [True]}))
 
+    def test_leaf_contains_and_notcontains(self):
+        # The case the operator exists for: a mention no whole-value list can
+        # name, matched case-insensitively because GitHub logins are.
+        self.assertTrue(self.m({'path': 'comment.body', 'contains': ['@defangdevs']}))
+        self.assertTrue(self.m({'path': 'comment.body', 'contains': ['nope', 'rebase']}))
+        self.assertFalse(self.m({'path': 'comment.body', 'contains': ['@someoneelse']}))
+        self.assertFalse(self.m({'path': 'comment.body', 'notContains': ['@DEFANGDEVS']}))
+        self.assertTrue(self.m({'path': 'comment.body', 'notContains': ['@someoneelse']}))
+
+    def test_contains_needs_a_string_value(self):
+        # A non-string contains nothing, so an absent path or a number fails
+        # `contains` and passes `notContains` — the direction notIn takes too.
+        self.assertFalse(self.m({'path': 'no.such.path', 'contains': ['x']}))
+        self.assertTrue(self.m({'path': 'no.such.path', 'notContains': ['x']}))
+        self.assertFalse(self.m({'path': 'number', 'contains': ['5']}))
+        self.assertFalse(self.m({'path': 'draft', 'contains': ['false']}))
+
+    def test_contains_composes_into_a_mention_rule(self):
+        mention = {'all': [{'path': 'action', 'in': ['opened']},
+                           {'path': 'sender.login', 'notIn': ['defangdevs']},
+                           {'path': 'comment.body', 'contains': ['@defangdevs']}]}
+        self.assertTrue(self.m(mention))
+        # Same comment, posted by the box itself: the sender clause is what
+        # stops a watch from answering its own echo forever.
+        echo = dict(self.P, sender={'login': 'defangdevs'})
+        self.assertFalse(self.m(mention, echo))
+
     def test_malformed_nodes_match_nothing(self):
         for bad in ('nope', {'path': 'action'}, {'path': 'action', 'in': 'opened'},
-                    {'path': 'action', 'in': ['a'], 'notIn': ['b']}, {'any': 'x'}, {}, None):
+                    {'path': 'action', 'in': ['a'], 'notIn': ['b']}, {'any': 'x'}, {}, None,
+                    # exactly one operator per leaf, and never an empty
+                    # substring — that one is in every string.
+                    {'path': 'action', 'in': ['a'], 'contains': ['b']},
+                    {'path': 'comment.body', 'contains': 'rebase'}):
             self.assertFalse(self.m(bad), 'matched malformed node %r' % (bad,))
         # ...including nested inside a well-formed combinator.
         self.assertFalse(self.m({'any': [{'path': 'action'}]}))
@@ -184,9 +217,14 @@ class TestPredicates(StateDirCase):
         ok = self.mod.predicate_error
         self.assertIsNone(ok({'path': 'a.b', 'in': ['x', 1, True, None]}))
         self.assertIsNone(ok({'any': [{'all': [{'path': 'a', 'notIn': []}]}]}))
+        self.assertIsNone(ok({'path': 'comment.body', 'contains': ['@bot']}))
+        self.assertIsNone(ok({'path': 'comment.body', 'notContains': ['@bot', 'wip']}))
         for bad in ('nope', {}, {'path': 'a'}, {'path': 'a', 'in': 'x'},
                     {'path': 'a', 'in': ['x'], 'notIn': ['y']}, {'any': 'x'},
-                    {'any': [{'path': ''}]}, {'path': 'a', 'in': [{'nested': 1}]}):
+                    {'any': [{'path': ''}]}, {'path': 'a', 'in': [{'nested': 1}]},
+                    {'path': 'a', 'contains': 'x'}, {'path': 'a', 'contains': ['']},
+                    {'path': 'a', 'contains': [1]}, {'path': 'a', 'contains': [None]},
+                    {'path': 'a', 'in': ['x'], 'notContains': ['y']}):
             self.assertIsNotNone(ok(bad), 'accepted malformed predicate %r' % (bad,))
 
 
@@ -878,6 +916,33 @@ class TestDispatchDeclarative(DispatchCase):
         self.watch()
         self.fake_live_peer('peer1', ['github:o/*'])
         self.mod.dispatch_event(self.run_env('failure'))
+        self.spawned(False)
+
+    def comment_env(self, body, sender='me', action='created'):
+        return self.env('issue_comment',
+                        {'action': action, 'issue': {'number': 286, 'title': 't'},
+                         'comment': {'body': body}}, sender=sender)
+
+    def test_a_mention_in_free_text_spawns(self):
+        # agent-box#296: an @mention is a work request, and no in/notIn list
+        # can name it — it lives inside comment.body. Without `contains` the
+        # watch declined it and the request reached nobody.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  when={'all': [{'path': 'action', 'in': ['created', 'edited']},
+                                {'path': 'sender.login', 'notIn': ['box']},
+                                {'path': 'comment.body', 'contains': ['@box']}]})
+        self.mod.dispatch_event(self.comment_env('ship it'))
+        self.spawned(False)
+        self.mod.dispatch_event(self.comment_env('@BOX rebase'))
+        self.spawned(True, 'comment created on #286')
+
+    def test_the_boxs_own_mention_echo_does_not_spawn(self):
+        # The sender clause earns its place here: the box quotes the request
+        # back in its reply, so without it every answer would spawn again.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  when={'all': [{'path': 'sender.login', 'notIn': ['box']},
+                                {'path': 'comment.body', 'contains': ['@box']}]})
+        self.mod.dispatch_event(self.comment_env('done, @box out', sender='box'))
         self.spawned(False)
 
 
