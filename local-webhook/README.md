@@ -282,10 +282,12 @@ quote them).
 
 Differences from session routing, all deliberate:
 
-- **Fails closed.** No spawn command, no dispatch file, or a corrupt one all
-  mean *spawn nothing*. Failing open here would be a session per delivery — a
-  fork bomb, not noise. (`webhook_subscribe` warns when the receiver daemon
-  advertises no spawn command in `receiver.json`.)
+- **Fails closed for a bigger reason.** No spawn command, no dispatch file, or
+  a corrupt one all mean *spawn nothing*. Session routing fails closed too since
+  0.13.0; what differs is the cost of the opposite mistake — failing open here
+  would be a session per delivery, a fork bomb, not noise. (`webhook_subscribe`
+  warns when the receiver daemon advertises no spawn command in
+  `receiver.json`.)
 - **Shared, not per-session.** The watch outlives the session that created it;
   every session sees the dispatch list under `dispatch` in
   `webhook_subscriptions`.
