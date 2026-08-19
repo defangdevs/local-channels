@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.13.0'
+VERSION = '0.14.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -316,7 +316,8 @@ FILTER_COMMENT = (
     "subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe "
     "and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; "
     "entries without timestamps don't expire until a write stamps them). Optional when/drop are payload "
-    "predicates ({any/all: [...]} over {path, in/notIn} leaves): drop refuses matching events, when accepts "
+    "predicates ({any/all: [...]} over {path, in/notIn} whole-value leaves and {path, "
+    "contains/notContains} case-insensitive substring leaves): drop refuses matching events, when accepts "
     "ONLY matching ones, and an entry carrying either opts out of the built-in CI carve-outs — the "
     "predicate is authoritative. Delete file to fail open (forward all)."
 )
@@ -597,12 +598,45 @@ def match_topic(source, key, pat):
 # daemon supplies the evaluator. The language is deliberately tiny — {any:[…]},
 # {all:[…]}, and leaves {path, in:[…]} / {path, notIn:[…]} — because anything
 # richer belongs in the consumer, not the wire format.
+#
+# 0.14.0 adds exactly one more comparison, {path, contains:[…]} / notContains
+# (local-channels#33), and the reason it is not consumer policy is the whole
+# argument for it: a GitHub @mention lives inside free text with no structured
+# field beside it, so no list of whole values can ever enumerate it — and the
+# consumer never gets a say, because dispatch_event returns before the spawn
+# command runs. Substring is the one operator with no workaround downstream.
+# Regex is still refused: payload text is hostile, and a catastrophic pattern
+# would stall the daemon on somebody else's comment body.
 def get_path(obj, path):
     for k in path.split('.'):
         if obj is None or not isinstance(obj, dict):
             return None
         obj = obj.get(k)
     return obj
+
+
+# The leaf operators, in the order an error message lists them. Exactly one
+# may appear in a leaf: two would need a precedence rule, and the language has
+# no room for one.
+LEAF_OPS = ('in', 'notIn', 'contains', 'notContains')
+
+
+def substr_hit(v, vals):
+    """True iff the value at a path is a string holding ANY listed substring.
+
+    Matched case-insensitively, because the case that drove this operator is a
+    GitHub @mention and GitHub logins are case-insensitive: "@DefangDevs" is the
+    same work request as "@defangdevs", and a case-sensitive leaf would drop it
+    with no use case on the other side of the trade.
+
+    A non-string value contains nothing, so an absent path fails `contains` and
+    passes `notContains` — the same direction `in`/`notIn` take when a path is
+    missing and the list does not name null.
+    """
+    if not isinstance(v, str):
+        return False
+    low = v.lower()
+    return any(isinstance(x, str) and x and x.lower() in low for x in vals)
 
 
 def scalar_eq(a, b):
@@ -628,13 +662,14 @@ def match_predicate(pred, payload):
             return any(match_predicate(x, payload) for x in pred['any'])
         if 'all' in pred and isinstance(pred['all'], list):
             return all(match_predicate(x, payload) for x in pred['all'])
-        neg = 'notIn' in pred and 'in' not in pred
-        vals = pred.get('notIn') if neg else pred.get('in')
-        if isinstance(pred.get('path'), str) and pred['path'] and isinstance(vals, list) \
-                and not ('in' in pred and 'notIn' in pred):
+        ops = [k for k in LEAF_OPS if k in pred]
+        if isinstance(pred.get('path'), str) and pred['path'] and len(ops) == 1 \
+                and isinstance(pred[ops[0]], list):
+            op = ops[0]
             v = get_path(payload, pred['path'])
-            hit = any(scalar_eq(v, x) for x in vals)
-            return not hit if neg else hit
+            hit = (substr_hit(v, pred[op]) if op in ('contains', 'notContains')
+                   else any(scalar_eq(v, x) for x in pred[op]))
+            return not hit if op in ('notIn', 'notContains') else hit
     print('local-webhook: malformed predicate node %.200r — matching nothing' % (pred,),
           file=sys.stderr)
     return False
@@ -656,13 +691,23 @@ def predicate_error(pred, where='predicate'):
         return None
     if not isinstance(pred.get('path'), str) or not pred.get('path'):
         return '%s needs "any", "all", or a leaf with a "path" string' % where
-    if ('in' in pred) == ('notIn' in pred):
-        return '%s (path %s) needs exactly one of "in" / "notIn"' % (where, pred['path'])
-    vals = pred['in'] if 'in' in pred else pred['notIn']
+    ops = [k for k in LEAF_OPS if k in pred]
+    if len(ops) != 1:
+        return '%s (path %s) needs exactly one of %s' % (
+            where, pred['path'], ' / '.join('"%s"' % o for o in LEAF_OPS))
+    op = ops[0]
+    vals = pred[op]
     if not isinstance(vals, list):
-        return '%s (path %s): "in"/"notIn" must be an array' % (where, pred['path'])
+        return '%s (path %s): "%s" must be an array' % (where, pred['path'], op)
     for x in vals:
-        if not (x is None or isinstance(x, (str, int, float, bool))):
+        if op in ('contains', 'notContains'):
+            # An empty substring is in every string, so it would quietly turn
+            # `contains` into "everything" — the one thing this file refuses to
+            # let a subscription express.
+            if not (isinstance(x, str) and x):
+                return '%s (path %s): "%s" values must be non-empty strings' % (
+                    where, pred['path'], op)
+        elif not (x is None or isinstance(x, (str, int, float, bool))):
             return '%s (path %s): values must be JSON scalars' % (where, pred['path'])
     return None
 
@@ -1493,7 +1538,11 @@ TOOLS = [
                     'description':
                         'Optional payload predicate: deliver ONLY events matching it. Shape: {"any": [...]} / '
                         '{"all": [...]} over leaves {"path": "dot.path", "in": [values]} or {"path": ..., '
-                        '"notIn": [values]}; null in a list matches an ABSENT path. Example — opened issues/PRs '
+                        '"notIn": [values]}; null in a list matches an ABSENT path. A leaf may instead carry '
+                        '"contains"/"notContains": [substrings], which test a STRING value case-insensitively — '
+                        'use them for free text no whole-value list can enumerate, e.g. '
+                        '{"path": "comment.body", "contains": ["@mybot"]}. A leaf carries exactly one of the '
+                        'four. Example — opened issues/PRs '
                         'plus failing CI: {"any": [{"path": "action", "in": ["opened", "reopened"]}, '
                         '{"path": "workflow_run.conclusion", "in": ["failure", "timed_out"]}]}. An entry with '
                         'when/drop is declarative: the built-in CI carve-outs step aside and these rules are the '
@@ -2044,6 +2093,11 @@ source or for everything: name a key or a prefix.
   --when JSON          deliver ONLY events whose payload matches this predicate:
                        {"any"/"all": [...]} over {"path": "a.b.c", "in"/"notIn":
                        [values]} leaves; null in a list matches an absent path.
+                       A leaf may instead carry "contains"/"notContains":
+                       [substrings] to test a STRING value case-insensitively,
+                       for free text no list of whole values can enumerate
+                       ({"path": "comment.body", "contains": ["@mybot"]}).
+                       Exactly one of the four per leaf.
                        An entry with --when/--drop is declarative — the built-in
                        CI carve-outs step aside and these rules are the whole
                        policy (put sender rules IN the predicate, e.g.

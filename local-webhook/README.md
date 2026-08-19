@@ -136,6 +136,23 @@ over leaves `{"path": "a.b.c", "in": [values]}` or
 `in` list matches an *absent* path. JSON booleans only match booleans (`true`
 never matches `1`).
 
+A leaf may instead carry `contains` / `notContains`, which test a **string**
+value for any of the listed substrings, case-insensitively (0.14.0):
+
+```json
+{ "all": [ { "path": "action", "in": ["created", "edited"] },
+           { "path": "comment.body", "contains": ["@mybot"] } ] }
+```
+
+Reach for these only where no list of whole values can do the job — free text.
+A GitHub @mention is the case they exist for: it lives inside `comment.body`
+with no structured field beside it, so `in` can never name it. Substrings must
+be non-empty (an empty one is in every string, which would smuggle back the
+"subscribe to everything" this file refuses to express), a non-string value
+contains nothing, and a leaf carries exactly **one** of the four operators.
+There is no regex: payload text is hostile, and a pathological pattern in
+somebody else's comment body would stall the daemon.
+
 ```json
 { "topic": "github:defangdevs/*",
   "when": { "any": [
