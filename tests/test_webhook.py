@@ -1068,9 +1068,11 @@ class TestDispatcher(StateDirCase):
     three-way exit contract (accepted / declined for now / broken)."""
 
     def recorder(self, marker, sleep=0):
-        # Each run appends one line: <marker> <count> then the batch lines.
+        # Body first, header last: a waiter that polls for the header count
+        # (runs()) never observes a RUN line before the batch text behind it
+        # has been flushed.
         path = os.path.join(self.state, marker + '.log')
-        cmd = ('{ echo "RUN count=$LOCAL_WEBHOOK_SPAWN_COUNT key=$LOCAL_WEBHOOK_SPAWN_KEY"; cat; } >> %s'
+        cmd = ('{ cat; echo "RUN count=$LOCAL_WEBHOOK_SPAWN_COUNT key=$LOCAL_WEBHOOK_SPAWN_KEY"; } >> %s'
                % path)
         if sleep:
             cmd += '; sleep %s' % sleep
