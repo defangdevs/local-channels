@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.15.0'
+VERSION = '0.16.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1099,13 +1099,41 @@ if not RECEIVER_ONLY and not CLI:
 #     the arrival-time answer is stale exactly when it matters;
 #   - at most SPAWN_MAX spawn commands run concurrently across all keys;
 #     waiting batches get re-checked whenever a spawn finishes.
-# A spawn that fails (non-zero exit, unlaunchable, > SPAWN_TIMEOUT_S) is
-# logged to stderr and its batch is DROPPED — retrying a broken spawner would
-# loop; the same events already reached session peers via the normal fan-out.
+# A spawn that fails (an unexpected non-zero exit, unlaunchable, >
+# SPAWN_TIMEOUT_S) is logged to stderr and its batch is DROPPED — retrying a
+# broken spawner would loop; the same events already reached session peers via
+# the normal fan-out. The one exit code that does NOT mean failure is
+# SPAWN_DEFER_EXIT, below.
 SPAWN_CMD = (os.environ.get('LOCAL_WEBHOOK_SPAWN_CMD') or '').strip()
 SPAWN_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_MAX', default=2))
 SPAWN_WINDOW_S = max(0, _int_env('LOCAL_WEBHOOK_SPAWN_WINDOW', default=60))
 SPAWN_TIMEOUT_S = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_TIMEOUT', default=600))
+
+# The spawn command's exit code is a three-way answer, not a boolean (issue
+# #28). 0 accepted the batch; 75 — EX_TEMPFAIL from sysexits.h — says the
+# command UNDERSTOOD the request and declines it for now; anything else says
+# the spawner is broken. Only the last drops the batch. The distinction is not
+# cosmetic: a consumer at a session ceiling (agent-box#170) used to print a
+# message and exit 1, indistinguishable from "command not found", and the
+# batch died there. Nothing else holds those events — the whole point of a
+# standing watch is events NO session owns, so unlike a failed session
+# delivery there is no peer with a copy.
+#
+# A deferred batch goes back at the HEAD of its key's pending list and keeps
+# last_start, so the rate window paces the retries and _run's finally re-pumps
+# it when a slot frees: no new timer, no busy loop. It is re-checked against
+# live ownership like any other follow-up batch before it starts again.
+#
+# Two bounds keep a permanent refusal from growing without limit. Age: a key
+# that has been declined for SPAWN_DEFER_MAX_S stops keeping the batch (five
+# minutes is roughly five refusals at the default 60s window — long enough to
+# ride out a cap that frees a slot, short enough that the events are still
+# worth acting on). Size: at most SPAWN_PENDING_MAX lines wait per key, oldest
+# dropped first, so a wedged consumer degrades instead of ballooning. Both
+# drops are said out loud, like every other suppressed spawn.
+SPAWN_DEFER_EXIT = 75
+SPAWN_DEFER_MAX_S = max(0, _int_env('LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S', default=300))
+SPAWN_PENDING_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_PENDING_MAX', default=200))
 
 
 class Dispatcher:
@@ -1113,11 +1141,13 @@ class Dispatcher:
     # batches. Acceptable — the same deliveries reached session peers, and a
     # standing watch cares about the next event, not a replay of the last one.
     def __init__(self, cmd, max_concurrent, window_s, timeout_s, clock=time.monotonic,
-                 owner_of=None):
+                 owner_of=None, defer_max_s=SPAWN_DEFER_MAX_S, pending_max=SPAWN_PENDING_MAX):
         self.cmd = cmd
         self.max = max_concurrent
         self.window = window_s
         self.timeout = timeout_s
+        self.defer_max = defer_max_s  # 0 = deferral disabled: a decline drops at once
+        self.pending_max = pending_max
         self.clock = clock  # injectable for tests; monotonic so a clock step can't wedge a key
         # Who owns a queued line NOW, asked again when its batch starts.
         # Injectable for tests; None means the real probe (ci_owner_now).
@@ -1125,7 +1155,8 @@ class Dispatcher:
         self.lock = threading.Lock()
         self.active = 0
         # key -> {pending: [(text, meta, env)], running: bool,
-        #         last_start: float|None, timer: Timer|None}
+        #         last_start: float|None, timer: Timer|None,
+        #         defer_since: float|None, defer_n: int}
         self.keys = {}
 
     # env is the routing envelope the line came from, kept per line so a
@@ -1134,8 +1165,10 @@ class Dispatcher:
     def add(self, key, text, meta, env=None):
         with self.lock:
             st = self.keys.setdefault(key, {'pending': [], 'running': False,
-                                            'last_start': None, 'timer': None})
+                                            'last_start': None, 'timer': None,
+                                            'defer_since': None, 'defer_n': 0})
             st['pending'].append((text, meta, env))
+            self._trim(key, st)
             self._pump(key)
 
     # Call with self.lock held. Starts a spawn for the key when allowed;
@@ -1163,6 +1196,11 @@ class Dispatcher:
             # gated a second time, or an unowned key could never start.
             batch = self._still_unowned(key, batch)
             if not batch:
+                # Nothing survived, so whatever deferral streak this batch was
+                # keeping alive is over with it: the next event on this key
+                # starts a fresh one.
+                st['defer_since'] = None
+                st['defer_n'] = 0
                 return
         st['running'] = True
         st['last_start'] = self.clock()
@@ -1170,8 +1208,11 @@ class Dispatcher:
         # The newest SURVIVING event's context labels the batch — labelling it
         # with a line that was just dropped would name a run nobody is here for.
         meta = dict(batch[-1][1] or {})
-        threading.Thread(target=self._run, args=(key, [t for t, _, _ in batch], meta),
-                         daemon=True).start()
+        # The whole (text, meta, env) items travel into _run, not just their
+        # text: a declined batch has to go back on the queue exactly as it came
+        # off, or the re-check before its next start would have no envelope to
+        # ask about.
+        threading.Thread(target=self._run, args=(key, batch, meta), daemon=True).start()
 
     # Call with self.lock held. Drops the lines a live session peer has come
     # to own since they were queued. Fails in the safe direction: a probe that
@@ -1198,6 +1239,45 @@ class Dispatcher:
             kept.append(item)
         return kept
 
+    # Call with self.lock held. Puts a declined batch back at the head of its
+    # key's pending list, so the next attempt keeps arrival order and picks up
+    # whatever arrived meanwhile. last_start is deliberately NOT rewound: the
+    # rate window then paces the retries by itself.
+    #
+    # The age bound is per KEY, timed from the first refusal of the current
+    # streak, because a coalesced batch has no stable identity — it grows and
+    # shrinks between attempts. The streak answers the question that actually
+    # matters: how long has this key been unable to spawn.
+    def _requeue(self, key, st, items):
+        now = self.clock()
+        waited = 0.0 if st['defer_since'] is None else now - st['defer_since']
+        if waited >= self.defer_max:
+            print('local-webhook: dropping %d event(s) for %s — the spawn command declined '
+                  'them %d time(s) over %ds, past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=%s'
+                  % (len(items), key or '(none)', st['defer_n'] + 1, round(waited),
+                     self.defer_max), file=sys.stderr)
+            st['defer_since'] = None
+            st['defer_n'] = 0
+            return
+        if st['defer_since'] is None:
+            st['defer_since'] = now
+        st['defer_n'] += 1
+        st['pending'][:0] = items
+        self._trim(key, st)
+
+    # Call with self.lock held. A consumer that keeps declining — or one key
+    # stuck behind a long-running spawn — must not turn a chatty repo into
+    # unbounded memory. Past the cap the OLDEST lines go: a fresh session
+    # needs the newest state of the repo more than it needs the backlog.
+    def _trim(self, key, st):
+        over = len(st['pending']) - self.pending_max
+        if over <= 0:
+            return
+        del st['pending'][:over]
+        print('local-webhook: pending batch for %s hit the %d-line cap — dropped %d '
+              'oldest event(s); the spawn command is not keeping up'
+              % (key or '(none)', self.pending_max, over), file=sys.stderr)
+
     def _on_timer(self, key):
         with self.lock:
             st = self.keys.get(key)
@@ -1205,7 +1285,9 @@ class Dispatcher:
                 st['timer'] = None
                 self._pump(key)
 
-    def _run(self, key, batch, meta):
+    def _run(self, key, items, meta):
+        batch = [t for t, _, _ in items]
+        defer = False
         try:
             env = dict(os.environ)
             env.update({
@@ -1220,7 +1302,16 @@ class Dispatcher:
                                input=('\n'.join(batch) + '\n').encode('utf-8'),
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                timeout=self.timeout)
-            if p.returncode != 0:
+            if p.returncode == SPAWN_DEFER_EXIT:
+                # Declined, not failed: log it as the deferral it is, with
+                # whatever reason the command printed — an operator staring at
+                # a quiet watch needs to see "at the cap", not an exit code.
+                defer = True
+                print('local-webhook: spawn command declined %d event(s) for %s for now '
+                      '(exit %d) — keeping the batch: %s'
+                      % (len(batch), key, SPAWN_DEFER_EXIT,
+                         p.stdout.decode('utf-8', 'replace').strip()[:500]), file=sys.stderr)
+            elif p.returncode != 0:
                 print('local-webhook: spawn command exited %d for %s: %s'
                       % (p.returncode, key, p.stdout.decode('utf-8', 'replace').strip()[:500]),
                       file=sys.stderr)
@@ -1234,6 +1325,13 @@ class Dispatcher:
                 st = self.keys.get(key)
                 if st is not None:
                     st['running'] = False
+                    if defer:
+                        self._requeue(key, st, items)
+                    else:
+                        # Accepted, or dropped as broken — either way this key
+                        # is no longer waiting on anything.
+                        st['defer_since'] = None
+                        st['defer_n'] = 0
                 for k in list(self.keys):  # a freed slot may unblock any key
                     self._pump(k)
 
