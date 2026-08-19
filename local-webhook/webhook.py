@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.14.0'
+VERSION = '0.15.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -310,16 +310,19 @@ FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
     "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; entries {topic, note, "
-    "ignoreSenders, when, drop, ttlHours, "
+    "ignoreSenders, include, exclude, ttlHours, "
     "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; "
     "CI-outcome events like workflow_run are never sender-ignored on this path) and expire ttlHours after "
     "subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe "
     "and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; "
-    "entries without timestamps don't expire until a write stamps them). Optional when/drop are payload "
+    "entries without timestamps don't expire until a write stamps them). Optional include/exclude are payload "
     "predicates ({any/all: [...]} over {path, in/notIn} whole-value leaves and {path, "
-    "contains/notContains} case-insensitive substring leaves): drop refuses matching events, when accepts "
-    "ONLY matching ones, and an entry carrying either opts out of the built-in CI carve-outs — the "
-    "predicate is authoritative. Delete file to fail open (forward all)."
+    "contains/notContains} case-insensitive substring leaves, and path may address \"event\"): exclude refuses "
+    "matching events, include accepts ONLY matching ones, and an entry carrying either opts out of the "
+    "built-in CI carve-outs — the predicate is authoritative. (Old names when/drop are read as aliases; a "
+    "new write always uses include/exclude.) A brand-new session subscription with no exclude given is seeded "
+    "with a default noise-exclude (stars/watches/forks/... — see DEFAULT_SESSION_EXCLUDE); a re-subscribe never "
+    "reapplies it. Delete file to fail open (forward all)."
 )
 
 # Dispatch subscriptions (issue #1): entries in this file ask for delivery into
@@ -344,8 +347,10 @@ DISPATCH_COMMENT = (
     "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
     "at all while a live session peer is subscribed to the same topic, since it is already getting that "
     "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed. An entry "
-    "with when/drop payload predicates replaces the failures-only brake with its own rules (the live-peer "
-    "brake still applies); see the session filter comment for the predicate shape."
+    "with include/exclude payload predicates (old names when/drop still accepted) replaces the "
+    "failures-only brake with its own rules (the live-peer brake still applies); see the session filter "
+    "comment for the predicate shape. Dispatch entries are unaffected by the default noise-exclude — they "
+    "already narrow via their own curated rules."
 )
 
 # CI-outcome events: their payload sender is merely who triggered the run,
@@ -460,10 +465,13 @@ def normalize_entry(t):
             'topic': t['topic'],
             'ignoreSenders': ig,
             # Kept as written, even if malformed: match_predicate answers False
-            # (loudly) for a bad node, and normalizing a typo'd `when` AWAY
+            # (loudly) for a bad node, and normalizing a typo'd `include` AWAY
             # would fail open — the wrong direction for a dispatch entry.
-            'when': t.get('when', None),
-            'drop': t.get('drop', None),
+            # `when`/`drop` (pre-#294) are read as aliases for a file nobody
+            # has rewritten yet; a new write always uses include/exclude
+            # (write_filter no longer emits the old names).
+            'include': t.get('include', t.get('when', None)),
+            'exclude': t.get('exclude', t.get('drop', None)),
             'note': t['note'][:300] if isinstance(t.get('note'), str) else '',
             'ttlHours': ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else None,
             'renewOnEvent': t.get('renewOnEvent') is True,
@@ -524,10 +532,10 @@ def write_filter(f, path=FILTER_FILE):
             o['renewOnEvent'] = True
         if e['ignoreSenders']:
             o['ignoreSenders'] = e['ignoreSenders']
-        if e['when'] is not None:
-            o['when'] = e['when']
-        if e['drop'] is not None:
-            o['drop'] = e['drop']
+        if e['include'] is not None:
+            o['include'] = e['include']
+        if e['exclude'] is not None:
+            o['exclude'] = e['exclude']
         if e['lastActivityAt']:
             o['lastActivityAt'] = e['lastActivityAt']
         topics.append(o)
@@ -591,15 +599,18 @@ def match_topic(source, key, pat):
 
 
 # ------------------------------------------------- payload predicates (#14) ---
-# Per-entry `when`/`drop` let a subscription decide on payload CONTENT, not just
-# topic and sender — the event-agnostic filter that keeps consumer policy
-# ("spawn on issues.opened, drop closed-PR echoes") out of this file's code.
-# Same seam keyPath/senderPath established: config supplies a dot-path, the
-# daemon supplies the evaluator. The language is deliberately tiny — {any:[…]},
-# {all:[…]}, and leaves {path, in:[…]} / {path, notIn:[…]} — because anything
-# richer belongs in the consumer, not the wire format.
+# Per-entry `include`/`exclude` (named `when`/`drop` before #294 — old names are
+# still read as aliases, see normalize_entry) let a subscription decide on
+# payload CONTENT, not just topic and sender — the event-agnostic filter that
+# keeps consumer policy ("spawn on issues.opened, exclude closed-PR echoes")
+# out of this file's code. Same seam keyPath/senderPath established: config
+# supplies a dot-path, the daemon supplies the evaluator. The language is
+# deliberately tiny — {any:[…]}, {all:[…]}, and leaves {path, in:[…]} /
+# {path, notIn:[…]} — because anything richer belongs in the consumer, not the
+# wire format. `path` may also address "event" (the X-GitHub-Event name) —
+# entry_forwards merges it into the payload it evaluates against.
 #
-# 0.14.0 adds exactly one more comparison, {path, contains:[…]} / notContains
+# 0.14.0 added exactly one more comparison, {path, contains:[…]} / notContains
 # (local-channels#33), and the reason it is not consumer policy is the whole
 # argument for it: a GitHub @mention lives inside free text with no structured
 # field beside it, so no list of whole values can ever enumerate it — and the
@@ -651,11 +662,11 @@ def scalar_eq(a, b):
 def match_predicate(pred, payload):
     """True iff the predicate matches the payload.
 
-    A malformed node matches NOTHING, loudly: for `when` that mutes, for `drop`
-    that forwards, and either way a stderr line keeps the misconfiguration
-    distinguishable from a watch that quietly stopped working (agent-box#170).
-    The tools reject malformed predicates at subscribe time (predicate_error),
-    so this only triggers on a hand-edited filter file.
+    A malformed node matches NOTHING, loudly: for `include` that mutes, for
+    `exclude` that forwards, and either way a stderr line keeps the
+    misconfiguration distinguishable from a watch that quietly stopped working
+    (agent-box#170). The tools reject malformed predicates at subscribe time
+    (predicate_error), so this only triggers on a hand-edited filter file.
     """
     if isinstance(pred, dict):
         if 'any' in pred and isinstance(pred['any'], list):
@@ -726,20 +737,28 @@ def predicate_error(pred, where='predicate'):
 # decides who may override an ignore list, and an unignored sender never needed
 # one. dispatch_event owns that verdict.
 #
-# An entry carrying when/drop predicates is DECLARATIVE: its rules were written
-# by whoever configured it, so the built-in CI carve-out steps aside — a
-# predicate entry that wants "CI failures override my mute" says so positionally
-# ({path: workflow_run.conclusion, in: [failure, …]} under `when`) instead of
-# inheriting the welded-on exemption whose entanglement with ignoreSenders is
-# what this field exists to end. ignoreSenders still applies to such an entry,
-# but as a PURE sender mute (it now silences even that sender's CI failures —
-# prefer expressing sender rules inside the predicate).
+# An entry carrying include/exclude predicates is DECLARATIVE: its rules were
+# written by whoever configured it, so the built-in CI carve-out steps aside —
+# a predicate entry that wants "CI failures override my mute" says so
+# positionally ({path: workflow_run.conclusion, in: [failure, …]} under
+# `include`) instead of inheriting the welded-on exemption whose entanglement
+# with ignoreSenders is what this field exists to end. ignoreSenders still
+# applies to such an entry, but as a PURE sender mute (it now silences even
+# that sender's CI failures — prefer expressing sender rules inside the
+# predicate).
 def entry_forwards(e, sender, event, payload=None, ci_exempt=True):
-    declarative = e['when'] is not None or e['drop'] is not None
+    declarative = e['include'] is not None or e['exclude'] is not None
     if declarative:
-        if e['drop'] is not None and match_predicate(e['drop'], payload):
+        # Most GitHub payloads carry no field of their own named "event" (the
+        # X-GitHub-Event header is passed to us separately), so a predicate
+        # can only address it if we put it there — setdefault so a payload
+        # that DOES have its own "event" field (e.g. workflow_run.event, a
+        # different thing at a different path) is never clobbered.
+        ctx = dict(payload) if isinstance(payload, dict) else {}
+        ctx.setdefault('event', event)
+        if e['exclude'] is not None and match_predicate(e['exclude'], ctx):
             return False
-        if e['when'] is not None and not match_predicate(e['when'], payload):
+        if e['include'] is not None and not match_predicate(e['include'], ctx):
             return False
     if not e['ignoreSenders'] or not sender:
         return True
@@ -1269,16 +1288,16 @@ def dispatch_event(env):
             # loud, like every other suppressed spawn: a deliberate drop must
             # stay distinguishable from a watch that broke (agent-box#170).
             print('local-webhook: not spawning for %s on %s — the subscribed watch '
-                  'declined it (when/drop rules or ignoreSenders)'
+                  'declined it (include/exclude rules or ignoreSenders)'
                   % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
         return
-    # A declarative entry (when/drop) already ruled on this event inside
+    # A declarative entry (include/exclude) already ruled on this event inside
     # entry_forwards — its rules REPLACE the hardcoded failures-only brake, or
     # the consumer could never spawn on anything the brake drops. The live-peer
     # probe below is NOT policy, it is session coordination, so it applies to
     # every entry alike.
     declarative = r['entry'] is not None and (
-        r['entry']['when'] is not None or r['entry']['drop'] is not None)
+        r['entry']['include'] is not None or r['entry']['exclude'] is not None)
     if event in CI_EVENTS:
         # A green (or queued, or in-progress) run is not news for a watch on
         # events NOBODY owns, whoever triggered it. 0.10.0 only reached this
@@ -1454,12 +1473,36 @@ INSTRUCTIONS = (
     'works while your own comments stay muted. Standing watches are stricter, so they cannot pile up '
     'sessions behind you: they spawn on a CI event only if it reports a failure, and never while a live '
     'session is subscribed to that topic (a new issue or someone else\'s PR still spawns either way). '
-    'Subscriptions can also filter on payload CONTENT with when/drop predicates (see webhook_subscribe) — '
-    'e.g. deliver only issues/PRs being opened, or drop close/merge echoes without muting their sender; an '
-    'entry carrying them sets its own policy and the built-in CI carve-outs step aside for it. '
+    'Subscriptions can also filter on payload CONTENT with include/exclude predicates (see '
+    'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, or '
+    'exclude close/merge echoes without muting their sender; an entry carrying them sets its own policy '
+    'and the built-in CI carve-outs step aside for it. A brand-new session subscription gets a default '
+    'noise-exclude (stars, watches, forks, ...) unless you pass your own exclude; a re-subscribe never '
+    'reapplies it, so clearing it with exclude:{} sticks. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
+
+# Draft default noise-exclude (#294) seeded on a brand-new SESSION subscription
+# that passes no exclude of its own — repo lifecycle/social-graph pings a
+# session almost never wants to react to, vs. label/milestone/commit_comment,
+# left alone because those carry actual human intent. The schedule clause only
+# catches workflow_run: check_suite's payload has no confirmed analogous field
+# for what triggered it, so a schedule-triggered check_suite is NOT excluded
+# here — get_path on a missing path returns None, which never matches, so the
+# gap fails toward "still delivered" rather than toward silently dropping a
+# real CI result on a made-up field name. Dispatch entries are not affected —
+# see webhook_subscribe / call_tool.
+DEFAULT_SESSION_EXCLUDE = {
+    'any': [
+        {'path': 'event', 'in': [
+            'star', 'watch', 'fork', 'gollum', 'member', 'membership', 'team',
+            'team_add', 'public', 'sponsorship', 'delete', 'page_build',
+            'project', 'project_card', 'project_column',
+        ]},
+        {'path': 'workflow_run.event', 'in': ['schedule']},
+    ],
+}
 
 TOOLS = [
     {
@@ -1533,30 +1576,35 @@ TOOLS = [
                         '(workflow_run, check_run, ...) are exempt and always delivered to a session; on a '
                         'deliver_to:"subagent" watch only a FAILING one is. Omit or pass [] to clear.',
                 },
-                'when': {
+                'include': {
                     'type': 'object',
                     'description':
                         'Optional payload predicate: deliver ONLY events matching it. Shape: {"any": [...]} / '
                         '{"all": [...]} over leaves {"path": "dot.path", "in": [values]} or {"path": ..., '
-                        '"notIn": [values]}; null in a list matches an ABSENT path. A leaf may instead carry '
+                        '"notIn": [values]}; null in a list matches an ABSENT path; "path" may address "event" '
+                        '(the GitHub event name). A leaf may instead carry '
                         '"contains"/"notContains": [substrings], which test a STRING value case-insensitively — '
                         'use them for free text no whole-value list can enumerate, e.g. '
                         '{"path": "comment.body", "contains": ["@mybot"]}. A leaf carries exactly one of the '
-                        'four. Example — opened issues/PRs '
-                        'plus failing CI: {"any": [{"path": "action", "in": ["opened", "reopened"]}, '
+                        'four. Example — opened issues/PRs plus failing CI: '
+                        '{"any": [{"path": "action", "in": ["opened", "reopened"]}, '
                         '{"path": "workflow_run.conclusion", "in": ["failure", "timed_out"]}]}. An entry with '
-                        'when/drop is declarative: the built-in CI carve-outs step aside and these rules are the '
-                        'whole policy (express sender muting inside the predicate, e.g. {"path": "sender.login", '
-                        '"notIn": [...]}, rather than combining with ignore_senders). Omit to keep on renew; '
-                        'pass {} to clear.',
+                        'include/exclude is declarative: the built-in CI carve-outs step aside and these rules '
+                        'are the whole policy (express sender muting inside the predicate, e.g. {"path": '
+                        '"sender.login", "notIn": [...]}, rather than combining with ignore_senders). Omit to '
+                        'keep on renew; pass {} to clear. Accepts the old name "when" as an alias.',
                 },
-                'drop': {
+                'exclude': {
                     'type': 'object',
                     'description':
-                        'Optional payload predicate: NEVER deliver events matching it (evaluated before "when", '
-                        'wins over it). Same shape as "when". E.g. {"path": "action", "in": ["closed", "merged"]} '
-                        'silences close/merge echoes without muting the sender. Omit to keep on renew; pass {} '
-                        'to clear.',
+                        'Optional payload predicate: NEVER deliver events matching it (evaluated before '
+                        '"include", wins over it). Same shape as "include". E.g. {"path": "action", "in": '
+                        '["closed", "merged"]} silences close/merge echoes without muting the sender. Omit to '
+                        'keep on renew; pass {} to clear. A brand-new deliver_to:"session" subscription that '
+                        'omits this gets a default noise-exclude (stars, watches, forks, team/member pings, '
+                        '...) seeded automatically; pass {} explicitly to opt out of that default, or your own '
+                        'predicate to replace it — a renew never reapplies the default. Accepts the old name '
+                        '"drop" as an alias.',
                 },
             },
             'required': ['topic'],
@@ -1639,10 +1687,10 @@ def call_tool(params):
                 o['renewOnEvent'] = True
             if e['ignoreSenders']:
                 o['ignoreSenders'] = e['ignoreSenders']
-            if e['when'] is not None:
-                o['when'] = e['when']
-            if e['drop'] is not None:
-                o['drop'] = e['drop']
+            if e['include'] is not None:
+                o['include'] = e['include']
+            if e['exclude'] is not None:
+                o['exclude'] = e['exclude']
             if e['subscribedAt']:
                 o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
             if e['lastActivityAt']:
@@ -1699,7 +1747,7 @@ def call_tool(params):
             return a.lower() == b.lower()
 
         def show(e):
-            rules = [k for k, v in (('when', e['when']), ('drop', e['drop'])) if v is not None]
+            rules = [k for k, v in (('include', e['include']), ('exclude', e['exclude'])) if v is not None]
             return e['topic'] + (' "%s"' % e['note'] if e['note'] else '') + \
                 (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
                 (' [%s rules]' % '+'.join(rules) if rules else '')
@@ -1737,9 +1785,16 @@ def call_tool(params):
             # Predicates are validated NOW, not at delivery time: a typo that
             # only surfaced as a match-nothing predicate would read as a watch
             # that quietly went dark (agent-box#170). null and {} mean "clear".
-            raw_when = arguments.get('when', _MISSING)
-            raw_drop = arguments.get('drop', _MISSING)
-            for label, raw in (('when', raw_when), ('drop', raw_drop)):
+            # `include`/`exclude` are the current names (#294); `when`/`drop`
+            # are accepted as aliases so an older caller keeps working, but
+            # only when the new name was not ALSO passed.
+            raw_include = arguments.get('include', _MISSING)
+            if raw_include is _MISSING:
+                raw_include = arguments.get('when', _MISSING)
+            raw_exclude = arguments.get('exclude', _MISSING)
+            if raw_exclude is _MISSING:
+                raw_exclude = arguments.get('drop', _MISSING)
+            for label, raw in (('include', raw_include), ('exclude', raw_exclude)):
                 if raw is not _MISSING and raw is not None and raw != {}:
                     err = predicate_error(raw, label)
                     if err:
@@ -1763,20 +1818,29 @@ def call_tool(params):
                     e['ttlHours'] = raw_ttl
                 if raw_renew is not _MISSING:
                     e['renewOnEvent'] = raw_renew
-                if raw_when is not _MISSING:
-                    e['when'] = raw_when or None
-                if raw_drop is not _MISSING:
-                    e['drop'] = raw_drop or None
+                if raw_include is not _MISSING:
+                    e['include'] = raw_include or None
+                if raw_exclude is not _MISSING:
+                    e['exclude'] = raw_exclude or None
                 topics = list(f['topics'])
                 topics[idx] = e
                 write_filter({**f, 'enabled': True, 'topics': topics}, path)
                 return text('renewed subscription %s%s%s (current%s: %s)%s' % (
                     show(e), ttl_msg(e), scope, ' dispatch' if dispatch else '', listing(topics), expired_note))
+            # First subscribe only (never a renew, and never for a dispatch
+            # entry, which already narrows via its own curated rules): a
+            # brand-new session subscription that names no exclude of its own
+            # is seeded with the default noise-exclude rather than None, so an
+            # agent that never thinks about repo/social-graph pings doesn't
+            # drink them by default. Passing exclude:{} explicitly opts out
+            # (raw_exclude becomes {} below, distinct from _MISSING).
+            default_exclude = (None if dispatch or raw_exclude is not _MISSING
+                                else DEFAULT_SESSION_EXCLUDE)
             entry = {
                 'topic': topic,
                 'ignoreSenders': [str(x).strip() for x in (raw_ig if raw_ig is not _MISSING else []) if str(x).strip()],
-                'when': (raw_when or None) if raw_when is not _MISSING else None,
-                'drop': (raw_drop or None) if raw_drop is not _MISSING else None,
+                'include': (raw_include or None) if raw_include is not _MISSING else None,
+                'exclude': (raw_exclude or None) if raw_exclude is not _MISSING else default_exclude,
                 'note': '' if raw_note is _MISSING else str(raw_note).strip()[:300],
                 # A dispatch entry defaults to pinned (ttlHours 0): it is a
                 # standing watch, and a spawned session has no warm cache whose
@@ -2058,7 +2122,7 @@ emit a box-local event onto the same bus.
 
 usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
                                   [--renew-on-event] [--ignore-sender LOGIN]...
-                                  [--when JSON] [--drop JSON]
+                                  [--include JSON] [--exclude JSON]
        webhook.py unsubscribe TOPIC [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME]
        webhook.py ls
@@ -2090,21 +2154,27 @@ source or for everything: name a key or a prefix.
                        own actions (repeatable; "@self" = $LOCAL_WEBHOOK_SELF).
                        CI-outcome events reach a session anyway; a standing
                        watch takes only the failing ones.
-  --when JSON          deliver ONLY events whose payload matches this predicate:
+  --include JSON       deliver ONLY events whose payload matches this predicate:
                        {"any"/"all": [...]} over {"path": "a.b.c", "in"/"notIn":
-                       [values]} leaves; null in a list matches an absent path.
+                       [values]} leaves; null in a list matches an absent path;
+                       "path" may address "event" (the GitHub event name).
                        A leaf may instead carry "contains"/"notContains":
                        [substrings] to test a STRING value case-insensitively,
                        for free text no list of whole values can enumerate
                        ({"path": "comment.body", "contains": ["@mybot"]}).
                        Exactly one of the four per leaf.
-                       An entry with --when/--drop is declarative — the built-in
-                       CI carve-outs step aside and these rules are the whole
-                       policy (put sender rules IN the predicate, e.g.
-                       {"path": "sender.login", "notIn": [...]})
-  --drop JSON          never deliver events matching this predicate (evaluated
-                       first, wins over --when). Same shape. Pass '{}' to clear
-                       either on re-subscribe
+                       An entry with --include/--exclude is declarative — the
+                       built-in CI carve-outs step aside and these rules are
+                       the whole policy (put sender rules IN the predicate,
+                       e.g. {"path": "sender.login", "notIn": [...]})
+  --exclude JSON       never deliver events matching this predicate (evaluated
+                       first, wins over --include). Same shape. Pass '{}' to
+                       clear either on re-subscribe. A brand-new "session"
+                       subscription that omits this gets a default
+                       noise-exclude (stars, watches, forks, ...); pass '{}'
+                       to opt out
+  --when JSON          old name for --include, still accepted
+  --drop JSON          old name for --exclude, still accepted
 
 emit puts a BOX-LOCAL event (a budget warning, a full disk, an OOM kill) on the
 same bus as any webhook: the JSON payload — an argument, or stdin when omitted
@@ -2317,9 +2387,12 @@ def run_cli(argv):
             for part in value().split(','):
                 if part.strip():
                     ignore_senders.append(part.strip())
-        elif a in ('--when', '--drop'):
+        elif a in ('--include', '--exclude', '--when', '--drop'):
             # Parse errors die here; SHAPE errors are call_tool's to report
-            # (predicate_error), same as every other argument problem.
+            # (predicate_error), same as every other argument problem. --when
+            # and --drop are the pre-#294 names, passed through unchanged so
+            # call_tool's own alias resolution handles them identically to a
+            # hand-rolled MCP call using the old argument names.
             try:
                 args[a[2:]] = json.loads(value())
             except ValueError:
