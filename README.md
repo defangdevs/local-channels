@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.14.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `when`/`drop` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
+| [`local-webhook`](local-webhook/) | 0.15.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
 
 ## Requirements
 
@@ -204,12 +204,16 @@ to that topic — a session driving a PR is already watching its CI, and a secon
 agent on the same branch is not help. Non-CI events (a new issue, someone else's
 PR) spawn regardless of who is subscribed.
 
-Since 0.11.0 a subscription can also carry `when`/`drop` **payload predicates**
-(`{"any"/"all": […]}` over `{"path": "a.b.c", "in"/"notIn": [values]}` leaves) —
-an event-agnostic filter on payload *content*, e.g. "issues being opened, not
-closed" or "only failing `workflow_run` conclusions". An entry carrying them
-sets its own policy: the built-in CI carve-outs above step aside for it (the
-live-session suppression still applies). See the
+Since 0.11.0 a subscription can also carry `include`/`exclude` **payload
+predicates** (`when`/`drop` are still accepted as the older names)
+(`{"any"/"all": […]}` over `{"path": "a.b.c", "in"/"notIn": [values]}` leaves,
+`path` may address `event`) — an event-agnostic filter on payload *content*,
+e.g. "issues being opened, not closed" or "only failing `workflow_run`
+conclusions". An entry carrying them sets its own policy: the built-in CI
+carve-outs above step aside for it (the live-session suppression still
+applies). A brand-new `deliver_to:"session"` subscription that passes no
+`exclude` is seeded with a default noise-exclude (stars, watches, forks,
+team/member pings, ...); pass `exclude: {}` to opt out. See the
 [local-webhook README](local-webhook/README.md) for the shape.
 
 ### Per-session filters

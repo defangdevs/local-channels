@@ -356,6 +356,24 @@ class TestRouteEvent(StateDirCase):
         self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues',
                                               {'action': 'closed'})['forward'])
 
+    def test_predicate_can_address_the_event_type(self):
+        # Prerequisite for #294's default noise-exclude: most GitHub payloads
+        # carry no field of their own named "event" (it's the X-GitHub-Event
+        # header, passed separately), so entry_forwards must merge it in for
+        # a predicate to see it at all.
+        self.write([self.entry('github:o/*', exclude={'path': 'event', 'in': ['star', 'watch']})])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'star', {})['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues', {'action': 'opened'})['forward'])
+
+    def test_event_setdefault_never_clobbers_a_real_payload_field(self):
+        # workflow_run.event is a REAL, different field (what triggered the
+        # run, e.g. "schedule") that already lived inside the payload before
+        # #294; merging in the X-GitHub-Event name must not touch it.
+        self.write([self.entry('github:o/*',
+                               exclude={'path': 'workflow_run.event', 'in': ['schedule']})])
+        payload = {'workflow_run': {'event': 'schedule'}}
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'workflow_run', payload)['forward'])
+
     def test_declarative_entry_loses_the_ci_sender_exemption(self):
         # The carve-out ("CI overrides a mute") is welded to ignoreSenders for
         # legacy entries; a predicate entry writes its own policy, so the mute
@@ -640,36 +658,77 @@ class TestCallTool(StateDirCase):
         self.assertEqual(saved['topics'][0]['note'], 'first')
         self.assertEqual(saved['topics'][0]['ttlHours'], 0)
 
-    # -- when/drop payload predicates (0.11.0) -------------------------------
+    # -- include/exclude payload predicates (0.11.0; renamed in 0.15.0) -----
     def test_predicates_persist_and_roundtrip(self):
+        include = {'path': 'action', 'in': ['opened']}
+        exclude = {'path': 'action', 'in': ['closed']}
+        out = self.call('webhook_subscribe', topic='o/r', include=include, exclude=exclude)
+        self.assertIn('[include+exclude rules]', out)
+        saved = self.read_json('filter.testsess.json')
+        self.assertEqual(saved['topics'][0]['include'], include)
+        self.assertEqual(saved['topics'][0]['exclude'], exclude)
+        # ...surviving an unrelated write (write_filter round-trip).
+        self.call('webhook_subscribe', topic='p/q', exclude={})
+        saved = self.read_json('filter.testsess.json')
+        self.assertEqual(saved['topics'][0]['include'], include)
+        # ...and listed by webhook_subscriptions.
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertEqual(body['topics'][0]['include'], include)
+
+    def test_when_drop_still_work_as_argument_aliases(self):
+        # Pre-#294 argument names read exactly like include/exclude, so a
+        # caller that never updated keeps working. A fresh write normalizes
+        # to the new names regardless of which ones came in.
         when = {'path': 'action', 'in': ['opened']}
         drop = {'path': 'action', 'in': ['closed']}
         out = self.call('webhook_subscribe', topic='o/r', when=when, drop=drop)
-        self.assertIn('[when+drop rules]', out)
-        saved = self.read_json('filter.testsess.json')
-        self.assertEqual(saved['topics'][0]['when'], when)
-        self.assertEqual(saved['topics'][0]['drop'], drop)
-        # ...surviving an unrelated write (write_filter round-trip).
-        self.call('webhook_subscribe', topic='p/q')
-        saved = self.read_json('filter.testsess.json')
-        self.assertEqual(saved['topics'][0]['when'], when)
-        # ...and listed by webhook_subscriptions.
-        body = json.loads(self.call('webhook_subscriptions'))
-        self.assertEqual(body['topics'][0]['when'], when)
+        self.assertIn('[include+exclude rules]', out)
+        saved = self.read_json('filter.testsess.json')['topics'][0]
+        self.assertEqual(saved['include'], when)
+        self.assertEqual(saved['exclude'], drop)
+        self.assertNotIn('when', saved)
+        self.assertNotIn('drop', saved)
 
     def test_malformed_predicate_rejected_at_subscribe_time(self):
         for bad in ({'path': 'a'}, {'any': 'x'}, 'nope', {'path': 'a', 'in': 'x'}):
-            out = self.call('webhook_subscribe', topic='o/r', when=bad)
+            out = self.call('webhook_subscribe', topic='o/r', include=bad)
             self.assertTrue(out.startswith('error:'), 'accepted %r: %s' % (bad, out))
         self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.testsess.json')))
 
     def test_renew_keeps_or_clears_predicates(self):
-        when = {'path': 'action', 'in': ['opened']}
-        self.call('webhook_subscribe', topic='o/r', when=when)
+        include = {'path': 'action', 'in': ['opened']}
+        # exclude={} on the first call opts out of the default noise-exclude
+        # (see test_new_session_subscribe_gets_default_noise_exclude), so this
+        # test is only exercising include.
+        self.call('webhook_subscribe', topic='o/r', include=include, exclude={})
         self.call('webhook_subscribe', topic='o/r')  # omitted → kept
-        self.assertEqual(self.read_json('filter.testsess.json')['topics'][0]['when'], when)
-        self.call('webhook_subscribe', topic='o/r', when={})  # {} → cleared
-        self.assertNotIn('when', self.read_json('filter.testsess.json')['topics'][0])
+        self.assertEqual(self.read_json('filter.testsess.json')['topics'][0]['include'], include)
+        self.call('webhook_subscribe', topic='o/r', include={})  # {} → cleared
+        self.assertNotIn('include', self.read_json('filter.testsess.json')['topics'][0])
+
+    def test_new_session_subscribe_gets_default_noise_exclude(self):
+        # A brand-new deliver_to:"session" entry that names no exclude is
+        # seeded with the built-in noise list rather than None.
+        self.call('webhook_subscribe', topic='o/r')
+        saved = self.read_json('filter.testsess.json')['topics'][0]
+        self.assertEqual(saved['exclude'], self.mod.DEFAULT_SESSION_EXCLUDE)
+        # A dispatch (subagent) entry is unaffected -- it curates its own rules.
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent')
+        self.assertNotIn('exclude', self.read_json('filter.dispatch.json')['topics'][0])
+
+    def test_default_noise_exclude_actually_suppresses_a_star_event(self):
+        self.call('webhook_subscribe', topic='o/r')
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'star')['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues', {'action': 'opened'})['forward'])
+
+    def test_renew_never_reapplies_the_default_exclude(self):
+        # Broadening with exclude:{} must stick across a renew that omits it,
+        # or "clear the noise filter" would be undone by the next re-subscribe.
+        self.call('webhook_subscribe', topic='o/r')
+        self.call('webhook_subscribe', topic='o/r', exclude={})
+        self.assertNotIn('exclude', self.read_json('filter.testsess.json')['topics'][0])
+        self.call('webhook_subscribe', topic='o/r', note='renew, no exclude passed')
+        self.assertNotIn('exclude', self.read_json('filter.testsess.json')['topics'][0])
 
 
 class TestDispatchEvent(StateDirCase):
@@ -1454,18 +1513,19 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(self.cli('status').returncode, 0)
 
     def test_declarative_watch_end_to_end(self):
-        """Real signed deliveries against a when/drop watch: an opened issue
-        spawns, a close echo does not, and a session peer's own drop predicate
-        mutes without touching its other topics."""
+        """Real signed deliveries against an include/exclude watch (CLI: the
+        old --when/--drop flag names, still accepted as aliases): an opened
+        issue spawns, a close echo does not, and a session peer's own exclude
+        predicate mutes without touching its other topics."""
         r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'rules watch',
                      '--when', json.dumps({'any': [
                          {'path': 'action', 'in': ['opened', 'reopened']},
                          {'path': 'workflow_run.conclusion', 'in': ['failure']}]}),
                      '--drop', json.dumps({'path': 'action', 'in': ['closed']}))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(b'[when+drop rules]', r.stdout)
+        self.assertIn(b'[include+exclude rules]', r.stdout)
         # A session peer that dropped close echoes on its repo.
-        r = self.cli('subscribe', 'peer/only', '--drop',
+        r = self.cli('subscribe', 'peer/only', '--exclude',
                      json.dumps({'path': 'action', 'in': ['closed']}), session='predsess')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.start_daemon()

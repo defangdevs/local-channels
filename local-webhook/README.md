@@ -118,7 +118,7 @@ a *failing* outcome, sender irrelevant (0.10.1) — see
       "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
 ```
 
-### `when` / `drop` payload predicates (0.11.0)
+### `include` / `exclude` payload predicates (0.11.0)
 
 Topic and sender are sometimes the wrong granularity: "their new issues, not
 their close buttons" is not expressible with `ignoreSenders`, which can only
@@ -127,14 +127,25 @@ mute the whole person. An entry may therefore carry two predicates over the
 event-agnostic mechanism, so a stripe source gates on `data.object.status`
 exactly like github gates on `action`:
 
-- `drop` — events matching it are refused by this entry. Evaluated first, wins.
-- `when` — if present, the entry accepts **only** matching events.
+- `exclude` — events matching it are refused by this entry. Evaluated first, wins.
+- `include` — if present, the entry accepts **only** matching events.
+
+`when` and `drop` are still accepted everywhere `include`/`exclude` are — in a
+filter file, as `webhook_subscribe` arguments, and as CLI flags — because
+downstream writers still emit them: agent-box's
+`services.agent-box.webhook.watchPolicy` writes `when` today. A fresh write
+always uses the new names, so a file converts itself the next time anything
+touches it.
 
 The predicate language is deliberately tiny: `{"any": [...]}` / `{"all": [...]}`
 over leaves `{"path": "a.b.c", "in": [values]}` or
 `{"path": "a.b.c", "notIn": [values]}`. Values are JSON scalars; `null` in an
 `in` list matches an *absent* path. JSON booleans only match booleans (`true`
-never matches `1`).
+never matches `1`). Since 0.15.0, `path` may also address `event` — the
+`X-GitHub-Event` name (`issues`, `workflow_run`, `star`, ...) — which
+`entry_forwards` merges into the payload it evaluates against via
+`setdefault` (a real payload field of the same name, if one ever exists,
+always wins).
 
 A leaf may instead carry `contains` / `notContains`, which test a **string**
 value for any of the listed substrings, case-insensitively (0.14.0):
@@ -155,28 +166,43 @@ somebody else's comment body would stall the daemon.
 
 ```json
 { "topic": "github:defangdevs/*",
-  "when": { "any": [
+  "include": { "any": [
       { "all": [ { "path": "action", "in": ["opened", "reopened"] },
                  { "path": "sender.login", "notIn": ["defangdevs"] } ] },
       { "path": "workflow_run.conclusion", "in": ["failure", "timed_out", "startup_failure"] } ] },
-  "drop": { "path": "action", "in": ["closed", "merged"] } }
+  "exclude": { "path": "action", "in": ["closed", "merged"] } }
 ```
 
-An entry carrying `when`/`drop` is **declarative**: its rules were written by
-whoever configured it, so the built-in CI carve-outs step aside for that entry —
-the sender-ignore exemption here, and on the dispatch path the failures-only
-brake (the live-session suppression is coordination, not policy, and still
-applies). Express sender muting *inside* the predicate (as above) rather than
-combining with `ignoreSenders`, which on a declarative entry is a pure mute
-that would silence even that sender's CI failures.
+An entry carrying `include`/`exclude` is **declarative**: its rules were
+written by whoever configured it, so the built-in CI carve-outs step aside for
+that entry — the sender-ignore exemption here, and on the dispatch path the
+failures-only brake (the live-session suppression is coordination, not policy,
+and still applies). Express sender muting *inside* the predicate (as above)
+rather than combining with `ignoreSenders`, which on a declarative entry is a
+pure mute that would silence even that sender's CI failures.
 
-`webhook_subscribe` takes the predicates as `when` / `drop` (CLI: `--when` /
-`--drop` with a JSON argument) and rejects a malformed one at subscribe time.
-A malformed node that reaches delivery anyway (hand-edited file) matches
-**nothing** and logs to stderr — for `when` that mutes the entry, for `drop` it
-forwards, and either way the misconfiguration is distinguishable from a watch
-that quietly stopped working. Omit both on re-subscribe to keep them; pass
-`{}` to clear.
+`webhook_subscribe` takes the predicates as `include` / `exclude` (CLI:
+`--include` / `--exclude` with a JSON argument; `when`/`drop` still work as
+aliases) and rejects a malformed one at subscribe time. A malformed node that
+reaches delivery anyway (hand-edited file) matches **nothing** and logs to
+stderr — for `include` that mutes the entry, for `exclude` it forwards, and
+either way the misconfiguration is distinguishable from a watch that quietly
+stopped working. Omit both on re-subscribe to keep them; pass `{}` to clear.
+
+#### Default noise-exclude for a brand-new session subscription (0.15.0)
+
+A brand-new `deliver_to:"session"` subscription (never a renew, and never a
+`deliver_to:"subagent"` entry, which already narrows via its own curated
+rules) that names no `exclude` of its own is seeded with a built-in
+noise-exclude instead of `None` — most agents never think to filter out a
+repo's social-graph/lifecycle pings (`star`, `watch`, `fork`, `gollum`,
+`member`, `membership`, `team`, `team_add`, `public`, `sponsorship`,
+`delete`, `page_build`, `project`, `project_card`, `project_column`), plus a
+`workflow_run` fired by a cron `schedule` rather than a human action.
+Deliberately left alone: `label`, `milestone`, `commit_comment` — those carry
+actual human intent, not pure plumbing. Pass `exclude: {}` explicitly to opt
+out, or your own predicate to replace it; a re-subscribe never reapplies the
+default, so once you've broadened with `exclude: {}` it stays broadened.
 
 ### Subscription expiry and notes (0.5.x)
 
@@ -296,7 +322,7 @@ Differences from session routing, all deliberate:
   "nothing to do". Session delivery keeps the unconditional exemption — "merge on
   green" wants exactly that green run. An outcome the payload does not state
   counts as a failure: a swallowed break is the one error worth avoiding twice
-  over. A watch carrying [`when`/`drop` predicates](#when--drop-payload-predicates-0110)
+  over. A watch carrying [`include`/`exclude` predicates](#include--exclude-payload-predicates-0110-renamed-from-whendrop-in-0140)
   replaces this brake with its own rules (0.11.0): the consumer owns the whole
   spawn decision, including whether a green run is news to it. Either way an
   event a watch declines is logged to stderr — a deliberate drop must stay
@@ -339,8 +365,8 @@ the two paths can't drift on TTL/renew semantics:
         --event budget_warning       # put a box-local event on the bus
 
 `--note`, `--ttl`, `--deliver-to`, `--renew-on-event`, `--ignore-sender`
-(repeatable, or one comma-separated list), `--when` and `--drop` (JSON
-predicate objects) mirror the tool arguments;
+(repeatable, or one comma-separated list), `--include` and `--exclude` (JSON
+predicate objects; `--when`/`--drop` still work as aliases) mirror the tool arguments;
 `webhook.py --help` prints the details. Subscriptions are per session, so export the same
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.
@@ -373,7 +399,7 @@ argument, or stdin when omitted or `-`) is signed with the source's secret from
 `sources.json` and POSTed to the local ingress, entering through the front door
 so verification, normalization, fan-out **and** standing-watch dispatch all
 apply. Everything downstream works unchanged: `budget:5h` or `disk:/var` are
-ordinary topics, `when`/`drop` predicates gate on `used_pct` like any other
+ordinary topics, `include`/`exclude` predicates gate on `used_pct` like any other
 payload field, and a `deliver_to:"subagent"` watch can spawn a fresh session
 for a signal nobody is live to see.
 
