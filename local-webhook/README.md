@@ -296,8 +296,24 @@ Differences from session routing, all deliberate:
   events arriving while that spawn runs, or within `LOCAL_WEBHOOK_SPAWN_WINDOW`
   (60 s) of its start, batch into one follow-up spawn — a 10-PR dependabot
   burst costs two sessions, not ten. At most `LOCAL_WEBHOOK_SPAWN_MAX` (2)
-  spawn commands run concurrently across all keys. A failing spawn command is
-  logged and its batch dropped; the same events already reached session peers.
+  spawn commands run concurrently across all keys.
+- **The spawn command can say "not now" (0.16.0).** Its exit code is a
+  three-way answer: `0` accepted the batch; **`75`** (`EX_TEMPFAIL`) means the
+  command understood the request and declines it *for now*; any other non-zero
+  means a broken spawner, whose batch is logged and dropped (the same events
+  already reached session peers). A declined batch is **kept** — put back at
+  the head of its key's pending queue, re-checked against live ownership like
+  any other waiting batch, and re-offered when the rate window opens or a
+  concurrency slot frees. This is how a consumer at a session ceiling stops
+  losing events: exit `1` there was indistinguishable from "command not
+  found", and for a standing watch — events *nobody* owns — no session peer
+  holds a copy to fall back on. Two bounds keep a permanent refusal finite: a
+  key declined for more than `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S` (300 s) drops
+  its batch with a log line naming how long it waited, and at most
+  `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` (200) lines wait per key, oldest dropped
+  first. The HTTP response is unaffected: `deliver()` still answers `200 ok`,
+  because the dispatch verdict is asynchronous and the HMAC and the peer
+  fan-out really did succeed.
 - **A waiting batch is re-checked before it spawns (0.11.1).** CI lines in a
   follow-up batch are put to the live-peer question again the moment the batch
   starts, and dropped if a session now owns them. One failing run emits both
@@ -435,6 +451,8 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SPAWN_MAX` | `2` | max concurrent spawn commands across all keys |
 | `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
 | `LOCAL_WEBHOOK_SPAWN_TIMEOUT` | `600` | seconds before a running spawn command is killed (and its batch dropped) |
+| `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S` | `300` | how long a batch the spawn command keeps declining (exit `75`) is kept before it is dropped; `0` disables deferral |
+| `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` | `200` | max event lines waiting per key; past it the oldest are dropped |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source if `sources.json` is absent |
 
 When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress

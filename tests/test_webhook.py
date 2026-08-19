@@ -11,6 +11,7 @@
 #     the same flow AGENTS.md prescribes for manual verification.
 import http.client
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1063,7 +1064,8 @@ class TestDispatchFollowupOwnership(DispatchCase):
 
 
 class TestDispatcher(StateDirCase):
-    """Fork-bomb control: immediate first spawn, coalescing, cap, failure."""
+    """Fork-bomb control: immediate first spawn, coalescing, cap, and the
+    three-way exit contract (accepted / declined for now / broken)."""
 
     def recorder(self, marker, sleep=0):
         # Each run appends one line: <marker> <count> then the batch lines.
@@ -1079,6 +1081,10 @@ class TestDispatcher(StateDirCase):
             return []
         with open(path, encoding='utf-8') as f:
             return [ln for ln in f.read().splitlines() if ln.startswith('RUN ')]
+
+    def pending(self, d, key):
+        st = d.keys.get(key) or {}
+        return [t for t, _, _ in st.get('pending', [])]
 
     def wait_for(self, cond, timeout=15):
         deadline = time.time() + timeout
@@ -1178,10 +1184,13 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 2, timeout=10))
 
     def test_failing_spawn_drops_batch_but_recovers(self):
+        # Exit code branch 3 of 3: anything but 0 or 75 means a broken
+        # spawner, and retrying one would loop.
         path, ok_cmd = self.recorder('rec')
         d = self.mod.Dispatcher('exit 3', 2, 0, 30)
         d.add('k', 'lost', {'key': 'k'})
         self.assertTrue(self.wait_for(lambda: d.active == 0))
+        self.assertEqual(self.pending(d, 'k'), [])      # dropped, not deferred
         d.cmd = ok_cmd  # spawner fixed; the next event must still dispatch
         d.add('k', 'found', {'key': 'k'})
 
@@ -1191,6 +1200,100 @@ class TestDispatcher(StateDirCase):
             with open(path, encoding='utf-8') as f:
                 return 'found' in f.read()
         self.assertTrue(self.wait_for(batch_arrived))
+
+    # ---- the exit-code contract: 0 accepted, 75 declined for now, else
+    # broken — plus the bounds that keep a permanent refusal finite (#28).
+
+    def test_exit_zero_accepts_and_leaves_nothing_waiting(self):
+        # Exit code branch 1 of 3, stated explicitly: an accepted batch leaves
+        # no pending lines and no deferral streak behind.
+        path, cmd = self.recorder('accepted')
+        d = self.mod.Dispatcher(cmd, 2, 0, 30)
+        d.add('k', 'e1', {'key': 'k'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        self.assertTrue(self.wait_for(lambda: d.active == 0))
+        self.assertEqual(self.pending(d, 'k'), [])
+        self.assertIsNone(d.keys['k']['defer_since'])
+
+    def test_exit_75_keeps_the_batch_and_re_offers_it(self):
+        # Exit code branch 2 of 3. Before 0.16.0 this batch was gone: the
+        # consumer at its session ceiling exited non-zero, and nothing else
+        # holds a standing watch's events.
+        path, ok_cmd = self.recorder('defer')
+        d = self.mod.Dispatcher('exit 75', 2, 1, 30)
+        d.add('k', 'declined', {'key': 'k'})
+        self.assertTrue(self.wait_for(lambda: self.pending(d, 'k') == ['declined']))
+        d.add('k', 'arrived-while-waiting', {'key': 'k'})
+        d.cmd = ok_cmd  # the consumer has room again
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) >= 1, timeout=10))
+
+        def both_lines():
+            with open(path, encoding='utf-8') as f:
+                text = f.read()
+            return 'declined' in text and 'arrived-while-waiting' in text
+        self.assertTrue(self.wait_for(both_lines, timeout=10))
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        # Requeued at the HEAD: the declined line still precedes the one that
+        # arrived while it waited.
+        self.assertLess(text.index('declined'), text.index('arrived-while-waiting'))
+        self.assertTrue(self.wait_for(lambda: d.active == 0))
+        self.assertIsNone(d.keys['k']['defer_since'])   # streak closed on acceptance
+
+    def test_a_deferred_batch_is_re_checked_for_ownership(self):
+        # The whole point of waiting is that the answer changes while you
+        # wait — the same re-check a coalesced follow-up batch gets (#17),
+        # reached by the same path.
+        path, ok_cmd = self.recorder('defer-owned')
+        owned = {'now': False}
+        d = self.mod.Dispatcher('exit 75', 2, 0.2, 30,
+                                owner_of=lambda env: 'peer1' if owned['now'] else None)
+        d.add('k', 'e1', {'key': 'k'}, {'event': 'workflow_run'})
+        self.assertTrue(self.wait_for(lambda: self.pending(d, 'k') == ['e1']))
+        owned['now'] = True   # a session claimed the topic while the batch waited
+        d.cmd = ok_cmd        # and the consumer has room again
+        self.assertTrue(self.wait_for(lambda: not self.pending(d, 'k') and d.active == 0))
+        time.sleep(0.5)
+        self.assertEqual(self.runs(path), [])           # no second session
+        self.assertIsNone(d.keys['k']['defer_since'])   # streak closed with the batch
+
+    def test_a_permanently_declined_batch_is_dropped_at_the_age_bound(self):
+        err = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = err
+        self.addCleanup(setattr, sys, 'stderr', real_stderr)
+        path, ok_cmd = self.recorder('bound')
+        # Sub-second bounds so the test does not sleep for minutes; the real
+        # defaults are 60s window / 300s age.
+        d = self.mod.Dispatcher('exit 75', 2, 0.05, 30, defer_max_s=0.3)
+        d.add('k', 'stale', {'key': 'k'})
+        self.assertTrue(self.wait_for(
+            lambda: 'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S' in err.getvalue()))
+        self.assertTrue(self.wait_for(lambda: d.active == 0))
+        self.assertEqual(self.pending(d, 'k'), [])
+        self.assertIsNone(d.keys['k']['defer_since'])
+        self.assertEqual(d.keys['k']['defer_n'], 0)
+        log = err.getvalue()
+        self.assertIn('declined', log)                  # each refusal said out loud
+        self.assertRegex(log, r'declined them \d+ time\(s\) over \d+s')
+        # The key is not poisoned: the next event still spawns.
+        d.cmd = ok_cmd
+        d.add('k', 'fresh', {'key': 'k'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+
+    def test_pending_lines_are_capped_oldest_first(self):
+        err = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = err
+        self.addCleanup(setattr, sys, 'stderr', real_stderr)
+        # Window 60s: nothing retries during the test, so the queue only grows.
+        d = self.mod.Dispatcher('exit 75', 2, 60, 30, pending_max=3)
+        d.add('k', 'e1', {'key': 'k'})
+        self.assertTrue(self.wait_for(lambda: self.pending(d, 'k') == ['e1']))
+        for t in ('e2', 'e3', 'e4', 'e5'):
+            d.add('k', t, {'key': 'k'})
+        self.assertEqual(self.pending(d, 'k'), ['e3', 'e4', 'e5'])
+        self.assertIn('hit the 3-line cap', err.getvalue())
 
 
 class TestResolveIngress(StateDirCase):
@@ -1279,11 +1382,11 @@ class TestEndToEnd(unittest.TestCase):
         env.update(extra)
         return env
 
-    def start_daemon(self, **extra):
+    def start_daemon(self, spawn_cmd=None, **extra):
         env = self.base_env(
             LOCAL_WEBHOOK_RECEIVER_ONLY='1',
             LOCAL_WEBHOOK_HTTP_SOCK=self.http_sock,
-            LOCAL_WEBHOOK_SPAWN_CMD='cat >> %s' % self.spawn_log,
+            LOCAL_WEBHOOK_SPAWN_CMD=spawn_cmd or ('cat >> %s' % self.spawn_log),
             **extra
         )
         p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env,
@@ -1500,6 +1603,35 @@ class TestEndToEnd(unittest.TestCase):
         self.assertFalse(os.path.exists(self.spawn_log))
         with open(os.path.join(self.state, 'receiver.json'), encoding='utf-8') as f:
             self.assertFalse(json.load(f)['spawn'])
+
+    def test_a_declined_spawn_is_retried_not_lost(self):
+        """A real signed delivery whose spawn command declines it (exit 75) on
+        the first attempt must still reach the second one — the whole of issue
+        #28, end to end."""
+        script = os.path.join(self.state, 'spawn.sh')
+        declined = os.path.join(self.state, 'declined.once')
+        with open(script, 'w', encoding='utf-8') as f:
+            # First invocation: the consumer is at its ceiling — it reads the
+            # batch, says why, and exits EX_TEMPFAIL. Afterwards it accepts.
+            f.write('if [ ! -f %s ]; then cat > /dev/null; : > %s; '
+                    'echo "at the hook-session cap"; exit 75; fi\n'
+                    'cat >> %s\n' % (declined, declined, self.spawn_log))
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Window 0: the retry rides the re-pump _run already does when a slot
+        # frees, so the test needs no new timer either.
+        self.start_daemon(spawn_cmd='sh %s' % script, LOCAL_WEBHOOK_SPAWN_WINDOW='0')
+
+        # The dispatch verdict is asynchronous, so the delivery is still 200:
+        # the HMAC verified and the peer fan-out happened either way.
+        self.assertEqual(self.post(self.ISSUE), (200, 'ok'))
+        self.assertTrue(self.wait_file(declined), 'the spawn command never ran')
+        self.assertTrue(self.wait_file(self.spawn_log, contains='issue #5 opened on o/r'),
+                        'the declined batch never reached the second attempt')
+        with open(self.spawn_log, encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('[UNTRUSTED webhook:github', text)
+        self.assertIn('standing watch', text)   # note echo survives the deferral
 
     def test_cli_exit_codes(self):
         self.assertEqual(self.cli('bogus-command').returncode, 2)
