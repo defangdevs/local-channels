@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.17.0'
+VERSION = '0.18.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -349,7 +349,10 @@ DISPATCH_COMMENT = (
     "a CI-outcome event spawns ONLY when it reports a FAILURE — a green, queued or in-progress run is "
     "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
     "at all while a live session peer is subscribed to the same topic, since it is already getting that "
-    "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed. An entry "
+    "delivery. For any OTHER event the same probe runs, but only entries carrying their own "
+    "include/exclude predicates count as claims: a session that declared what it is working on is "
+    "precise enough to trust, while a rule-less repo-wide entry would silence the watch for the whole "
+    "repo (#16). So a new issue still spawns while a session holds one PR. An entry "
     "with include/exclude payload predicates (old names when/drop still accepted) replaces the "
     "failures-only brake with its own rules (the live-peer brake still applies); see the session filter "
     "comment for the predicate shape. Dispatch entries are unaffected by the default noise-exclude — they "
@@ -867,12 +870,32 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, ci_e
 #   - it answers about the filter as its owner would see it, so ci_exempt keeps
 #     the session default.
 # Expiry is read, never applied: an expired entry claims nothing.
-def filter_claims(path, source, key, sender, event, payload=None):
+def filter_claims(path, source, key, sender, event, payload=None, declared_only=False):
+    """Does the filter at `path` claim this event?
+
+    declared_only restricts the answer to entries carrying an `include`
+    predicate. That is the difference between "a session is watching this repo"
+    and "a session said what it is working on", and the dispatch probe needs
+    the second one for non-CI events — see #16: a rule-less repo-wide entry is
+    not precise enough to mean a claim, so honouring it for every event would
+    let one hook session silence the standing watch for the whole repo until it
+    exits.
+
+    INCLUDE only, deliberately. `exclude` cannot claim anything: a new session
+    subscription is seeded with the default noise-exclude, so counting excludes
+    would make almost every session entry a claim and reintroduce exactly the
+    repo-wide silence this guards against (caught by
+    test_emit_reaches_sessions_and_standing_watches, whose peer subscribes with
+    nothing but a note). A claim is a positive statement about what an event
+    must look like to be mine.
+    """
     f = read_filter(path)
     if not f['enabled'] or not f['topicsConfigured']:
         return False
     now = now_ms()
     for e in f['topics']:
+        if declared_only and e['include'] is None:
+            continue
         if entry_expired(e, f['ttlHours'], now):
             continue
         if not key:
@@ -1234,7 +1257,7 @@ class Dispatcher:
     # raises leaves the batch alone, because a missed drop costs one session
     # and a wrong drop loses the event entirely.
     def _still_unowned(self, key, batch):
-        probe = self.owner_of or ci_owner_now
+        probe = self.owner_of or owner_now
         kept = []
         for item in batch:
             text, meta, env = item
@@ -1370,10 +1393,11 @@ DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) i
 # ownership is object-granular, so a session working one PR would otherwise
 # silence the watch for every unrelated issue in that repo for the life of its
 # subscription.
-def owned_by_live_session(env):
+def owned_by_live_session(env, declared_only=False):
     for key in peer_scopes_live():
         if filter_claims(filter_path_of(key), env.get('source', ''), env.get('key', ''),
-                         env.get('sender', ''), env.get('event', ''), env.get('payload')):
+                         env.get('sender', ''), env.get('event', ''), env.get('payload'),
+                         declared_only=declared_only):
             return key or '(unscoped)'
     return None
 
@@ -1384,10 +1408,31 @@ def owned_by_live_session(env):
 # session 1's peer socket appears seconds after its spawn command runs, so the
 # events that arrived in that gap were judged unowned and then waited a full
 # window for a verdict nobody revisited.
-def ci_owner_now(env):
-    if not env or env.get('event', '') not in CI_EVENTS:
+def owner_now(env):
+    """The live session already handling this event, if any.
+
+    Two regimes, and the difference is precision — #16's open question about
+    what should scope this probe once the CI vocabulary goes:
+
+      - a CI event is claimed by ANY live peer subscribed to the topic. Coarse,
+        but a build result is repo-shaped anyway, and this is the 0.10.0
+        behaviour nothing should change under it.
+      - every OTHER event is claimed only by a peer whose entry carries an
+        `include` predicate. A session that declared what it is working on has
+        said something precise enough to act on; a bare repo-wide entry has
+        not, and treating it as a claim would silence the watch for every
+        unrelated issue and PR in that repo. Excludes never claim — the default
+        noise-exclude would otherwise turn every session into an owner.
+    """
+    if not env:
         return None
-    return owned_by_live_session(env)
+    if env.get('event', '') in CI_EVENTS:
+        return owned_by_live_session(env)
+    return owned_by_live_session(env, declared_only=True)
+
+
+# The old name, kept for callers that only ever meant the CI question.
+ci_owner_now = owner_now
 
 
 def dispatch_event(env):
@@ -1437,6 +1482,20 @@ def dispatch_event(env):
             # bug (agent-box#170).
             print('local-webhook: not spawning for %s on %s — session %s is subscribed to it'
                   % (event or '(none)', env.get('key', '') or '(none)', owner), file=sys.stderr)
+            return
+    else:
+        # Not a CI event, so the brake above never looked. A live peer that
+        # DECLARED what it is working on is already receiving this delivery and
+        # holds the context for it: spawning a second session onto the same
+        # object is what happened twice in one hour on agent-box#319, where a
+        # human's review of a box-authored PR started a fresh session while the
+        # session that opened the PR was live — and the duplicate pushed to its
+        # branch. Entries with no `include` are deliberately NOT claims (#16).
+        owner = owned_by_live_session(env, declared_only=True)
+        if owner:
+            print('local-webhook: not spawning for %s on %s — session %s declared it'
+                  % (event or '(none)', env.get('key', '') or '(none)', owner),
+                  file=sys.stderr)
             return
     entry = r['entry']
     text, payload_meta = format_delivery(env, entry)

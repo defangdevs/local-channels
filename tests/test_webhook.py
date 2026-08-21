@@ -962,6 +962,73 @@ class TestDispatchBrakes(DispatchCase):
                                                     'issue': {'number': 9, 'title': 't'}}))
         self.spawned(True, 'issue #9 opened')
 
+    def review_env(self, number=317, sender='human'):
+        return self.env('pull_request_review',
+                        {'action': 'submitted',
+                         'review': {'state': 'approved'},
+                         'pull_request': {'number': number, 'title': 't',
+                                          'user': {'login': 'box'}}},
+                        sender=sender)
+
+    PR_RULE = {'include': {'path': 'pull_request.number', 'in': [317]}}
+
+    def test_a_declared_peer_claims_a_non_ci_event(self):
+        # agent-box#319: a review on a box-authored PR spawned a session while
+        # the session that OPENED that PR was live — twice in one hour, and the
+        # first duplicate pushed to the branch the live one owned. The CI brake
+        # never looked, because a review is not a CI event.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.PR_RULE)])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(False)
+
+    def test_a_declared_peer_claims_only_what_it_declared(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.PR_RULE)])
+        self.mod.dispatch_event(self.review_env(number=999))
+        self.spawned(True, 'review approved')
+
+    def test_an_exclude_only_peer_does_not_claim(self):
+        # The seeded default noise-exclude must never read as ownership, or
+        # every session becomes an owner of its whole repo the moment it
+        # subscribes — which is the same repo-wide silence #16 warns about.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [{'topic': 'github:o/*',
+                                       'exclude': {'path': 'action', 'in': ['closed']}}])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
+
+    def test_a_rule_less_peer_does_not_claim_a_non_ci_event(self):
+        # The regression #16 warns about: honouring a repo-wide, rule-less
+        # entry as a claim would let one hook session silence the watch for
+        # every issue and PR in that repo until it exits.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', ['github:o/*'])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
+
+    def test_a_declared_claim_does_not_silence_other_work_in_the_repo(self):
+        # Same property test_non_ci_event_spawns_even_when_a_session_owns_the_repo
+        # pins, now with a peer that DID declare: new work still spawns.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.PR_RULE)])
+        self.mod.dispatch_event(self.env('issues', {'action': 'opened',
+                                                    'issue': {'number': 9, 'title': 't'}}))
+        self.spawned(True, 'issue #9 opened')
+
+    def test_a_declared_claim_under_another_topic_is_not_ownership(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [dict(topic='github:other/*', **self.PR_RULE)])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
+
+    def test_an_expired_declared_claim_does_not_suppress(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', subscribedAt=old, **self.PR_RULE)])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
+
     def test_expired_session_subscription_does_not_suppress(self):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
         old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
