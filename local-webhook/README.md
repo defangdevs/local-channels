@@ -361,32 +361,31 @@ Differences from session routing, all deliberate:
   tree) is not help. Liveness comes from the peer's `instances/<key>.<pid>.sock`
   entry, pid-checked, so a crashed session cannot mute a watch; the probe is
   read-only, so it never renews the subscription it consults. Suppression is
-  logged. **Scoped to CI events on purpose:** topics are repo-granular while
-  ownership is object-granular, so a session working one PR must not silence the
-  watch for every unrelated new issue in that repo — `issues.opened` and other
-  people's PRs spawn regardless of who is subscribed to the topic.
+  logged. **Two regimes, split by precision (0.19.0).** A CI event is claimed by
+  any live peer subscribed to the topic — coarse, but a build result is
+  repo-shaped anyway. Every other event is claimed only by a peer whose entry
+  carries an `include` predicate: a session that declared what it is working on
+  has said something precise enough to act on, while a bare repo-wide entry has
+  not. An `exclude` never claims — a new session subscription is seeded with the
+  default noise-exclude, so counting those would make every session an owner. That is the difference between "a session
+  is watching this repo" and "a session is working this PR", and it is why
+  `issues.opened` still spawns while a session holds one PR (#16 — honouring a
+  rule-less entry for every event would silence the watch for the whole repo
+  until that session exits).
 
-- **Object claims (0.18.0).** The gap that left: a review on a PR *this account
-  authored*, or a comment mentioning it, is by construction about work a live
-  session may already hold — and those events are not CI-shaped, so the brake
-  above never saw them. Reviews on two box-authored PRs spawned duplicate
-  sessions within an hour, and the first duplicate pushed to the branch the live
-  session owned (agent-box#319). A subscription can now name the objects it is
-  working on:
+  So a session that wants to stop the watch from starting a second agent onto
+  its work says what its work is:
 
   ```
-  webhook_subscribe(topic="defangdevs/agent-box", objects=[317],
+  webhook_subscribe(topic="defangdevs/agent-box",
+                    include={"path": "pull_request.number", "in": [317]},
                     note="PR #317: waiting on CI + review")
   ```
 
-  Dispatch then suppresses a spawn for any event whose payload object matches a
-  live peer's claim — `pull_request_review`, `issue_comment`, `push`, anything —
-  and keeps spawning for everything else, so the repo-granular/object-granular
-  distinction above is preserved rather than traded away. A claim is about
-  ownership, not routing: it holds even for events that peer's own
-  `ignoreSenders`/`exclude` would drop, because a session muting its own echoes
-  still owns the PR those echoes are about. `objects: []` releases it, and an
-  expired subscription claims nothing.
+  This also narrows what that session receives, which is usually what it wanted
+  anyway. Before 0.18.0 the probe was gated on `event in CI_EVENTS`, so a review
+  or a comment on work a live session held spawned a duplicate session
+  regardless (agent-box#319).
 
 ### Per-identity filters
 
