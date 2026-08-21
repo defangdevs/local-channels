@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.16.1'
+VERSION = '0.17.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1082,7 +1082,14 @@ if not RECEIVER_ONLY and not CLI:
 # --prompt`). The text arrives on the command's STDIN — never on the command
 # line, where attacker-controlled payload strings could reach shell parsing —
 # and routing context rides in LOCAL_WEBHOOK_SPAWN_* env vars (values are
-# payload-derived, so a spawn command must still quote them).
+# payload-derived, so a spawn command must still quote them). The six fixed
+# vars (SOURCE/KEY/EVENT/TOPIC/NOTE/COUNT) name the batch's routing, never the
+# object it is about — a consumer wanting "which PR/issue/run" had to regex
+# the rendered prose, whose wording is not a contract (issue #29). SPAWN_META
+# closes that gap: the same per-event dict summarize_github/summarize_generic
+# already compute for the channel-notification path, JSON-encoded unranked —
+# it promises only that whatever meta the source produced is visible, never
+# that a given key (e.g. "number") exists for every event type.
 #
 # Dispatch fails CLOSED at every layer — no spawn command, no dispatch file, or
 # a corrupt one all mean "spawn nothing". Session routing fails closed too since
@@ -1305,6 +1312,10 @@ class Dispatcher:
                 'LOCAL_WEBHOOK_SPAWN_TOPIC': meta.get('topic', ''),
                 'LOCAL_WEBHOOK_SPAWN_NOTE': meta.get('note', ''),
                 'LOCAL_WEBHOOK_SPAWN_COUNT': str(len(batch)),
+                # Unranked, source-defined object identity — see issue #29.
+                # dict, never absent: an empty object beats no variable, since
+                # a consumer can `.get()` a JSON object but not a missing var.
+                'LOCAL_WEBHOOK_SPAWN_META': json.dumps(meta.get('payload') or {}, sort_keys=True),
             })
             p = subprocess.run(self.cmd, shell=True, env=env,
                                input=('\n'.join(batch) + '\n').encode('utf-8'),
@@ -1428,13 +1439,18 @@ def dispatch_event(env):
                   % (event or '(none)', env.get('key', '') or '(none)', owner), file=sys.stderr)
             return
     entry = r['entry']
-    text, _ = format_delivery(env, entry)
+    text, payload_meta = format_delivery(env, entry)
     DISPATCHER.add(env.get('key', '') or '(none)', text, {
         'source': env.get('source', ''),
         'key': env.get('key', ''),
         'event': env.get('event', ''),
         'topic': entry['topic'] if entry else '',
         'note': entry['note'] if entry else '',
+        # Object identity (number, action, conclusion, ...) — whatever the
+        # source's summarizer put in the same meta a channel notification
+        # gets. Kept nested so it can ride to LOCAL_WEBHOOK_SPAWN_META as one
+        # JSON blob without colliding with the six fixed keys above.
+        'payload': payload_meta,
     }, env)
 
 

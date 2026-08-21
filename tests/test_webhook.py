@@ -768,6 +768,50 @@ class TestDispatchEvent(StateDirCase):
         self.assertIn('issue #7 opened on o/r', text)
         self.assertIn('ctx', text)  # the note is echoed into the prompt
 
+    def test_match_exposes_object_identity_meta(self):
+        out = os.path.join(self.state, 'spawned_meta.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "META=$LOCAL_WEBHOOK_SPAWN_META"; } > %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx')
+        mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
+        text = ''
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    text = f.read()
+                if 'META=' in text:
+                    break
+            time.sleep(0.05)
+        line = next((ln for ln in text.splitlines() if ln.startswith('META=')), '')
+        self.assertTrue(line, 'expected a META= line, got: %r' % text)
+        meta = json.loads(line[len('META='):])
+        self.assertEqual(meta['number'], '7')
+        self.assertEqual(meta['action'], 'opened')
+        self.assertEqual(meta['event'], 'issues')
+        self.assertEqual(meta['repo'], 'o/r')
+
+    def test_no_payload_meta_is_empty_object_not_absent(self):
+        # Non-github sources (or a Dispatcher.add caller with no per-line meta)
+        # must still get a valid JSON object — a consumer does `.get()` on it.
+        out = os.path.join(self.state, 'spawned_empty.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "META=$LOCAL_WEBHOOK_SPAWN_META"; } > %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        mod.DISPATCHER.add('k', 'hello', {'key': 'k'})
+        deadline = time.time() + 10
+        text = ''
+        while time.time() < deadline:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    text = f.read()
+                if 'META=' in text:
+                    break
+            time.sleep(0.05)
+        line = next((ln for ln in text.splitlines() if ln.startswith('META=')), '')
+        self.assertEqual(line, 'META={}')
+
     def test_unmatched_event_spawns_nothing(self):
         out = os.path.join(self.state, 'spawned.txt')
         mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='cat > %s' % out,
