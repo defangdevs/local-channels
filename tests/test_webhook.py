@@ -572,6 +572,24 @@ class TestCallTool(StateDirCase):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', ttl_hours=8)
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'][0]['ttlHours'], 8)
 
+    def test_objects_claim_round_trips_and_releases(self):
+        r = self.call('webhook_subscribe', topic='o/r', objects=[317, '#318', 317])
+        self.assertIn('holding #317, #318', r)
+        def claim():
+            return self.read_json('filter.testsess.json')['topics'][0].get('objects', [])
+
+        self.assertEqual(claim(), ['317', '318'])
+        # A renew that says nothing about objects keeps the claim...
+        self.call('webhook_subscribe', topic='o/r', note='still on it')
+        self.assertEqual(claim(), ['317', '318'])
+        # ...and an empty list releases it.
+        r = self.call('webhook_subscribe', topic='o/r', objects=[])
+        self.assertNotIn('holding', r)
+        self.assertEqual(claim(), [])
+
+    def test_objects_must_be_a_list(self):
+        self.assertIn('must be an array', self.call('webhook_subscribe', topic='o/r', objects=317))
+
     def test_deliver_to_validation(self):
         out = self.call('webhook_subscribe', topic='o/r', deliver_to='nonsense')
         self.assertTrue(out.startswith('error: deliver_to'))
@@ -961,6 +979,62 @@ class TestDispatchBrakes(DispatchCase):
         self.mod.dispatch_event(self.env('issues', {'action': 'opened',
                                                     'issue': {'number': 9, 'title': 't'}}))
         self.spawned(True, 'issue #9 opened')
+
+    def review_env(self, number=317, sender='human', state='approved'):
+        return self.env('pull_request_review',
+                        {'action': 'submitted',
+                         'review': {'state': state},
+                         'pull_request': {'number': number, 'title': 't',
+                                          'user': {'login': 'box'}}},
+                        sender=sender)
+
+    def test_a_claimed_object_does_not_spawn(self):
+        # agent-box#319: a review on a box-authored PR spawned a session while
+        # the session that OPENED that PR was live — twice in one hour, and the
+        # first duplicate pushed to the branch the live one owned.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'objects': ['317']}])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(False)
+
+    def test_an_unclaimed_object_still_spawns(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'objects': ['999']}])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
+
+    def test_a_claim_does_not_silence_other_work_in_the_same_repo(self):
+        # The property that rules out a topic-wide brake: ownership is
+        # object-granular, topics are repo-granular.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'objects': ['317']}])
+        self.mod.dispatch_event(self.env('issues', {'action': 'opened',
+                                                    'issue': {'number': 9, 'title': 't'}}))
+        self.spawned(True, 'issue #9 opened')
+
+    def test_a_claim_holds_even_for_events_that_peer_filters_out(self):
+        # A claim answers "who owns this work", not "what does that session
+        # want delivered": a session muting its own echoes still owns the PR
+        # those echoes are about, so the spawn must stay suppressed.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'objects': ['317'],
+                                       'ignoreSenders': ['human']}])
+        self.mod.dispatch_event(self.review_env(sender='human'))
+        self.spawned(False)
+
+    def test_a_claim_by_a_session_watching_another_repo_is_not_ownership(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.fake_live_peer('peer1', [{'topic': 'github:other/*', 'objects': ['317']}])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
+
+    def test_an_expired_claim_does_not_suppress(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'objects': ['317'],
+                                       'subscribedAt': old}])
+        self.mod.dispatch_event(self.review_env())
+        self.spawned(True, 'review approved')
 
     def test_expired_session_subscription_does_not_suppress(self):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
