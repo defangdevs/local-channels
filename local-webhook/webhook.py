@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.16.0'
+VERSION = '0.16.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -322,7 +322,10 @@ FILTER_COMMENT = (
     "built-in CI carve-outs — the predicate is authoritative. (Old names when/drop are read as aliases; a "
     "new write always uses include/exclude.) A brand-new session subscription with no exclude given is seeded "
     "with a default noise-exclude (stars/watches/forks/... — see DEFAULT_SESSION_EXCLUDE); a re-subscribe never "
-    "reapplies it. Delete file to fail open (forward all)."
+    "reapplies it. Nothing fails open (0.13.0): a missing, unparseable or empty-topics file forwards "
+    "NOTHING, so deleting this file does not bring traffic back — it unsubscribes the session. To receive "
+    "events again, subscribe to a topic (webhook_subscribe, or `webhook.py subscribe <topic>`); "
+    "webhook_subscriptions reports which of the three states you are in as filterState absent/invalid/ok."
 )
 
 # Dispatch subscriptions (issue #1): entries in this file ask for delivery into
@@ -341,7 +344,7 @@ DISPATCH_COMMENT = (
     "do not go to a session peer — the ingress owner runs LOCAL_WEBHOOK_SPAWN_CMD to start a FRESH "
     "session per event batch (without a spawn command these entries are inert). Same schema and TTL "
     "semantics as a session filter file, but entries subscribed through the tools default to ttlHours:0 "
-    "(a pinned standing watch). Unlike session routing, dispatch fails CLOSED: a missing or corrupt "
+    "(a pinned standing watch). Like a session filter, dispatch fails CLOSED: a missing or corrupt "
     "file means spawn nothing. Two extra brakes apply here only, because a spawn costs a whole session: "
     "a CI-outcome event spawns ONLY when it reports a FAILURE — a green, queued or in-progress run is "
     "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
@@ -444,9 +447,11 @@ def topic_invalid_reason(pat):
 FILTER_LOCK = threading.RLock()
 
 
-# missing/parse-error → topicsConfigured=false so should-forward fails open
-# (delete file = forward all). An explicit but empty topics array is a valid
-# "mute all" config and is preserved separately. A legacy "repos" array from
+# missing/parse-error → topicsConfigured=false, and since 0.13.0 that forwards
+# NOTHING (deleting the file unsubscribes the session; it does not forward all).
+# An explicit but empty topics array is the same outcome reached deliberately,
+# and is preserved separately so read_filter can still report which of the three
+# states a session is in. A legacy "repos" array from
 # gh-webhook 0.2.x is read as github topics. Entries normalize to
 # { topic, note, ignoreSenders, subscribedAt, lastActivityAt } so string and
 # object forms mix freely.
@@ -466,7 +471,7 @@ def normalize_entry(t):
             'ignoreSenders': ig,
             # Kept as written, even if malformed: match_predicate answers False
             # (loudly) for a bad node, and normalizing a typo'd `include` AWAY
-            # would fail open — the wrong direction for a dispatch entry.
+            # would fail open — the wrong direction on either path.
             # `when`/`drop` (pre-#294) are read as aliases for a file nobody
             # has rewritten yet; a new write always uses include/exclude
             # (write_filter no longer emits the old names).
@@ -513,8 +518,9 @@ def read_filter(path=FILTER_FILE):
 
 
 # Atomic replace: the filter is re-read on every delivery, so a partial write
-# during a concurrent delivery would fail open (read_filter catches parse
-# errors). Writing to a tmp file + rename removes even that brief window.
+# during a concurrent delivery would read as a parse error, and since 0.13.0
+# that drops the delivery (read_filter reports state "invalid"). Writing to a
+# tmp file + rename removes even that brief window.
 # Every entry serializes as an object carrying at least subscribedAt (missing
 # timestamps are stamped "now" on write, so grandfathered pre-0.5.0 entries
 # enter the TTL clock the first time anything writes the file); empty optional
@@ -1078,10 +1084,12 @@ if not RECEIVER_ONLY and not CLI:
 # and routing context rides in LOCAL_WEBHOOK_SPAWN_* env vars (values are
 # payload-derived, so a spawn command must still quote them).
 #
-# Unlike session routing (fail open: worst case is noise), dispatch fails
-# CLOSED at every layer — no spawn command, no dispatch file, or a corrupt one
-# all mean "spawn nothing". Failing open here would mean a session per
-# delivery: a fork bomb, not noise.
+# Dispatch fails CLOSED at every layer — no spawn command, no dispatch file, or
+# a corrupt one all mean "spawn nothing". Session routing fails closed too since
+# 0.13.0, so that is no longer the difference between them; the difference is
+# what the opposite mistake costs. A stray session delivery spends one session's
+# context, while a stray spawn is a whole new session, so failing open here
+# would mean a session per delivery: a fork bomb, not noise.
 #
 # Fork-bomb control (issue #1, decision 1), per routing key so one chatty repo
 # cannot starve another:

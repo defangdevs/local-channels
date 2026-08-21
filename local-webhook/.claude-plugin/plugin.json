@@ -1,6 +1,6 @@
 {
   "name": "local-webhook",
   "description": "HMAC-verified webhook channel: pushes deliveries from GitHub or any other signing sender into the session, plus webhook_subscribe / webhook_unsubscribe MCP tools (and an equivalent webhook.py CLI) for topic routing — including deliver_to:\"subagent\" standing watches that spawn a fresh session per event batch instead of interrupting the active one, and per-subscription include/exclude payload predicates so routing can key on event content, not just topic and sender. `webhook.py emit` puts box-local events (budget, disk, OOM) on the same bus.",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "keywords": ["channel", "mcp", "webhook", "github", "sensors"]
 }
