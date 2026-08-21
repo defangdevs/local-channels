@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.17.0'
+VERSION = '0.18.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -349,7 +349,10 @@ DISPATCH_COMMENT = (
     "a CI-outcome event spawns ONLY when it reports a FAILURE — a green, queued or in-progress run is "
     "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
     "at all while a live session peer is subscribed to the same topic, since it is already getting that "
-    "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed. An entry "
+    "delivery. Non-CI events (new issues, others' PRs) spawn regardless of who is subscribed to the "
+    "TOPIC — but not regardless of who claims the OBJECT: an entry listing issue/PR numbers in "
+    "`objects` suppresses a spawn for events about exactly those, whatever the event type, because the "
+    "session holding them is already receiving the delivery. Objects nobody claimed keep spawning. An entry "
     "with include/exclude payload predicates (old names when/drop still accepted) replaces the "
     "failures-only brake with its own rules (the live-peer brake still applies); see the session filter "
     "comment for the predicate shape. Dispatch entries are unaffected by the default noise-exclude — they "
@@ -455,6 +458,55 @@ FILTER_LOCK = threading.RLock()
 # gh-webhook 0.2.x is read as github topics. Entries normalize to
 # { topic, note, ignoreSenders, subscribedAt, lastActivityAt } so string and
 # object forms mix freely.
+# An entry may name the OBJECTS it is working on — issue/PR numbers under its
+# topic. Topics are repo-granular and ownership is not: a session on one PR
+# must not silence new work in the same repo, which is why the live-peer brake
+# was scoped to CI outcomes and nothing else. A claim closes that gap without
+# widening the brake: dispatch suppresses a spawn only for the objects a live
+# session says it is holding, and everything else still spawns.
+MAX_OBJECTS = 64
+OBJECT_MAX_LEN = 32
+
+
+def normalize_objects(v):
+    """A claim list as strings. Numbers arrive as ints from a tool call and as
+    strings from a hand-edited file; payloads carry them as ints. One
+    representation, so the comparison cannot miss on type."""
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        v = [v]
+    out = []
+    for x in v:
+        if isinstance(x, bool):
+            continue
+        if isinstance(x, int):
+            x = str(x)
+        if not isinstance(x, str):
+            continue
+        x = x.strip().lstrip('#')
+        if x and len(x) <= OBJECT_MAX_LEN and x not in out:
+            out.append(x)
+        if len(out) >= MAX_OBJECTS:
+            break
+    return out
+
+
+# Where an event says which object it is about. Same paths the summarizers
+# read for meta['number'], so a claim matches exactly what a delivery reports.
+def payload_objects(payload):
+    got = []
+    for path in (('number',), ('issue', 'number'), ('pull_request', 'number'),
+                 ('discussion', 'number')):
+        n = g(payload, *path)
+        if isinstance(n, bool) or n is None:
+            continue
+        n = s(n) if not isinstance(n, str) else n.strip()
+        if n and n not in got:
+            got.append(n)
+    return got
+
+
 def normalize_entry(t):
     if isinstance(t, str):
         t = {'topic': t}
@@ -468,6 +520,7 @@ def normalize_entry(t):
         ttl = t.get('ttlHours')
         return {
             'topic': t['topic'],
+            'objects': normalize_objects(t.get('objects')),
             'ignoreSenders': ig,
             # Kept as written, even if malformed: match_predicate answers False
             # (loudly) for a bad node, and normalizing a typo'd `include` AWAY
@@ -536,6 +589,8 @@ def write_filter(f, path=FILTER_FILE):
             o['ttlHours'] = e['ttlHours']
         if e['renewOnEvent']:
             o['renewOnEvent'] = True
+        if e['objects']:
+            o['objects'] = e['objects']
         if e['ignoreSenders']:
             o['ignoreSenders'] = e['ignoreSenders']
         if e['include'] is not None:
@@ -1234,7 +1289,7 @@ class Dispatcher:
     # raises leaves the batch alone, because a missed drop costs one session
     # and a wrong drop loses the event entirely.
     def _still_unowned(self, key, batch):
-        probe = self.owner_of or ci_owner_now
+        probe = self.owner_of or owner_now
         kept = []
         for item in batch:
             text, meta, env = item
@@ -1370,6 +1425,46 @@ DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) i
 # ownership is object-granular, so a session working one PR would otherwise
 # silence the watch for every unrelated issue in that repo for the life of its
 # subscription.
+def filter_claims_object(path, source, key, sender, event, payload=None):
+    """Does this filter claim the OBJECT this event is about?
+
+    Narrower than filter_claims on purpose: the entry must both cover the
+    topic and name the object. An entry with no `objects` claims nothing here,
+    so a session watching a whole repo keeps spawning new work — the property
+    test_non_ci_event_spawns_even_when_a_session_owns_the_repo pins.
+    """
+    objects = payload_objects(payload)
+    if not objects or not key:
+        return False
+    f = read_filter(path)
+    if not f['enabled'] or not f['topicsConfigured']:
+        return False
+    now = now_ms()
+    for e in f['topics']:
+        if not e['objects'] or entry_expired(e, f['ttlHours'], now):
+            continue
+        if not match_topic(source, key, e['topic']):
+            continue
+        if any(o in e['objects'] for o in objects):
+            return True
+    return False
+
+
+def claimed_by_live_session(env):
+    """The live session holding this event's object, if any.
+
+    Deliberately does NOT consult entry_forwards: a claim is about who owns
+    the work, not about what that session wants delivered. A session that
+    muted its own echoes still owns the PR those echoes are about.
+    """
+    for key in peer_scopes_live():
+        if filter_claims_object(filter_path_of(key), env.get('source', ''),
+                                env.get('key', ''), env.get('sender', ''),
+                                env.get('event', ''), env.get('payload')):
+            return key or '(unscoped)'
+    return None
+
+
 def owned_by_live_session(env):
     for key in peer_scopes_live():
         if filter_claims(filter_path_of(key), env.get('source', ''), env.get('key', ''),
@@ -1384,10 +1479,19 @@ def owned_by_live_session(env):
 # session 1's peer socket appears seconds after its spawn command runs, so the
 # events that arrived in that gap were judged unowned and then waited a full
 # window for a verdict nobody revisited.
-def ci_owner_now(env):
-    if not env or env.get('event', '') not in CI_EVENTS:
+def owner_now(env):
+    if not env:
         return None
-    return owned_by_live_session(env)
+    if env.get('event', '') in CI_EVENTS:
+        owner = owned_by_live_session(env)
+        if owner:
+            return owner
+    # Object claims are not CI-shaped and apply to every event.
+    return claimed_by_live_session(env)
+
+
+# Kept as the old name for callers that only ever meant the CI question.
+ci_owner_now = owner_now
 
 
 def dispatch_event(env):
@@ -1438,6 +1542,20 @@ def dispatch_event(env):
             print('local-webhook: not spawning for %s on %s — session %s is subscribed to it'
                   % (event or '(none)', env.get('key', '') or '(none)', owner), file=sys.stderr)
             return
+    # Every event, not just CI: a live session that named this object is
+    # already receiving the delivery and is the better handler for it. Two
+    # reviews on box-authored PRs spawned duplicate sessions the day this
+    # landed, and the first of them pushed to a branch another session owned
+    # (agent-box#319). A topic-wide brake would have been the wrong fix —
+    # ownership is object-granular, topics are repo-granular — so this only
+    # fires for the objects a session actually claimed.
+    claimer = claimed_by_live_session(env)
+    if claimer:
+        print('local-webhook: not spawning for %s on %s — session %s claims %s'
+              % (event or '(none)', env.get('key', '') or '(none)', claimer,
+                 ', '.join('#' + o for o in payload_objects(env.get('payload')))),
+              file=sys.stderr)
+        return
     entry = r['entry']
     text, payload_meta = format_delivery(env, entry)
     DISPATCHER.add(env.get('key', '') or '(none)', text, {
@@ -1640,7 +1758,9 @@ TOOLS = [
             'ignore_senders / ttl_hours / renew_on_event in place), as does a "warm" delivery <10min after the '
             'previous; renew_on_event:true resets it on every delivery instead. For a standing watch that '
             'should NOT land in this session, pass deliver_to:"subagent" — each matching event batch then '
-            'spawns a fresh session.' % DEFAULT_TTL_HOURS,
+            'spawns a fresh session. When you pick up a specific issue or PR, name it in `objects` so a '
+            'standing watch does not spawn a second session onto the work you are already holding.'
+            % DEFAULT_TTL_HOURS,
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -1654,6 +1774,19 @@ TOOLS = [
                         'Short reason for subscribing ("waiting on Lio to wire the hook, issue 15"). Echoed under '
                         'every delivery on this topic so a fresh-context session knows why the event matters. '
                         'Omit to keep the existing note; pass "" to clear.',
+                },
+                'objects': {
+                    'type': 'array',
+                    'items': {'type': ['string', 'number']},
+                    'description':
+                        'Issue/PR numbers this session is WORKING ON under this topic (e.g. [317]). '
+                        'A standing watch then does not spawn a fresh session for events about them '
+                        '— reviews, comments, pushes — because you are already getting those '
+                        'deliveries and you hold the context. Objects you do not name keep spawning: '
+                        'topics are repo-granular, ownership is not, so a session on one PR never '
+                        'silences new work in the same repo. Claim what you pick up, and let the '
+                        'subscription lapse when you are done. Omit to keep the current claim; pass '
+                        '[] to release it.',
                 },
                 'ttl_hours': {
                     'type': 'number',
@@ -1807,6 +1940,8 @@ def call_tool(params):
                 o['ttlHours'] = e['ttlHours']
             if e['renewOnEvent']:
                 o['renewOnEvent'] = True
+            if e['objects']:
+                o['objects'] = e['objects']
             if e['ignoreSenders']:
                 o['ignoreSenders'] = e['ignoreSenders']
             if e['include'] is not None:
@@ -1872,7 +2007,8 @@ def call_tool(params):
             rules = [k for k, v in (('include', e['include']), ('exclude', e['exclude'])) if v is not None]
             return e['topic'] + (' "%s"' % e['note'] if e['note'] else '') + \
                 (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
-                (' [%s rules]' % '+'.join(rules) if rules else '')
+                (' [%s rules]' % '+'.join(rules) if rules else '') + \
+                (' (holding %s)' % ', '.join('#' + o for o in e['objects']) if e['objects'] else '')
 
         def listing(ts):
             return ', '.join(show(e) for e in ts) or '(none)'
@@ -1903,6 +2039,9 @@ def call_tool(params):
             raw_renew = arguments.get('renew_on_event', _MISSING)
             if raw_renew is not _MISSING and not isinstance(raw_renew, bool):
                 return text('error: renew_on_event must be a boolean')
+            raw_objects = arguments.get('objects', _MISSING)
+            if raw_objects is not _MISSING and not isinstance(raw_objects, list):
+                return text('error: objects must be an array of issue/PR numbers')
             raw_note = arguments.get('note', _MISSING)
             # Predicates are validated NOW, not at delivery time: a typo that
             # only surfaced as a match-nothing predicate would read as a watch
@@ -1940,6 +2079,8 @@ def call_tool(params):
                     e['ttlHours'] = raw_ttl
                 if raw_renew is not _MISSING:
                     e['renewOnEvent'] = raw_renew
+                if raw_objects is not _MISSING:
+                    e['objects'] = normalize_objects(raw_objects)
                 if raw_include is not _MISSING:
                     e['include'] = raw_include or None
                 if raw_exclude is not _MISSING:
@@ -1969,6 +2110,7 @@ def call_tool(params):
                 # loss the session-filter TTL exists to bound.
                 'ttlHours': (0 if dispatch else None) if raw_ttl is _MISSING else raw_ttl,
                 'renewOnEvent': raw_renew is True,
+                'objects': normalize_objects(None if raw_objects is _MISSING else raw_objects),
                 'subscribedAt': now_iso,
                 'lastActivityAt': '',
             }
@@ -2244,6 +2386,7 @@ emit a box-local event onto the same bus.
 
 usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
                                   [--renew-on-event] [--ignore-sender LOGIN]...
+                                  [--object NUMBER]...
                                   [--include JSON] [--exclude JSON]
        webhook.py unsubscribe TOPIC [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME]
@@ -2270,6 +2413,10 @@ source or for everything: name a key or a prefix.
                        you: a CI event spawns only if it reports a FAILURE, and
                        never while a live session is subscribed to that topic.
                        A new issue or someone else's PR spawns either way
+  --object NUMBER      an issue/PR number this session is working on (repeatable).
+                       A standing watch will not spawn a session for events about
+                       it — you are already getting them. Objects you do not name
+                       keep spawning. --no-objects releases the claim.
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
@@ -2499,6 +2646,14 @@ def run_cli(argv):
             if v not in ('session', 'subagent'):
                 die('--deliver-to must be "session" or "subagent"')
             args['deliver_to'] = v
+        elif a in ('--object', '--objects'):
+            i += 1
+            if i >= len(argv):
+                die('%s needs a value' % a)
+            args.setdefault('objects', []).extend(
+                x for x in argv[i].replace(',', ' ').split() if x)
+        elif a == '--no-objects':
+            args['objects'] = []
         elif a == '--renew-on-event':
             args['renew_on_event'] = True
         elif a == '--no-renew-on-event':
