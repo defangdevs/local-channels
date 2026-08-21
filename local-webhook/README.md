@@ -278,7 +278,16 @@ start a new agent session (under agent-box, a wrapper over
 `[UNTRUSTED …]` framing and note echo as a channel message) arrives on the
 command's **stdin**; routing context rides in `LOCAL_WEBHOOK_SPAWN_SOURCE`,
 `_KEY`, `_EVENT`, `_TOPIC`, `_NOTE` and `_COUNT` env vars (payload-derived —
-quote them).
+quote them). Those six name the batch's *routing*, never the object it is
+about, so a consumer wanting "which PR/issue/run" had no way to get it short
+of regexing the rendered prose. `LOCAL_WEBHOOK_SPAWN_META` (0.17.0) closes
+that gap: one JSON object, the same per-event meta a channel notification's
+`meta` field already carries (`event`, `repo`, `sender`, and whatever the
+event type adds — `number`, `action`, `conclusion`, `ref`, ...), taken from
+the newest surviving line in a coalesced batch. It promises only that
+whatever the source's summarizer produced is visible, not that a given key
+exists for every event type; an event with nothing to add still gets `{}`,
+never a missing variable.
 
 Differences from session routing, all deliberate:
 
