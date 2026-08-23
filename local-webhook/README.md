@@ -98,6 +98,14 @@ no wildcard for a whole source (`github:*`) or for everything (`*`); an entry
 holding one is **kept and never matches**, and `webhook_subscriptions` marks it
 `invalid` with a reason, so an upgraded filter shows a visible dead row its
 owner can re-point rather than silently losing a subscription.
+
+On the **session** path a prefix topic must also carry an `include` predicate —
+`webhook_subscribe` refuses `github:owner/*` on its own, because owner-wide
+traffic interrupting a working session is a firehose rather than a watch. Name
+one repo, narrow it with `include`, or use `deliver_to:"subagent"`, which is
+exempt: it spawns a session per event batch instead of interrupting one, and an
+org-wide standing watch is its intended shape.
+
 An entry may also be an object with `ignoreSenders`: events on that topic whose
 sender matches are dropped as echoes of the session's own actions (pass
 `ignore_senders` to `webhook_subscribe`, or hand-edit). `"@self"` resolves to
@@ -111,9 +119,10 @@ a *failing* outcome, sender irrelevant (0.10.1) — see
 
 ```json
 { "enabled": true, "ttlHours": 1, "topics": [
-    "github:defangdevs/*",
-    { "topic": "github:me/my-config-repo", "ttlHours": 72,
-      "note": "tracking the config migration all week", "subscribedAt": "2026-07-16T00:00:00Z" },
+    { "topic": "github:defangdevs/*", "include": { "any": [ { "path": "action", "in": ["opened"] } ] },
+      "note": "a prefix topic needs an include on the session path", "subscribedAt": "2026-07-16T00:00:00Z" },
+    { "topic": "github:me/my-config-repo", "ttlHours": 8,
+      "note": "tracking the config migration today", "subscribedAt": "2026-07-16T00:00:00Z" },
     { "topic": "github:defangdevs/claude-box", "ignoreSenders": ["@self"],
       "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T00:00:00Z" } ] }
 ```
@@ -213,8 +222,19 @@ the whole conversation to handle one stale event burns a large pile of tokens.
 So subscriptions **expire**, `ttlHours` after their clock was last reset
 (top-level default **1** — chosen to track how long the KV cache stays warm, so
 a straggler event can't trigger an expensive cold re-read; per-entry `ttlHours`
-overrides it; `0` = pinned, never expires — but see the warning below). Expired
-topics are pruned at delivery time and on every tool call.
+overrides it; `0` = pinned, never expires). Expired topics are pruned at
+delivery time and on every tool call.
+
+A **session** subscription is capped at **8 hours** (`MAX_SESSION_TTL_HOURS`)
+and may not be pinned: `webhook_subscribe` refuses a longer `ttl_hours`, and
+entries written before the cap are clamped when the file is read. The reason is
+the renewal rule below — routine CI fires several events inside the warm
+window, so each burst renews the very subscription it is polluting, and a
+long-lived session topic sustains itself indefinitely. One observed case: a 12h
+subscription on a busy repo lived through the night on CI bursts and delivered
+a nightly build into unrelated work. A watch meant to last longer belongs on
+`deliver_to:"subagent"`, which has no cap because it spawns a session rather
+than interrupting one.
 
 Two things reset the clock:
 
