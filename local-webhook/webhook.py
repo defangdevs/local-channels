@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.19.0'
+VERSION = '0.20.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -291,6 +291,18 @@ def verify(secret, sig_header, body):
 # The optional per-topic "note" (why this subscription exists) is echoed under
 # every delivery so a fresh-context session knows what the event relates to.
 DEFAULT_TTL_HOURS = 1
+# Session subscriptions are capped, dispatch ones are not. The asymmetry is the
+# same one that makes ttlHours:0 the dispatch default: a dispatch match spawns a
+# fresh session, while a session match INTERRUPTS a human mid-task. A topic that
+# outlives the work it was created for stops being a watch and becomes noise,
+# and the renewal rule makes that self-sustaining — a repo's routine CI fires
+# several events inside the warm window, so each burst renews the subscription
+# it is polluting. Observed: a 12h session subscription on a busy repo survived
+# overnight on CI bursts alone and delivered a nightly build into unrelated
+# work. An honest multi-day watch wants deliver_to:"subagent", which costs no
+# interruption; subscribe rejects a longer ttl_hours rather than clamping it
+# silently, and read_filter clamps entries written before this rule.
+MAX_SESSION_TTL_HOURS = 8
 # A delivery is "warm" (and so renews the TTL) if it lands within this window
 # of the previous delivery — ~2× the ~5min prompt-cache TTL, enough slack that
 # a couple of slow turns don't break an active streak, still well short of a
@@ -489,7 +501,20 @@ def normalize_entry(t):
     return None
 
 
+def capped_ttl(ttl, session):
+    """Clamp a session TTL to MAX_SESSION_TTL_HOURS; leave dispatch alone.
+
+    Applied on READ so entries written before the cap existed — including
+    pinned ones, which a session should never have had — start expiring like
+    everything else, without needing anyone to rewrite their filter file.
+    """
+    if not session or ttl is None:
+        return ttl
+    return MAX_SESSION_TTL_HOURS if ttl == 0 or ttl > MAX_SESSION_TTL_HOURS else ttl
+
+
 def read_filter(path=FILTER_FILE):
+    session = os.path.abspath(path) != os.path.abspath(DISPATCH_FILE)
     try:
         with open(path, encoding='utf-8') as f:
             raw = json.load(f)
@@ -502,10 +527,13 @@ def read_filter(path=FILTER_FILE):
         ttl = raw.get('ttlHours')
         return {
             'enabled': raw.get('enabled') is not False,
-            'ttlHours': ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else DEFAULT_TTL_HOURS,
+            'ttlHours': capped_ttl(
+                ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else DEFAULT_TTL_HOURS,
+                session),
             'topicsConfigured': topics is not None,
             'state': 'ok' if topics is not None else 'unconfigured',
-            'topics': [e for e in map(normalize_entry, topics or []) if e],
+            'topics': [dict(e, ttlHours=capped_ttl(e['ttlHours'], session))
+                       for e in map(normalize_entry, topics or []) if e],
         }
     except OSError:
         # No file: this session never subscribed. Distinct from the case below,
@@ -1705,7 +1733,11 @@ TOOLS = [
             'properties': {
                 'topic': {
                     'type': 'string',
-                    'description': 'Topic pattern: "source:key" or "source:prefix/*". Bare "owner/repo" implies github. There is no pattern for a whole source or for everything.',
+                    'description': 'Topic pattern: "source:key" or "source:prefix/*". Bare "owner/repo" implies github. '
+                        'There is no pattern for a whole source or for everything. A "prefix/*" topic delivered to '
+                        'this session is refused unless it also carries an include predicate — owner-wide traffic '
+                        'interrupting a working session is a firehose, not a watch. Name one key, narrow it with '
+                        'include, or pass deliver_to:"subagent".',
                 },
                 'note': {
                     'type': 'string',
@@ -1719,12 +1751,13 @@ TOOLS = [
                     'description':
                         "Per-topic expiry override in hours (default: the filter file's ttlHours, %d "
                         'unless changed). Counted from the last clock reset — re-subscribe, or a "warm" delivery '
-                        '(one arriving <10min after the previous, while the cache is still hot). A larger value suits '
-                        'an awaited response that will take days. Prefer a TTL scoped to the work in flight: 0 pins '
-                        'the topic forever, and deliveries land in whichever session is active, so a pinned topic '
-                        'interrupts unrelated work indefinitely. (With deliver_to:"subagent" the reverse holds: '
-                        'events spawn a fresh session instead of interrupting one, so 0 is safe and is the '
-                        'default there.) Omit to keep the existing override on renew.' % DEFAULT_TTL_HOURS,
+                        '(one arriving <10min after the previous, while the cache is still hot). Scope it to the '
+                        'work in flight. For THIS session the maximum is %d and 0 (pinned) is refused: matching '
+                        'events interrupt whatever the session is doing, and routine CI fires several events inside '
+                        'the warm window, so a long-lived topic renews itself faster than it can expire. A watch '
+                        'meant to outlast that wants deliver_to:"subagent" instead — it spawns a fresh session per '
+                        'event batch, interrupts nobody, and has no limit (0 is its default). Omit to keep the '
+                        'existing override on renew.' % (DEFAULT_TTL_HOURS, MAX_SESSION_TTL_HOURS),
                 },
                 'deliver_to': {
                     'type': 'string',
@@ -1959,6 +1992,21 @@ def call_tool(params):
             if raw_ttl is not _MISSING and not (
                     isinstance(raw_ttl, (int, float)) and not isinstance(raw_ttl, bool) and raw_ttl >= 0):
                 return text('error: ttl_hours must be a number >= 0 (0 = never expire)')
+            # Refuse rather than clamp: silently shortening a watch someone
+            # asked to keep for days is the kind of surprise that gets noticed
+            # only when the events stop arriving.
+            if not dispatch and raw_ttl is not _MISSING and (
+                    raw_ttl == 0 or raw_ttl > MAX_SESSION_TTL_HOURS):
+                return text(
+                    'error: %s. Matching events interrupt whatever this session is doing, so a '
+                    'subscription that outlives the work becomes noise — and routine CI fires '
+                    'several events inside the warm window, so a long-lived topic renews itself '
+                    'faster than it can expire. For a watch meant to last longer, pass '
+                    'deliver_to:"subagent": it spawns a fresh session per event batch, interrupts '
+                    'nobody, and has no TTL limit.'
+                    % ('ttl_hours 0 (pinned) is not allowed for a session subscription' if raw_ttl == 0
+                       else 'ttl_hours %s is too long for a session subscription (max %s)'
+                            % (_num(raw_ttl), _num(MAX_SESSION_TTL_HOURS))))
             raw_renew = arguments.get('renew_on_event', _MISSING)
             if raw_renew is not _MISSING and not isinstance(raw_renew, bool):
                 return text('error: renew_on_event must be a boolean')
@@ -1988,6 +2036,24 @@ def call_tool(params):
                 return '%s, renews on every event' % base if e['renewOnEvent'] else base
 
             idx = next((i for i, e in enumerate(f['topics']) if eq(e['topic'], topic)), -1)
+            # Too broad for a session. A prefix topic is every event of every
+            # repo under that owner, and pointed at an interactive session
+            # that is a firehose, not a watch. Naming one repo is fine — the
+            # default noise-exclude covers the worst of it — but an owner-wide
+            # pattern has to say what it actually wants. Dispatch is exempt: it
+            # is the documented shape for a standing org-wide watch, and it
+            # spawns rather than interrupts.
+            if not dispatch and topic.rstrip().endswith('/*'):
+                eff_include = (raw_include if raw_include is not _MISSING
+                               else (f['topics'][idx]['include'] if idx >= 0 else None))
+                if not eff_include:
+                    return text(
+                        'error: topic "%s" is too broad for a session subscription: it matches every '
+                        'event of every key under that prefix, and each one interrupts this session. '
+                        'Either name the single key you care about, or pass an include predicate that '
+                        'says which events matter (e.g. {"any":[{"path":"action","in":["opened"]}]}), '
+                        'or pass deliver_to:"subagent" to make it a standing watch that spawns a fresh '
+                        'session instead of interrupting this one.' % topic)
             if idx >= 0:
                 # Re-subscribe = renew: the TTL clock restarts even if nothing changed.
                 e = {**f['topics'][idx], 'subscribedAt': now_iso}

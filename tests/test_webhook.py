@@ -638,7 +638,8 @@ class TestCallTool(StateDirCase):
             out = self.call('webhook_subscribe', topic=topic)
             self.assertIn('not a valid pattern', out)
             self.assertIn('removed in 0.13.0', out)
-        # The prefix form is still how you follow a whole org.
+        # The prefix form is still a valid pattern; for a session it now has
+        # to be narrowed as well (see TestSessionSubscriptionLimits).
         self.assertNotIn('not a valid pattern',
                          self.call('webhook_subscribe', topic='github:defangdevs/*'))
 
@@ -730,6 +731,83 @@ class TestCallTool(StateDirCase):
         self.assertNotIn('exclude', self.read_json('filter.testsess.json')['topics'][0])
         self.call('webhook_subscribe', topic='o/r', note='renew, no exclude passed')
         self.assertNotIn('exclude', self.read_json('filter.testsess.json')['topics'][0])
+
+
+class TestSessionSubscriptionLimits(StateDirCase):
+    """A session subscription interrupts a human, so it is bounded twice: it
+    cannot outlive the work by much, and it cannot be an owner-wide firehose.
+    Dispatch is exempt on both counts — it spawns instead of interrupting."""
+
+    def test_session_ttl_is_capped(self):
+        cap = self.mod.MAX_SESSION_TTL_HOURS
+        out = self.call('webhook_subscribe', topic='o/r', ttl_hours=cap + 1)
+        self.assertIn('too long for a session subscription', out)
+        self.assertIn('deliver_to:"subagent"', out)
+        self.assertEqual(self.mod.read_filter(
+            os.path.join(self.state, 'filter.testsess.json'))['topics'], [])
+        # The cap itself is allowed.
+        self.assertIn('subscribed to', self.call('webhook_subscribe', topic='o/r', ttl_hours=cap))
+
+    def test_session_may_not_pin(self):
+        out = self.call('webhook_subscribe', topic='o/r', ttl_hours=0)
+        self.assertIn('ttl_hours 0 (pinned) is not allowed for a session subscription', out)
+        self.assertIn('deliver_to:"subagent"', out)
+
+    def test_dispatch_ttl_is_unbounded(self):
+        cap = self.mod.MAX_SESSION_TTL_HOURS
+        for ttl in (0, cap * 100):
+            out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', ttl_hours=ttl)
+            self.assertNotIn('too long', out)
+
+    def test_legacy_over_cap_entry_is_clamped_on_read(self):
+        """Entries written before the cap must start expiring without anyone
+        rewriting the file — that backlog is exactly what caused the noise."""
+        path = os.path.join(self.state, 'filter.testsess.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'ttlHours': 999, 'topics': [
+                {'topic': 'github:o/r', 'ttlHours': 720},
+                {'topic': 'github:o/s', 'ttlHours': 0},
+                {'topic': 'github:o/t', 'ttlHours': 2},
+            ]}, f)
+        got = self.mod.read_filter(path)
+        cap = self.mod.MAX_SESSION_TTL_HOURS
+        self.assertEqual(got['ttlHours'], cap)
+        self.assertEqual([e['ttlHours'] for e in got['topics']], [cap, cap, 2])
+
+    def test_dispatch_pinned_entry_survives_read(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        got = self.mod.read_filter(os.path.join(self.state, 'filter.dispatch.json'))
+        self.assertEqual(got['topics'][0]['ttlHours'], 0)
+
+    def test_session_prefix_topic_needs_an_include(self):
+        out = self.call('webhook_subscribe', topic='github:o/*')
+        self.assertIn('too broad for a session subscription', out)
+        self.assertEqual(self.mod.read_filter(
+            os.path.join(self.state, 'filter.testsess.json'))['topics'], [])
+
+    def test_session_prefix_topic_is_fine_with_an_include(self):
+        out = self.call('webhook_subscribe', topic='github:o/*',
+                        include={'any': [{'path': 'action', 'in': ['opened']}]})
+        self.assertIn('subscribed to', out)
+
+    def test_renewing_a_narrowed_prefix_topic_need_not_repeat_the_include(self):
+        self.call('webhook_subscribe', topic='github:o/*',
+                  include={'any': [{'path': 'action', 'in': ['opened']}]})
+        out = self.call('webhook_subscribe', topic='github:o/*', note='still working on it')
+        self.assertIn('renewed subscription', out)
+
+    def test_clearing_the_include_on_a_prefix_topic_is_refused(self):
+        self.call('webhook_subscribe', topic='github:o/*',
+                  include={'any': [{'path': 'action', 'in': ['opened']}]})
+        out = self.call('webhook_subscribe', topic='github:o/*', include={})
+        self.assertIn('too broad', out)
+
+    def test_dispatch_prefix_topic_needs_no_include(self):
+        out = self.call('webhook_subscribe', topic='github:o/*', deliver_to='subagent')
+        self.assertNotIn('too broad', out)
+
+    def test_exact_topic_needs_no_include(self):
+        self.assertIn('subscribed to', self.call('webhook_subscribe', topic='github:o/r'))
 
 
 class TestDispatchEvent(StateDirCase):

@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.19.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
+| [`local-webhook`](local-webhook/) | 0.20.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
 
 ## Requirements
 
@@ -142,6 +142,12 @@ restarting the session. The agent calls:
 `github:owner/repo` (exact) or `github:owner/*` (prefix). A bare `owner/repo` or
 `owner/*` is shorthand for the `github:` form.
 
+A prefix topic on the **session** path must also carry an `include` predicate
+(0.20.0): `github:owner/*` alone is every event of every repo under that owner,
+landing in a session that is trying to work. Name one repo, narrow it with
+`include`, or use `deliver_to:"subagent"` — exempt, because an org-wide standing
+watch is exactly its purpose and it spawns rather than interrupts.
+
 There is deliberately **no way to subscribe to everything** (0.13.0). The
 whole-source form `github:*` and the whole-bus form `*` were both removed, so
 the widest topic expressible is a prefix under one source. Keyless payloads —
@@ -177,14 +183,19 @@ to handle one stale event.
   delivery regardless of gap — for a stream you mean to follow indefinitely.
 - Expired topics are pruned at delivery time and on every tool call.
 
-> **Don't pin.** `ttl_hours: 0` never expires, and `renew_on_event: true` keeps
-> a busy topic alive forever in practice. A delivery lands in whichever session
-> is *active at the time*, so either one interrupts unrelated work
-> indefinitely — no session "owns" a standing watch on a repo. Scope the TTL to
-> the work in flight and let it lapse. Pinning becomes reasonable only once a
-> subscription can request delivery into a **fresh** session instead of the
-> active one ([#1](https://github.com/defangdevs/local-channels/issues/1)),
-> since a cold run has no warm cache to lose.
+> **A session subscription can't pin, and can't run long.** `ttl_hours: 0` and
+> anything above **8 hours** (`MAX_SESSION_TTL_HOURS`) are refused on the
+> session path since 0.20.0; entries written before the cap are clamped when
+> the filter is read. A delivery lands in whichever session is *active at the
+> time*, so a long-lived topic interrupts unrelated work — and the renewal rule
+> makes it self-sustaining, because routine CI fires several events inside the
+> warm window and each burst renews the subscription it is polluting. One
+> observed case: a 12h subscription on a busy repo lived through the night on
+> CI bursts and delivered a nightly build into an unrelated session.
+>
+> A watch meant to last longer belongs on `deliver_to:"subagent"`, which has no
+> cap and defaults to pinned: a cold spawned run has no warm cache to lose and
+> interrupts nobody.
 
 ### Echo muting
 
