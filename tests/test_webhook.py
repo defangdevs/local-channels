@@ -162,6 +162,18 @@ class TestPredicates(StateDirCase):
         # ...and notIn on an absent path matches (fails toward delivering).
         self.assertTrue(self.m({'path': 'no.such.path', 'notIn': ['x']}))
 
+    def test_list_index_path(self):
+        # agent-box#251's workflow_run.pull_requests.0.number: an all-digits
+        # segment indexes into a list instead of ending the walk at None.
+        payload = {'workflow_run': {'pull_requests': [{'number': 247}, {'number': 9}]}}
+        self.assertTrue(self.m({'path': 'workflow_run.pull_requests.0.number', 'in': [247]}, payload))
+        self.assertTrue(self.m({'path': 'workflow_run.pull_requests.1.number', 'in': [9]}, payload))
+        # Out of range, non-digit, or negative all miss the same way a
+        # missing dict key does — no IndexError, no wraparound.
+        self.assertTrue(self.m({'path': 'workflow_run.pull_requests.2.number', 'in': [None]}, payload))
+        self.assertTrue(self.m({'path': 'workflow_run.pull_requests.head.number', 'in': [None]}, payload))
+        self.assertTrue(self.m({'path': 'workflow_run.pull_requests.-1.number', 'in': [None]}, payload))
+
     def test_any_all_compose(self):
         self.assertTrue(self.m({'any': [{'path': 'action', 'in': ['closed']},
                                         {'path': 'workflow_run.conclusion', 'in': ['failure']}]}))
