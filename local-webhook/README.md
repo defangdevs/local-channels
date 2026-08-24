@@ -154,7 +154,12 @@ never matches `1`). Since 0.15.0, `path` may also address `event` — the
 `X-GitHub-Event` name (`issues`, `workflow_run`, `star`, ...) — which
 `entry_forwards` merges into the payload it evaluates against via
 `setdefault` (a real payload field of the same name, if one ever exists,
-always wins).
+always wins). Since 0.22.0, an all-digits segment indexes into a list instead
+of ending the walk at `None` — `workflow_run.pull_requests.0.number` reaches
+the first linked PR's number, the shape a spawned session needs to scope a
+`when` to its own run (agent-box#251). Anything else against a list —
+non-digits, a negative sign, an out-of-range index — misses the same way a
+missing dict key does.
 
 A leaf may instead carry `contains` / `notContains`, which test a **string**
 value for any of the listed substrings, case-insensitively (0.14.0):

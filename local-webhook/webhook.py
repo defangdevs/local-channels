@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.21.0'
+VERSION = '0.22.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -657,9 +657,15 @@ def match_topic(source, key, pat):
 # would stall the daemon on somebody else's comment body.
 def get_path(obj, path):
     for k in path.split('.'):
-        if obj is None or not isinstance(obj, dict):
+        if isinstance(obj, list):
+            # An all-digits segment indexes the list (agent-box#251's
+            # workflow_run.pull_requests.0.number); anything else — including
+            # a negative sign — has no match, same as a missing dict key.
+            obj = obj[int(k)] if k.isdigit() and int(k) < len(obj) else None
+        elif isinstance(obj, dict):
+            obj = obj.get(k)
+        else:
             return None
-        obj = obj.get(k)
     return obj
 
 
