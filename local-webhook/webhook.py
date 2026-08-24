@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.20.0'
+VERSION = '0.21.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1595,6 +1595,10 @@ def summarize_github(event, p):
     elif event == 'issue_comment':
         meta['action'] = s(g(p, 'action'))
         meta['number'] = s(g(p, 'issue', 'number'))
+        # Truncated the same way s() truncates every other meta value (200
+        # chars) — enough to carry a "@login+profile" mention suffix without
+        # handing a spawn command the full attacker-controlled comment body.
+        meta['comment_body'] = s(g(p, 'comment', 'body'))
         content = 'comment %s on #%s (%s) by %s: body=%s' % (
             s(g(p, 'action')), s(g(p, 'issue', 'number')), repo, sender, u(g(p, 'comment', 'body')))
     elif event == 'pull_request_review':

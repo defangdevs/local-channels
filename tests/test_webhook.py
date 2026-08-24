@@ -870,6 +870,36 @@ class TestDispatchEvent(StateDirCase):
         self.assertEqual(meta['event'], 'issues')
         self.assertEqual(meta['repo'], 'o/r')
 
+    def test_issue_comment_meta_carries_the_raw_body(self):
+        # agent-box#333: a spawn consumer that wants to resolve a
+        # "@login+profile" mention suffix has nothing to parse but the
+        # rendered prose line — unless the raw comment body rides along in
+        # LOCAL_WEBHOOK_SPAWN_META, same as `number`/`action` already do.
+        out = os.path.join(self.state, 'spawned_comment_meta.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "META=$LOCAL_WEBHOOK_SPAWN_META"; } > %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx')
+        env = {'source': 'github', 'format': 'github', 'event': 'issue_comment',
+               'key': 'o/r', 'sender': 'x', 'delivery': 'd1',
+               'payload': {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'x'},
+                           'action': 'created', 'issue': {'number': 286, 'title': 't'},
+                           'comment': {'body': '@box+opus please rebase'}}}
+        mod.dispatch_event(env)
+        text = ''
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    text = f.read()
+                if 'META=' in text:
+                    break
+            time.sleep(0.05)
+        line = next((ln for ln in text.splitlines() if ln.startswith('META=')), '')
+        self.assertTrue(line, 'expected a META= line, got: %r' % text)
+        meta = json.loads(line[len('META='):])
+        self.assertEqual(meta['comment_body'], '@box+opus please rebase')
+
     def test_no_payload_meta_is_empty_object_not_absent(self):
         # Non-github sources (or a Dispatcher.add caller with no per-line meta)
         # must still get a valid JSON object — a consumer does `.get()` on it.
