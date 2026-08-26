@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.22.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
+| [`local-webhook`](local-webhook/) | 0.23.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
 
 ## Requirements
 
@@ -145,8 +145,10 @@ restarting the session. The agent calls:
 A prefix topic on the **session** path must also carry an `include` predicate
 (0.20.0): `github:owner/*` alone is every event of every repo under that owner,
 landing in a session that is trying to work. Name one repo, narrow it with
-`include`, or use `deliver_to:"subagent"` — exempt, because an org-wide standing
-watch is exactly its purpose and it spawns rather than interrupts.
+`include`, or use `deliver_to:"subagent"` — exempt from the *topic* rule,
+because an org-wide standing watch is exactly its purpose and it spawns rather
+than interrupts, though it must declare `include`/`exclude` rules of its own
+(0.23.0).
 
 There is deliberately **no way to subscribe to everything** (0.13.0). The
 whole-source form `github:*` and the whole-bus form `*` were both removed, so
@@ -201,28 +203,37 @@ to handle one stale event.
 
 `ignore_senders` drops events on a topic whose sender matches — the session's own
 comments and edits coming back at it. `"@self"` resolves to `LOCAL_WEBHOOK_SELF`.
-CI-outcome events (`workflow_run`, `workflow_job`, `check_run`, `check_suite`,
-`status`, `deployment_status`) are **exempt**: their sender is merely whoever
-triggered the run, and muting your own login must not mute CI results for your
-own pushes. Where several entries match one event, the most permissive wins.
+Since 0.23.0 it is a **pure sender mute**: nothing is exempt from it. Through
+0.22.x a hardcoded set of GitHub CI-outcome events (`workflow_run`,
+`check_run`, …) overrode it, on the reasoning that their sender is merely
+whoever triggered the run — but that meant a source-agnostic bus deciding, for
+one source, which events outrank a consumer's explicit instruction. Say it in
+the rules instead (below), where it can be said precisely — *instead of*, not
+beside: the mute is applied after the predicates and wins, so an entry keeping
+both silences that sender's failures too. Where several entries match one
+event, the most permissive wins.
 
-A `deliver_to:"subagent"` standing watch is stricter than an exemption: a CI
-event spawns a session only when it reports a *failing* outcome, whoever
-triggered it (0.10.1 — through 0.10.0 the outcome only decided whether a CI
-event could override an ignored sender, so a green run from an unignored sender
-still spawned). And no CI event spawns at all while a live session is subscribed
-to that topic — a session driving a PR is already watching its CI, and a second
-agent on the same branch is not help. Non-CI events (a new issue, someone else's
-PR) spawn regardless of who is subscribed.
+A `deliver_to:"subagent"` standing watch **must carry rules** — every event it
+matches costs a whole agent session, so `webhook_subscribe` refuses one that
+declares neither `include` nor `exclude`, and dispatch spawns nothing for a
+rule-less entry written before 0.23.0. That replaces the built-in
+failures-only CI brake this plugin used to apply on that path; the policy is
+now the watch's own, and on agent-box it is declared in
+`services.agent-box.webhook.watchPolicy`. What remains built in is session
+coordination, not policy: no event spawns while a live session's own `include`
+predicate claims it — a session driving a PR is already watching it, and a
+second agent on the same branch is not help. A rule-less session subscription
+claims nothing, so new work in the same repo still spawns.
 
-Since 0.11.0 a subscription can also carry `include`/`exclude` **payload
-predicates** (`when`/`drop` are still accepted as the older names)
+Since 0.11.0 a subscription carries `include`/`exclude` **payload predicates**
+(`when`/`drop` are still accepted as the older names)
 (`{"any"/"all": […]}` over `{"path": "a.b.c", "in"/"notIn": [values]}` leaves,
 `path` may address `event`) — an event-agnostic filter on payload *content*,
 e.g. "issues being opened, not closed" or "only failing `workflow_run`
-conclusions". An entry carrying them sets its own policy: the built-in CI
-carve-outs above step aside for it (the live-session suppression still
-applies). A brand-new `deliver_to:"session"` subscription that passes no
+conclusions". These rules are the whole policy: nothing built in adds to them,
+which is why sender rules belong inside them
+(`{"path": "sender.login", "notIn": […]}`). A brand-new
+`deliver_to:"session"` subscription that passes no
 `exclude` is seeded with a default noise-exclude (stars, watches, forks,
 team/member pings, ...); pass `exclude: {}` to opt out. See the
 [local-webhook README](local-webhook/README.md) for the shape.

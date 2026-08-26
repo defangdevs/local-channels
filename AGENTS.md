@@ -50,7 +50,7 @@ new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
 
 - **Comments carry the *why*.** `webhook.py` is heavily commented with the
   reasoning behind each design choice (why TTL tracks cache warmth, why the CLI
-  binds nothing, why CI events are sender-ignore exempt). Match that register
+  binds nothing, why a standing watch must declare its own rules). Match that register
   when you touch it; a change that invalidates a comment must update it.
 - **Terminology is fixed:** channel, delivery, ingress owner, session peer,
   topic (`source:key`), subscription, warm/cold delivery, echo muting. Reuse the
