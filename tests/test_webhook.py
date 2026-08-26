@@ -356,19 +356,43 @@ class TestRouteEvent(StateDirCase):
         self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run')['forward'])
         self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run')['forward'])
 
-    def test_the_ci_exemption_is_expressible_as_a_rule(self):
-        # ...and more precisely than the carve-out ever was: it took every CI
-        # event from the muted sender, this takes only the failing ones.
-        self.write([self.entry('github:o/*', ignoreSenders=['me'], when={'any': [
-            {'path': 'event', 'notIn': ['workflow_run']},
-            {'path': 'workflow_run.conclusion', 'in': ['failure']}]})])
-        run = lambda concl: {'workflow_run': {'conclusion': concl}}
-        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
-                                              run('failure'))['forward'])
-        self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
+    def test_the_ci_exemption_is_expressible_positionally(self):
+        # What replaces the carve-out is a predicate INSTEAD of ignoreSenders,
+        # never beside it: the mute is evaluated after the rules and is
+        # unconditional, so an entry keeping both silences that sender's
+        # failures too (the test below). Said in one predicate it does what the
+        # carve-out did — my own failing run still reaches me — and what the
+        # carve-out could not: my green runs and my comment echoes stay quiet.
+        self.write([self.entry('github:o/*', when={'any': [
+            {'path': 'workflow_run.conclusion', 'in': ['failure']},
+            {'path': 'sender.login', 'notIn': ['me']}]})])
+
+        def run(concl, login='me'):
+            return {'sender': {'login': login}, 'workflow_run': {'conclusion': concl}}
+
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
                                              run('failure'))['forward'])
-        self.assertFalse(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
                                               run('success'))['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'issues',
+                                              {'sender': {'login': 'me'},
+                                               'action': 'opened'})['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'issues',
+                                             {'sender': {'login': 'other'},
+                                              'action': 'opened'})['forward'])
+
+    def test_ignore_senders_beside_a_rule_still_mutes_the_sender(self):
+        # Why the rule above carries the sender clause itself: ignoreSenders is
+        # applied after the predicate and wins, so keeping the mute takes the
+        # failing run back out again — the trap a filter written by editing the
+        # old carve-out into a rule would fall into.
+        self.write([self.entry('github:o/*', ignoreSenders=['me'],
+                               when={'path': 'workflow_run.conclusion', 'in': ['failure']})])
+        payload = {'sender': {'login': 'me'}, 'workflow_run': {'conclusion': 'failure'}}
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
+                                              payload)['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
+                                             payload)['forward'])
 
     # -- when/drop payload predicates (0.11.0) -------------------------------
     def test_when_accepts_only_matching_payloads(self):

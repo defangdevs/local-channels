@@ -115,11 +115,13 @@ events (`workflow_run`, `check_run`, …) overrode it — their sender is merely
 who triggered the run, so muting your own login also muted your own build
 results — and the dispatch path carried the mirror image: a CI event spawned a
 session only on a *failing* outcome. Both were this plugin holding one
-consumer's policy, and both are retired (#16). Say it in the rules instead: an
-entry that wants its own failing runs through a sender mute writes
-`{"path": "workflow_run.conclusion", "in": ["failure"]}` under `include`, which
-is also more precise than the carve-out ever was — see
-[Dispatch](#dispatch-delivery-into-a-fresh-session-090).
+consumer's policy, and both are retired (#16). Say it in the rules *instead of*
+in `ignoreSenders`, which is evaluated after them and wins: an entry that wants
+its own failing runs but not its own comment echoes drops the mute and writes
+one `include` — `{"any": [{"path": "workflow_run.conclusion", "in":
+["failure"]}, {"path": "sender.login", "notIn": ["me"]}]}` — which says what
+the carve-out meant and more, since the carve-out took that sender's green runs
+too. See [Dispatch](#dispatch-delivery-into-a-fresh-session-090).
 
 ```json
 { "enabled": true, "ttlHours": 1, "topics": [

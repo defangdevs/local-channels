@@ -327,8 +327,9 @@ FILTER_COMMENT = (
     "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; entries {topic, note, "
     "ignoreSenders, include, exclude, ttlHours, "
     "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; a pure "
-    "sender mute since 0.23.0 — no event overrides it, so keep CI results by writing the sender rule inside "
-    "the predicate instead) and expire ttlHours after "
+    "sender mute since 0.23.0 — no event overrides it, and it is applied after the predicates and wins, so "
+    "keep your own CI results by dropping the mute and putting the sender rule inside `include`) "
+    "and expire ttlHours after "
     "subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe "
     "and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; "
     "entries without timestamps don't expire until a write stamps them). Optional include/exclude are payload "
@@ -736,10 +737,13 @@ def predicate_error(pred, where='predicate'):
 # carve-out for entries carrying predicates. Keeping it for the rest meant this
 # file deciding, for one source, which events are important enough to override
 # a consumer's explicit instruction. An entry that wants "CI failures reach me
-# anyway" says so positionally instead, and can then say it precisely:
+# anyway" writes that positionally INSTEAD of muting the sender — the mute is
+# evaluated after the predicate and wins, so the two together take the failure
+# back out again:
 #   include: {any: [{path: "workflow_run.conclusion", in: ["failure", ...]},
-#                   {all: [{path: "sender.login", notIn: ["me"]}, ...]}]}
-# See #16 for the whole retirement.
+#                   {path: "sender.login", notIn: ["me"]}]}
+# which also says more than the carve-out could: that sender's GREEN runs stay
+# quiet. See #16 for the whole retirement.
 def entry_forwards(e, sender, event, payload=None):
     if e['include'] is not None or e['exclude'] is not None:
         # Most GitHub payloads carry no field of their own named "event" (the
@@ -1745,9 +1749,11 @@ TOOLS = [
                         '(e.g. your own GitHub login; "@self" resolves to LOCAL_WEBHOOK_SELF). A PURE sender '
                         'mute since 0.23.0: nothing is exempt, so it also silences CI runs YOU triggered '
                         '(GitHub stamps a run with whoever started it). To keep those, drop the sender from '
-                        'this list and write the rule positionally in "include" instead, e.g. {"any": '
-                        '[{"path": "workflow_run.conclusion", "in": ["failure"]}, {"all": [{"path": '
-                        '"sender.login", "notIn": ["me"]}]}]}. Omit or pass [] to clear.',
+                        'this list and write the rule positionally in "include" instead — beside a mute it '
+                        'would not help, since the mute is applied after the rules and wins. E.g. {"any": '
+                        '[{"path": "workflow_run.conclusion", "in": ["failure"]}, {"path": '
+                        '"sender.login", "notIn": ["me"]}]}: your failing runs and everyone else\'s events, '
+                        'without your own echoes. Omit or pass [] to clear.',
                 },
                 'include': {
                     'type': 'object',

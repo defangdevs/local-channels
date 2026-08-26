@@ -208,8 +208,10 @@ Since 0.23.0 it is a **pure sender mute**: nothing is exempt from it. Through
 `check_run`, …) overrode it, on the reasoning that their sender is merely
 whoever triggered the run — but that meant a source-agnostic bus deciding, for
 one source, which events outrank a consumer's explicit instruction. Say it in
-the rules instead (below), where it can be said precisely. Where several
-entries match one event, the most permissive wins.
+the rules instead (below), where it can be said precisely — *instead of*, not
+beside: the mute is applied after the predicates and wins, so an entry keeping
+both silences that sender's failures too. Where several entries match one
+event, the most permissive wins.
 
 A `deliver_to:"subagent"` standing watch **must carry rules** — every event it
 matches costs a whole agent session, so `webhook_subscribe` refuses one that
