@@ -9,6 +9,7 @@
 #   - end-to-end tests run webhook.py as real subprocesses (receiver daemon,
 #     session peer, CLI) and drive the HTTP ingress with signed deliveries —
 #     the same flow AGENTS.md prescribes for manual verification.
+import contextlib
 import http.client
 import importlib.util
 import io
@@ -27,6 +28,13 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEBHOOK_PY = os.path.join(REPO, 'local-webhook', 'webhook.py')
 PYTHON = sys.executable or 'python3'
+
+# Since 0.23.0 a standing watch must DECLARE which events deserve a session —
+# there is no built-in policy left to inherit (#16). This predicate accepts
+# everything on the topic ("event" is merged into every payload, so it is never
+# absent), i.e. it spells out the rule-less shape a watch used to have, and
+# lets a test about something else stay about that something else.
+ANY_EVENT = {'path': 'event', 'notIn': [None]}
 
 _module_seq = [0]
 
@@ -336,21 +344,31 @@ class TestRouteEvent(StateDirCase):
         self.assertGreater(m.parse_ms(saved['github:w/*']['subscribedAt']), t0 - 1e3)  # renewed
         self.assertEqual(saved['github:c/*']['subscribedAt'], sub)                     # untouched
 
-    def test_ignore_senders_with_ci_exemption(self):
+    def test_ignore_senders_is_a_pure_sender_mute(self):
+        # 0.23.0: no event overrides an explicit mute any more. Through 0.22.x
+        # a hardcoded set of GitHub CI events did — muting your own login was
+        # not allowed to mute your own build results — which is this plugin
+        # holding one source's policy (#16). The mute is now literal; a session
+        # that wants its own failing runs writes that into `include`.
         self.write([self.entry('github:o/*', ignoreSenders=['me'])])
         self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'issues')['forward'])
         self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'issues')['forward'])
-        self.assertTrue(self.mod.route_event('github', 'o/r', 'me', 'workflow_run')['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run')['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run')['forward'])
 
-    def test_ci_exempt_false_applies_sender_ignore_to_ci_events(self):
-        # The dispatch path passes ci_exempt=False for a non-failing CI event,
-        # which is what stops a green build from spawning a session behind you.
-        self.write([self.entry('github:o/*', ignoreSenders=['me'])])
+    def test_the_ci_exemption_is_expressible_as_a_rule(self):
+        # ...and more precisely than the carve-out ever was: it took every CI
+        # event from the muted sender, this takes only the failing ones.
+        self.write([self.entry('github:o/*', ignoreSenders=['me'], when={'any': [
+            {'path': 'event', 'notIn': ['workflow_run']},
+            {'path': 'workflow_run.conclusion', 'in': ['failure']}]})])
+        run = lambda concl: {'workflow_run': {'conclusion': concl}}
         self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
-                                              ci_exempt=False)['forward'])
-        # ...while somebody else's green build is not an echo of anything.
+                                              run('failure'))['forward'])
         self.assertTrue(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
-                                             ci_exempt=False)['forward'])
+                                             run('failure'))['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'other', 'workflow_run',
+                                              run('success'))['forward'])
 
     # -- when/drop payload predicates (0.11.0) -------------------------------
     def test_when_accepts_only_matching_payloads(self):
@@ -387,10 +405,9 @@ class TestRouteEvent(StateDirCase):
         payload = {'workflow_run': {'event': 'schedule'}}
         self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'workflow_run', payload)['forward'])
 
-    def test_declarative_entry_loses_the_ci_sender_exemption(self):
-        # The carve-out ("CI overrides a mute") is welded to ignoreSenders for
-        # legacy entries; a predicate entry writes its own policy, so the mute
-        # becomes a pure sender mute — even for a CI event.
+    def test_a_declarative_entry_mutes_its_sender_too(self):
+        # 0.11.0 suspended the CI carve-out for predicate entries; 0.23.0
+        # retired it for every entry. This pins the predicate half of that.
         self.write([self.entry('github:o/*', ignoreSenders=['me'],
                                when={'path': 'action', 'in': ['completed']})])
         self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'workflow_run',
@@ -440,56 +457,6 @@ class TestRouteEvent(StateDirCase):
         self.assertFalse(r['refused'])
 
 
-class TestCiOutcomeIsNews(StateDirCase):
-    """Only a terminal, non-success CI outcome overrides ignoreSenders on the
-    dispatch path — everything else is a lifecycle ping."""
-
-    def news(self, event, payload):
-        return self.mod.ci_outcome_is_news(event, payload)
-
-    def run_payload(self, action, conclusion):
-        p = {'action': action, 'workflow_run': {'name': 'CI', 'status': 'completed'}}
-        if conclusion is not None:
-            p['workflow_run']['conclusion'] = conclusion
-        return p
-
-    def test_failing_run_is_news(self):
-        for concl in ('failure', 'timed_out', 'action_required', 'startup_failure', 'stale'):
-            self.assertTrue(self.news('workflow_run', self.run_payload('completed', concl)), concl)
-
-    def test_green_and_lifecycle_are_not(self):
-        self.assertFalse(self.news('workflow_run', self.run_payload('completed', 'success')))
-        self.assertFalse(self.news('workflow_run', self.run_payload('completed', 'skipped')))
-        self.assertFalse(self.news('workflow_run', self.run_payload('completed', 'cancelled')))
-        self.assertFalse(self.news('workflow_run', self.run_payload('requested', None)))
-        self.assertFalse(self.news('workflow_run', self.run_payload('in_progress', None)))
-
-    def test_check_run_and_suite(self):
-        self.assertTrue(self.news('check_run', {'action': 'completed',
-                                                'check_run': {'conclusion': 'failure'}}))
-        self.assertFalse(self.news('check_run', {'action': 'created',
-                                                 'check_run': {'conclusion': None}}))
-        self.assertTrue(self.news('check_suite', {'action': 'completed',
-                                                  'check_suite': {'conclusion': 'timed_out'}}))
-
-    def test_status_and_deployment_status_use_state(self):
-        self.assertTrue(self.news('status', {'state': 'failure'}))
-        self.assertTrue(self.news('status', {'state': 'error'}))
-        self.assertFalse(self.news('status', {'state': 'success'}))
-        self.assertFalse(self.news('status', {'state': 'pending'}))
-        self.assertTrue(self.news('deployment_status', {'deployment_status': {'state': 'failure'}}))
-        self.assertFalse(self.news('deployment_status', {'deployment_status': {'state': 'success'}}))
-
-    def test_unknown_shape_counts_as_news(self):
-        # Never swallow a failure because GitHub moved a field.
-        self.assertTrue(self.news('workflow_run', {'action': 'completed'}))
-        self.assertTrue(self.news('workflow_run', {}))
-
-    def test_non_ci_events_are_not_its_business(self):
-        self.assertFalse(self.news('issues', {'action': 'opened'}))
-        self.assertFalse(self.news('', {}))
-
-
 class TestPeerScope(StateDirCase):
     """instances/<key>.<pid>.sock — the naming the ownership probe reads."""
 
@@ -533,29 +500,55 @@ class TestFilterClaims(StateDirCase):
             json.dump(body, f)
         return path
 
+    CLAIM = {'include': {'path': 'event', 'notIn': [None]}}
+
     def test_matches_and_misses(self):
-        path = self.write(['github:o/*'])
+        path = self.write([dict(topic='github:o/*', **self.CLAIM)])
         self.assertTrue(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run'))
         self.assertFalse(self.mod.filter_claims(path, 'github', 'other/r', 'x', 'workflow_run'))
+
+    def test_a_rule_less_entry_claims_nothing(self):
+        # Only a DECLARED claim counts, for every event kind since 0.23.0 (#16):
+        # a claim suppresses a standing watch, and "I am subscribed to this
+        # repo" is not precise enough to silence one. Through 0.22.x a CI event
+        # was the exception — any live peer on the topic claimed it — because a
+        # session had no way to name its own run; it names its branch now.
+        path = self.write(['github:o/*'])
+        self.assertFalse(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run'))
+        path = self.write([{'topic': 'github:o/*',
+                            'exclude': {'path': 'action', 'in': ['closed']}}],
+                          name='filter.excl.json')
+        self.assertFalse(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run'))
+
+    def test_a_branch_claim_covers_that_branchs_ci(self):
+        # The replacement for the retired CI regime: a session says which run
+        # is its own, which agent-box seeds at spawn (agent-box#251).
+        path = self.write([{'topic': 'github:o/*', 'include': {
+            'path': 'workflow_run.head_branch', 'in': ['fix/1-thing']}}])
+        mine = {'workflow_run': {'head_branch': 'fix/1-thing'}}
+        theirs = {'workflow_run': {'head_branch': 'master'}}
+        self.assertTrue(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run', mine))
+        self.assertFalse(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run', theirs))
 
     def test_missing_or_disabled_claims_nothing(self):
         # Deliberately NOT fail-open: a yes here suppresses a spawn.
         self.assertFalse(self.mod.filter_claims(
             os.path.join(self.state, 'nope.json'), 'github', 'o/r', 'x', 'workflow_run'))
-        path = self.write(['github:o/*'], enabled=False)
+        path = self.write([dict(topic='github:o/*', **self.CLAIM)], enabled=False)
         self.assertFalse(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run'))
 
     def test_expired_entry_claims_nothing(self):
         old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
-        path = self.write([{'topic': 'github:o/r', 'subscribedAt': old}], ttlHours=1)
+        path = self.write([dict(topic='github:o/r', subscribedAt=old, **self.CLAIM)], ttlHours=1)
         self.assertFalse(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run'))
 
     def test_probe_writes_nothing(self):
         # Looking at a subscription must not renew it or prune its neighbours.
         old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
-        path = self.write([{'topic': 'github:o/r', 'ttlHours': 0, 'subscribedAt': old,
-                            'lastActivityAt': old},
-                           {'topic': 'github:dead/r', 'subscribedAt': old}], ttlHours=1)
+        path = self.write([dict(topic='github:o/r', ttlHours=0, subscribedAt=old,
+                                lastActivityAt=old, **self.CLAIM),
+                           dict(topic='github:dead/r', subscribedAt=old, **self.CLAIM)],
+                          ttlHours=1)
         with open(path, encoding='utf-8') as f:
             before = f.read()
         self.assertTrue(self.mod.filter_claims(path, 'github', 'o/r', 'x', 'workflow_run'))
@@ -572,7 +565,7 @@ class TestCallTool(StateDirCase):
         self.assertNotIn('ttlHours', saved['topics'][0])  # inherits file default
 
     def test_dispatch_subscribe_defaults_to_pinned_shared_file(self):
-        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='watch')
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='watch', include=ANY_EVENT)
         self.assertIn('dispatch', out)
         self.assertIn('pinned (never expires)', out)
         saved = self.read_json('filter.dispatch.json')
@@ -581,7 +574,7 @@ class TestCallTool(StateDirCase):
         self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.testsess.json')))
 
     def test_dispatch_subscribe_explicit_ttl_wins(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', ttl_hours=8)
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', ttl_hours=8, include=ANY_EVENT)
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'][0]['ttlHours'], 8)
 
     def test_deliver_to_validation(self):
@@ -590,19 +583,19 @@ class TestCallTool(StateDirCase):
 
     def test_scopes_are_independent(self):
         self.call('webhook_subscribe', topic='o/r')
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         out = self.call('webhook_unsubscribe', topic='o/r', deliver_to='subagent')
         self.assertIn('unsubscribed from github:o/r [dispatch]', out)
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'], [])
         self.assertEqual(self.read_json('filter.testsess.json')['topics'][0]['topic'], 'github:o/r')
         # ... and the session unsubscribe does not touch dispatch either.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.call('webhook_unsubscribe', topic='o/r')
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'][0]['topic'], 'github:o/r')
 
     def test_subscriptions_lists_both_scopes(self):
         self.call('webhook_subscribe', topic='o/r', note='mine')
-        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent', note='watch')
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent', note='watch', include=ANY_EVENT)
         body = json.loads(self.call('webhook_subscriptions'))
         self.assertEqual(body['topics'][0]['topic'], 'github:o/r')
         self.assertEqual(body['dispatch']['topics'][0]['topic'], 'github:p/q')
@@ -656,17 +649,17 @@ class TestCallTool(StateDirCase):
                          self.call('webhook_subscribe', topic='github:defangdevs/*'))
 
     def test_subscriptions_warns_on_spawnless_receiver(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         with open(os.path.join(self.state, 'receiver.json'), 'w', encoding='utf-8') as f:
             json.dump({'pid': 1, 'version': '0.9.0', 'spawn': False}, f)
         body = json.loads(self.call('webhook_subscriptions'))
         self.assertIn('inert', body['dispatch']['warning'])
-        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.assertIn('WARNING', out)
 
     def test_renew_keeps_scope_fields(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='first')
-        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='first', include=ANY_EVENT)
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.assertIn('renewed subscription', out)
         saved = self.read_json('filter.dispatch.json')
         self.assertEqual(saved['topics'][0]['note'], 'first')
@@ -727,7 +720,7 @@ class TestCallTool(StateDirCase):
         saved = self.read_json('filter.testsess.json')['topics'][0]
         self.assertEqual(saved['exclude'], self.mod.DEFAULT_SESSION_EXCLUDE)
         # A dispatch (subagent) entry is unaffected -- it curates its own rules.
-        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent', include=ANY_EVENT)
         self.assertNotIn('exclude', self.read_json('filter.dispatch.json')['topics'][0])
 
     def test_default_noise_exclude_actually_suppresses_a_star_event(self):
@@ -768,7 +761,7 @@ class TestSessionSubscriptionLimits(StateDirCase):
     def test_dispatch_ttl_is_unbounded(self):
         cap = self.mod.MAX_SESSION_TTL_HOURS
         for ttl in (0, cap * 100):
-            out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', ttl_hours=ttl)
+            out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', ttl_hours=ttl, include=ANY_EVENT)
             self.assertNotIn('too long', out)
 
     def test_legacy_over_cap_entry_is_clamped_on_read(self):
@@ -787,7 +780,7 @@ class TestSessionSubscriptionLimits(StateDirCase):
         self.assertEqual([e['ttlHours'] for e in got['topics']], [cap, cap, 2])
 
     def test_dispatch_pinned_entry_survives_read(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         got = self.mod.read_filter(os.path.join(self.state, 'filter.dispatch.json'))
         self.assertEqual(got['topics'][0]['ttlHours'], 0)
 
@@ -815,7 +808,7 @@ class TestSessionSubscriptionLimits(StateDirCase):
         self.assertIn('too broad', out)
 
     def test_dispatch_prefix_topic_needs_no_include(self):
-        out = self.call('webhook_subscribe', topic='github:o/*', deliver_to='subagent')
+        out = self.call('webhook_subscribe', topic='github:o/*', deliver_to='subagent', include=ANY_EVENT)
         self.assertNotIn('too broad', out)
 
     def test_exact_topic_needs_no_include(self):
@@ -832,7 +825,7 @@ class TestDispatchEvent(StateDirCase):
                 'key': 'o/r', 'sender': 'x', 'delivery': 'd1', 'payload': p}
 
     def test_no_dispatcher_is_inert(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.assertIsNone(self.mod.DISPATCHER)
         self.mod.dispatch_event(self.env())  # must not raise
 
@@ -841,7 +834,7 @@ class TestDispatchEvent(StateDirCase):
         mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='cat > %s' % out,
                         LOCAL_WEBHOOK_STATE_DIR=self.state)
         self.mod = mod
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx', include=ANY_EVENT)
         mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
         # Poll for CONTENT, not existence: the shell creates the redirect
         # target before `cat` has written anything.
@@ -863,7 +856,7 @@ class TestDispatchEvent(StateDirCase):
         mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "META=$LOCAL_WEBHOOK_SPAWN_META"; } > %s' % out,
                         LOCAL_WEBHOOK_STATE_DIR=self.state)
         self.mod = mod
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx', include=ANY_EVENT)
         mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
         text = ''
         deadline = time.time() + 10
@@ -891,7 +884,7 @@ class TestDispatchEvent(StateDirCase):
         mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "META=$LOCAL_WEBHOOK_SPAWN_META"; } > %s' % out,
                         LOCAL_WEBHOOK_STATE_DIR=self.state)
         self.mod = mod
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='ctx', include=ANY_EVENT)
         env = {'source': 'github', 'format': 'github', 'event': 'issue_comment',
                'key': 'o/r', 'sender': 'x', 'delivery': 'd1',
                'payload': {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'x'},
@@ -937,7 +930,7 @@ class TestDispatchEvent(StateDirCase):
         mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='cat > %s' % out,
                         LOCAL_WEBHOOK_STATE_DIR=self.state)
         self.mod = mod
-        self.call('webhook_subscribe', topic='somewhere/else', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='somewhere/else', deliver_to='subagent', include=ANY_EVENT)
         env = self.env()
         mod.dispatch_event(env)
         time.sleep(0.3)
@@ -964,6 +957,13 @@ class DispatchCase(StateDirCase):
                         {'action': action,
                          'workflow_run': {'name': 'CI', 'status': action, 'conclusion': conclusion}},
                         sender=sender)
+
+    # What agent-box seeds into a session it spawns for a CI batch: "this
+    # session owns this repo's CI outcomes while it lives" (agent-box#251).
+    # Since 0.23.0 that seeded predicate is the ONLY thing that claims a CI
+    # event — the coarse "any peer subscribed to the topic" regime went with
+    # the CI vocabulary.
+    CI_CLAIM = {'include': {'path': 'workflow_run', 'notIn': [None]}}
 
     def fake_live_peer(self, key, topics):
         """A running process with an instances/<key>.<pid>.sock and a filter."""
@@ -997,86 +997,129 @@ class DispatchCase(StateDirCase):
 
 
 class TestDispatchBrakes(DispatchCase):
-    """A standing watch spawns for CI only on a failure (0.10.0, made
-    sender-independent in 0.10.1), and never while a live session peer is
-    already subscribed to the topic (0.10.0)."""
+    """What a standing watch does and does not spawn for. Since 0.23.0 the
+    policy half is entirely the watch's own rules (#16); the mechanism half —
+    never spawn for an event a live session peer has declared — stays."""
 
-    # -- brake 1: CI events spawn only on a failure --------------------------
-    def test_failing_run_spawns(self):
+    # -- brake 1: a watch must declare what deserves a session ---------------
+    def test_a_rule_less_watch_spawns_nothing(self):
+        # The retirement's fail-closed side. A rule-less entry used to inherit
+        # this repo's own GitHub policy (spawn for a FAILING CI outcome); with
+        # that gone it declares nothing, so it gets nothing — rather than
+        # spawning a session per event on the topic, which is what "no filter"
+        # would otherwise mean. Written by hand because webhook_subscribe now
+        # refuses to create one; this is the pre-0.23.0 file on disk.
+        with open(os.path.join(self.state, 'filter.dispatch.json'), 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'topics': [{'topic': 'github:o/r'}]}, f)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.mod.dispatch_event(self.run_env('failure'))
+        self.spawned(False)
+        # ...and says which silence this is: a watch that never spawns reads
+        # exactly like a broken one otherwise (agent-box#170).
+        self.assertIn('declares no include/exclude rules', err.getvalue())
+
+    def test_subscribe_refuses_a_rule_less_watch(self):
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                        note='standing watch')
+        self.assertTrue(out.startswith('error: a standing watch'), out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.dispatch.json')))
+        # An exclude alone is a policy too — it says what NOT to spawn for.
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                        exclude={'path': 'action', 'in': ['closed']})
+        self.assertIn('subscribed to github:o/r', out)
+        # A session subscription is unaffected: rule-less there means
+        # "everything on this topic", which is what working in a repo wants.
+        self.assertIn('subscribed to github:o/r',
+                      self.call('webhook_subscribe', topic='o/r'))
+
+    def test_subscriptions_names_a_rule_less_watch_as_inert(self):
+        # An operator asking "is my watch working?" reads this listing; a watch
+        # that silently spawns nothing must not read like one that works.
+        with open(os.path.join(self.state, 'filter.dispatch.json'), 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'topics': [{'topic': 'github:o/r'}]}, f)
+        out = self.call('webhook_subscriptions')
+        self.assertIn('rulelessTopics', out)
+        self.assertIn('spawn NOTHING', out)
+
+    def test_a_renew_may_not_strip_the_rules_off_a_watch(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include={})
+        self.assertTrue(out.startswith('error: a standing watch'), out)
+        self.assertIsNotNone(self.read_json('filter.dispatch.json')['topics'][0]['include'])
+
+    # The failures-only CI brake this version retired, written as what it
+    # always was: one consumer's policy. These four pin that the rules can
+    # express it exactly — and, unlike the brake, can also disagree with it.
+    CI_FAILURES = {'include': {'path': 'workflow_run.conclusion',
+                               'in': ['failure', 'timed_out', 'action_required',
+                                      'startup_failure', 'stale']}}
+
+    def test_declared_failures_spawn(self):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
-                  ignore_senders=['me'])
-        self.mod.dispatch_event(self.run_env('failure'))
-        self.spawned(True, 'workflow "CI"')
-
-    def test_green_run_from_ignored_sender_does_not_spawn(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
-                  ignore_senders=['me'])
-        self.mod.dispatch_event(self.run_env('success'))
-        self.spawned(False)
-
-    def test_lifecycle_ping_from_ignored_sender_does_not_spawn(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
-                  ignore_senders=['me'])
-        self.mod.dispatch_event(self.run_env(None, action='requested'))
-        self.spawned(False)
-
-    def test_green_run_from_an_unignored_sender_does_not_spawn(self):
-        # 0.10.1 reversal: through 0.10.0 the outcome only decided whether a CI
-        # event could override ignoreSenders, so a green run from a sender the
-        # watch did not name spawned a session — and a watch on a repo whose
-        # humans push under their own logins names nobody. The sender was never
-        # the question: no green build is worth an agent, whoever triggered it.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
-                  ignore_senders=['me'])
-        self.mod.dispatch_event(self.run_env('success', sender='someone'))
-        self.spawned(False)
-
-    def test_green_run_spawns_nothing_with_no_ignore_list_at_all(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
-        self.mod.dispatch_event(self.run_env('success', sender='someone'))
-        self.spawned(False)
-
-    def test_cancelled_and_lifecycle_from_an_unignored_sender_do_not_spawn(self):
-        # One merge emits a supersede-cancelled run and several lifecycle pings;
-        # a cancelled run is not a failure — its successor reports the verdict.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
-        self.mod.dispatch_event(self.run_env('cancelled', sender='someone'))
-        self.spawned(False)
-        self.mod.dispatch_event(self.run_env(None, action='in_progress', sender='someone'))
-        self.spawned(False)
-
-    def test_green_check_run_from_an_unignored_sender_does_not_spawn(self):
-        # The exact shape that spawned a session on this box: a merge to master
-        # fanned out check_run.completed/success per job.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
-        self.mod.dispatch_event(self.env('check_run', {
-            'action': 'completed',
-            'check_run': {'name': 'build', 'status': 'completed', 'conclusion': 'success'},
-        }, sender='someone'))
-        self.spawned(False)
-
-    def test_failing_run_from_an_unignored_sender_spawns(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+                  ignore_senders=['me'], **self.CI_FAILURES)
         self.mod.dispatch_event(self.run_env('failure', sender='someone'))
         self.spawned(True, 'workflow "CI"')
 
+    def test_green_and_lifecycle_runs_do_not_spawn_under_those_rules(self):
+        # The shapes that used to cost a session each before 0.10.1: a merge to
+        # master fans out check_run.completed/success per job plus a green
+        # workflow_run, and a superseded run reports itself cancelled.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', **self.CI_FAILURES)
+        for env in (self.run_env('success', sender='someone'),
+                    self.run_env('cancelled', sender='someone'),
+                    self.run_env(None, action='in_progress', sender='someone'),
+                    self.env('check_run', {
+                        'action': 'completed',
+                        'check_run': {'name': 'build', 'status': 'completed',
+                                      'conclusion': 'success'}}, sender='someone')):
+            self.mod.dispatch_event(env)
+            self.spawned(False)
+
+    def test_an_ignored_sender_is_muted_even_for_a_failure(self):
+        # 0.23.0: the mute is literal on this path too. A watch that wants its
+        # own failing runs writes the sender rule into the predicate instead —
+        # the next test — where it applies to failures and not to echoes.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  ignore_senders=['me'], **self.CI_FAILURES)
+        self.mod.dispatch_event(self.run_env('failure', sender='me'))
+        self.spawned(False)
+
+    def test_a_watch_may_ask_for_what_the_brake_would_have_dropped(self):
+        # Impossible before 0.23.0 for a rule-less watch: green runs, and from
+        # a sender it otherwise ignores. The consumer owns the whole verdict.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  include={'path': 'workflow_run.conclusion', 'in': ['success']})
+        self.mod.dispatch_event(self.run_env('success', sender='me'))
+        self.spawned(True, 'workflow "CI"')
+
     # -- brake 2: a live session that owns the topic suppresses the spawn ----
-    def test_ci_event_suppressed_while_a_live_session_is_subscribed(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
-        self.fake_live_peer('peer1', ['github:o/*'])
+    def test_ci_event_suppressed_while_a_live_session_claims_it(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
         self.mod.dispatch_event(self.run_env('failure'))
         self.spawned(False)
 
-    def test_ci_event_spawns_when_the_subscribed_session_is_elsewhere(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
-        self.fake_live_peer('peer1', ['github:other/*'])
+    def test_ci_event_spawns_when_the_claiming_session_is_elsewhere(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        self.fake_live_peer('peer1', [dict(topic='github:other/*', **self.CI_CLAIM)])
+        self.mod.dispatch_event(self.run_env('failure'))
+        self.spawned(True, 'workflow "CI"')
+
+    def test_a_rule_less_peer_does_not_claim_a_ci_event_either(self):
+        # The half 0.23.0 changed: through 0.22.x any live peer subscribed to
+        # the topic silenced the watch for every CI event on it, whether or not
+        # it had said the run was its own. That was the last place a bare
+        # repo-wide subscription could mute a watch.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        self.fake_live_peer('peer1', ['github:o/*'])
         self.mod.dispatch_event(self.run_env('failure'))
         self.spawned(True, 'workflow "CI"')
 
     def test_non_ci_event_spawns_even_when_a_session_owns_the_repo(self):
         # Ownership is object-granular, topics are repo-granular: a session
         # working one PR must not silence new work in the same repo.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', ['github:o/*'])
         self.mod.dispatch_event(self.env('issues', {'action': 'opened',
                                                     'issue': {'number': 9, 'title': 't'}}))
@@ -1097,13 +1140,13 @@ class TestDispatchBrakes(DispatchCase):
         # the session that OPENED that PR was live — twice in one hour, and the
         # first duplicate pushed to the branch the live one owned. The CI brake
         # never looked, because a review is not a CI event.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.PR_RULE)])
         self.mod.dispatch_event(self.review_env())
         self.spawned(False)
 
     def test_a_declared_peer_claims_only_what_it_declared(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.PR_RULE)])
         self.mod.dispatch_event(self.review_env(number=999))
         self.spawned(True, 'review approved')
@@ -1112,7 +1155,7 @@ class TestDispatchBrakes(DispatchCase):
         # The seeded default noise-exclude must never read as ownership, or
         # every session becomes an owner of its whole repo the moment it
         # subscribes — which is the same repo-wide silence #16 warns about.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', [{'topic': 'github:o/*',
                                        'exclude': {'path': 'action', 'in': ['closed']}}])
         self.mod.dispatch_event(self.review_env())
@@ -1122,7 +1165,7 @@ class TestDispatchBrakes(DispatchCase):
         # The regression #16 warns about: honouring a repo-wide, rule-less
         # entry as a claim would let one hook session silence the watch for
         # every issue and PR in that repo until it exits.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', ['github:o/*'])
         self.mod.dispatch_event(self.review_env())
         self.spawned(True, 'review approved')
@@ -1130,37 +1173,38 @@ class TestDispatchBrakes(DispatchCase):
     def test_a_declared_claim_does_not_silence_other_work_in_the_repo(self):
         # Same property test_non_ci_event_spawns_even_when_a_session_owns_the_repo
         # pins, now with a peer that DID declare: new work still spawns.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.PR_RULE)])
         self.mod.dispatch_event(self.env('issues', {'action': 'opened',
                                                     'issue': {'number': 9, 'title': 't'}}))
         self.spawned(True, 'issue #9 opened')
 
     def test_a_declared_claim_under_another_topic_is_not_ownership(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.fake_live_peer('peer1', [dict(topic='github:other/*', **self.PR_RULE)])
         self.mod.dispatch_event(self.review_env())
         self.spawned(True, 'review approved')
 
     def test_an_expired_declared_claim_does_not_suppress(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
         self.fake_live_peer('peer1', [dict(topic='github:o/*', subscribedAt=old, **self.PR_RULE)])
         self.mod.dispatch_event(self.review_env())
         self.spawned(True, 'review approved')
 
     def test_expired_session_subscription_does_not_suppress(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
-        self.fake_live_peer('peer1', [{'topic': 'github:o/*', 'subscribedAt': old}])
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', subscribedAt=old,
+                                           **self.CI_CLAIM)])
         self.mod.dispatch_event(self.run_env('failure'))
         self.spawned(True, 'workflow "CI"')
 
 
 class TestDispatchDeclarative(DispatchCase):
-    """A watch carrying when/drop predicates (0.11.0) owns its spawn policy:
-    the failures-only CI brake steps aside for it, while the live-peer
-    suppression — coordination, not policy — still applies."""
+    """A watch's when/drop predicates (0.11.0) ARE its spawn policy — since
+    0.23.0 there is nothing else — while the live-peer suppression, which is
+    coordination rather than policy, still applies."""
 
     RULES = {'when': {'any': [
         {'all': [{'path': 'action', 'in': ['opened', 'reopened']},
@@ -1195,8 +1239,8 @@ class TestDispatchDeclarative(DispatchCase):
         self.mod.dispatch_event(self.run_env('failure', sender='box'))
         self.spawned(True, 'workflow "CI"')
 
-    def test_rules_may_spawn_what_the_brake_would_drop(self):
-        # The proof the predicate REPLACES the failures-only brake: a watch
+    def test_rules_may_spawn_what_the_old_brake_would_have_dropped(self):
+        # The proof the predicate REPLACED the failures-only brake: a watch
         # that explicitly asks for green runs gets them.
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
                   when={'path': 'workflow_run.conclusion', 'in': ['success']})
@@ -1205,7 +1249,7 @@ class TestDispatchDeclarative(DispatchCase):
 
     def test_live_peer_still_suppresses_a_declarative_ci_spawn(self):
         self.watch()
-        self.fake_live_peer('peer1', ['github:o/*'])
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
         self.mod.dispatch_event(self.run_env('failure'))
         self.spawned(False)
 
@@ -1271,24 +1315,29 @@ class TestDispatchFollowupOwnership(DispatchCase):
         })
 
     def test_one_failing_run_costs_one_session_not_two(self):
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.mod.dispatch_event(self.run_env('failure'))     # nobody owns it: spawn 1
         self.wait_for_spawns(1)
         self.mod.dispatch_event(self.check_run_failure())    # same run, peer not up yet
-        self.fake_live_peer('peer1', ['github:o/*'])         # spawn 1's session claims it
+        # spawn 1's session comes up and claims this repo's CI outcomes — the
+        # claim agent-box seeds for a session it starts on a CI batch.
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', include={'any': [
+            {'path': 'workflow_run', 'notIn': [None]},
+            {'path': 'check_run', 'notIn': [None]}]})])
         time.sleep(3.5)                                      # window opens; batch re-checked
         self.assertEqual(self.spawns(), 1)
 
-    def test_a_queued_non_ci_event_still_spawns_its_own_session(self):
+    def test_a_queued_new_issue_still_spawns_its_own_session(self):
         # Ownership is object-granular and topics are repo-granular, so the
-        # re-check must stay scoped to CI exactly like the arrival check: a new
-        # issue arriving in the same burst is new work, not a duplicate.
-        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent')
+        # re-check asks the same question the arrival check does — does a live
+        # peer CLAIM this event — and a session holding one failing run has
+        # claimed nothing about a new issue arriving in the same burst.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.mod.dispatch_event(self.run_env('failure'))
         self.wait_for_spawns(1)
         self.mod.dispatch_event(self.env('issues', {'action': 'opened',
                                                     'issue': {'number': 9, 'title': 't'}}))
-        self.fake_live_peer('peer1', ['github:o/*'])
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
         self.wait_for_spawns(2)
         with open(self.log, encoding='utf-8') as f:
             self.assertIn('issue #9 opened', f.read())
@@ -1682,6 +1731,11 @@ class TestEndToEnd(unittest.TestCase):
         conn.close()
         return out
 
+    # A watch must declare rules (0.23.0); this is the widest one, i.e. the
+    # rule-less shape written out. Tests about something else pass it so they
+    # can stay about that something else.
+    ANY_EVENT_JSON = json.dumps(ANY_EVENT)
+
     ISSUE = {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'someone'},
              'action': 'opened', 'issue': {'number': 5, 'title': 'title here',
                                            'html_url': 'https://x/5'}}
@@ -1721,7 +1775,8 @@ class TestEndToEnd(unittest.TestCase):
 
     def test_dispatch_spawns_and_peer_fanout_and_isolation(self):
         # Standing watch via CLI (what a session's tool call writes).
-        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch')
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',
+                     '--include', self.ANY_EVENT_JSON)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(b'pinned', r.stdout)
         # A session peer subscribed to a DIFFERENT repo.
@@ -1768,40 +1823,42 @@ class TestEndToEnd(unittest.TestCase):
                 'workflow_run': {'name': 'CI', 'status': action, 'conclusion': conclusion,
                                  'head_branch': 'main', 'html_url': 'https://x/run/1'}}
 
-    def test_dispatch_ci_brakes_end_to_end(self):
-        """Real signed deliveries: a standing watch must not spawn for a green
-        run — from an ignored sender or any other (0.10.1) — nor for a failure a
-        live session is already subscribed to, but must spawn once it is gone."""
+    def test_dispatch_policy_and_ownership_end_to_end(self):
+        """Real signed deliveries: a standing watch spawns for what its own
+        rules ask for and nothing else (0.23.0 — the failures-only CI brake
+        that used to be built in, written as the watch's policy), and never
+        for a run a live session has CLAIMED, but takes over once it is gone."""
         r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent',
-                     '--ignore-sender', 'someone', '--note', 'standing watch')
+                     '--note', 'standing watch',
+                     '--include', json.dumps({
+                         'path': 'workflow_run.conclusion',
+                         'in': ['failure', 'timed_out', 'startup_failure']}))
         self.assertEqual(r.returncode, 0, r.stderr)
-        # The session that OWNS this repo's work right now.
-        r = self.cli('subscribe', 'o/r', '--note', 'driving PR 1', session='ownersess')
+        # The session that OWNS this run right now says so by naming the branch
+        # — the claim that replaced "any peer subscribed to the topic".
+        r = self.cli('subscribe', 'o/r', '--note', 'driving PR 1',
+                     '--include', json.dumps({'path': 'workflow_run.head_branch',
+                                              'in': ['main']}),
+                     session='ownersess')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.start_daemon()
 
-        # Brake 1, the 0.10.1 half: a green run from a sender the watch does NOT
-        # ignore. No peer is live yet, so the outcome is the only thing that can
-        # be suppressing this spawn.
+        # Policy: a green run is not what this watch asked for. No peer is live
+        # yet, so the rules are the only thing that can be suppressing it.
         self.assertEqual(self.post(self.run_payload('success', sender='outsider'),
                                    event='workflow_run')[0], 200)
         time.sleep(1)
         self.assertFalse(os.path.exists(self.spawn_log),
-                         'green run from an unignored sender spawned a session')
+                         'green run spawned a session the watch never asked for')
 
         peer = self.start_peer('ownersess')
 
-        # Brake 1: green run from the ignored sender — nothing to spawn for.
-        self.assertEqual(self.post(self.run_payload('success'), event='workflow_run')[0], 200)
-        time.sleep(1)
-        self.assertFalse(os.path.exists(self.spawn_log), 'green run spawned a session')
-
-        # Brake 2: a real FAILURE, but the owning session is live and subscribed,
-        # so it is already getting this delivery — still no spawn.
+        # Coordination: a real FAILURE, but the owning session claimed this
+        # branch's runs and is already getting the delivery — still no spawn.
         self.assertEqual(self.post(self.run_payload('failure'), event='workflow_run')[0], 200)
         time.sleep(1)
         self.assertFalse(os.path.exists(self.spawn_log),
-                         'spawned while a live session owned the topic')
+                         'spawned while a live session claimed the run')
         # ...and it really did reach that session.
         line = [None]
 
@@ -1814,16 +1871,32 @@ class TestEndToEnd(unittest.TestCase):
         self.assertTrue(line[0], 'owning session never got the CI event')
         self.assertIn('workflow "CI"', json.loads(line[0].decode())['params']['content'])
 
-        # Session gone: nobody owns the repo, so the watch takes over. The
+        # Session gone: nobody claims the run, so the watch takes over. The
         # stale socket is still on disk — liveness is the pid, not the file.
         peer.kill()
         peer.wait()
         self.assertEqual(self.post(self.run_payload('failure'), event='workflow_run')[0], 200)
         self.assertTrue(self.wait_file(self.spawn_log, contains='workflow "CI"'),
-                        'no spawn once the owning session was gone')
+                        'no spawn once the claiming session was gone')
+
+    def test_a_rule_less_watch_spawns_nothing_end_to_end(self):
+        """The other half of 0.23.0, through the real path: the CLI refuses to
+        create a rule-less watch, and one left on disk by an older version
+        matches nothing rather than everything."""
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'no rules')
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(b'needs include/exclude rules', r.stdout)
+        with open(os.path.join(self.state, 'filter.dispatch.json'), 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'topics': [{'topic': 'github:o/r',
+                                                    'note': 'pre-0.23.0 watch'}]}, f)
+        self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+        time.sleep(1)
+        self.assertFalse(os.path.exists(self.spawn_log),
+                         'a watch that declares nothing spawned a session')
 
     def test_dispatch_inert_without_spawn_cmd(self):
-        self.cli('subscribe', 'o/r', '--deliver-to', 'subagent')
+        self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--include', self.ANY_EVENT_JSON)
         env = self.base_env(LOCAL_WEBHOOK_RECEIVER_ONLY='1', LOCAL_WEBHOOK_HTTP_SOCK=self.http_sock)
         p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1849,7 +1922,8 @@ class TestEndToEnd(unittest.TestCase):
             f.write('if [ ! -f %s ]; then cat > /dev/null; : > %s; '
                     'echo "at the hook-session cap"; exit 75; fi\n'
                     'cat >> %s\n' % (declined, declined, self.spawn_log))
-        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch')
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',
+                     '--include', self.ANY_EVENT_JSON)
         self.assertEqual(r.returncode, 0, r.stderr)
         # Window 0: the retry rides the re-pump _run already does when a slot
         # frees, so the test needs no new timer either.
@@ -1939,7 +2013,8 @@ class TestEndToEnd(unittest.TestCase):
         self.add_source('budget', keyPath='window')
         r = self.cli('subscribe', 'budget:5h', '--note', 'usage-limit warnings', session='peersess')
         self.assertEqual(r.returncode, 0, r.stderr)
-        r = self.cli('subscribe', 'budget:5h', '--deliver-to', 'subagent', '--note', 'budget watch')
+        r = self.cli('subscribe', 'budget:5h', '--deliver-to', 'subagent', '--note', 'budget watch',
+                     '--include', self.ANY_EVENT_JSON)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.start_daemon()
         peer = self.start_peer('peersess')
@@ -2010,7 +2085,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn(b'could not reach', r.stderr)
 
     def test_cli_status_shape(self):
-        self.cli('subscribe', 'o/r', '--deliver-to', 'subagent')
+        self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--include', self.ANY_EVENT_JSON)
         r = self.cli('status')
         body = json.loads(r.stdout.decode())
         self.assertEqual(body['dispatchTopicCount'], 1)

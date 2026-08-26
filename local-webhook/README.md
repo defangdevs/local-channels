@@ -109,12 +109,16 @@ org-wide standing watch is its intended shape.
 An entry may also be an object with `ignoreSenders`: events on that topic whose
 sender matches are dropped as echoes of the session's own actions (pass
 `ignore_senders` to `webhook_subscribe`, or hand-edit). `"@self"` resolves to
-`LOCAL_WEBHOOK_SELF`. **CI-outcome events** (`workflow_run`, `workflow_job`,
-`check_run`, `check_suite`, `status`, `deployment_status`) are exempt from
-sender-ignore: their sender is merely who triggered the run, and muting your
-own login must not mute CI results for your own pushes. A
-`deliver_to:"subagent"` watch is stricter still: there a CI event spawns only on
-a *failing* outcome, sender irrelevant (0.10.1) — see
+`LOCAL_WEBHOOK_SELF`. Since 0.23.0 this is a **pure sender mute**, with no
+exemption for any event. Through 0.22.x a hardcoded set of GitHub CI-outcome
+events (`workflow_run`, `check_run`, …) overrode it — their sender is merely
+who triggered the run, so muting your own login also muted your own build
+results — and the dispatch path carried the mirror image: a CI event spawned a
+session only on a *failing* outcome. Both were this plugin holding one
+consumer's policy, and both are retired (#16). Say it in the rules instead: an
+entry that wants its own failing runs through a sender mute writes
+`{"path": "workflow_run.conclusion", "in": ["failure"]}` under `include`, which
+is also more precise than the carve-out ever was — see
 [Dispatch](#dispatch-delivery-into-a-fresh-session-090).
 
 ```json
@@ -187,13 +191,12 @@ somebody else's comment body would stall the daemon.
   "exclude": { "path": "action", "in": ["closed", "merged"] } }
 ```
 
-An entry carrying `include`/`exclude` is **declarative**: its rules were
-written by whoever configured it, so the built-in CI carve-outs step aside for
-that entry — the sender-ignore exemption here, and on the dispatch path the
-failures-only brake (the live-session suppression is coordination, not policy,
-and still applies). Express sender muting *inside* the predicate (as above)
-rather than combining with `ignoreSenders`, which on a declarative entry is a
-pure mute that would silence even that sender's CI failures.
+These rules are the **whole policy**: since 0.23.0 nothing built in adds to
+them or steps aside for them, and a `deliver_to:"subagent"` watch cannot be
+created without them (the live-session suppression on the dispatch path is
+coordination, not policy, and still applies). Express sender muting *inside*
+the predicate (as above) rather than combining with `ignoreSenders`, which is a
+blunt mute that also silences that sender's CI failures.
 
 `webhook_subscribe` takes the predicates as `include` / `exclude` (CLI:
 `--include` / `--exclude` with a JSON argument; `when`/`drop` still work as
@@ -350,67 +353,80 @@ Differences from session routing, all deliberate:
   first. The HTTP response is unaffected: `deliver()` still answers `200 ok`,
   because the dispatch verdict is asynchronous and the HMAC and the peer
   fan-out really did succeed.
-- **A waiting batch is re-checked before it spawns (0.11.1).** CI lines in a
-  follow-up batch are put to the live-peer question again the moment the batch
-  starts, and dropped if a session now owns them. One failing run emits both
+- **A waiting batch is re-checked before it spawns (0.11.1).** Every line in a
+  follow-up batch is put to the live-peer question again the moment the batch
+  starts, and dropped if a session now claims it. One failing run emits both
   `check_run.completed` and `workflow_run.completed`; the second arrives while
   the first spawn's session is still booting, so the arrival-time answer is
   "nobody owns this" and the window then defers it for a full 60 s — long after
-  that session opened its peer socket and claimed the topic. Without the
-  re-check every failing run cost exactly two sessions, ~60 s apart. Only CI
-  lines are re-examined, and only in a follow-up batch: the first event on an
-  idle key still spawns immediately.
-- **CI events only spawn on a failure (0.10.0, sender-independent since
-  0.10.1).** A run reports itself queued, in progress, cancelled and
-  finished-fine, and none of those justify a whole session — so on this path a CI
-  event spawns only for a terminal non-success outcome (`failure`, `timed_out`,
-  `action_required`, `startup_failure`, `stale`, and `error`/`failure` for
-  `status` / `deployment_status`), whoever triggered the run. A failure
-  additionally overrides `ignoreSenders`, because your own build breaking is
-  news. 0.10.0 had only that override, which made the rule accidentally
-  sender-dependent: a watch on repos whose humans push under their own logins
-  ignores nobody relevant, so every green `check_run.completed` and
-  `workflow_run` success on a merge still took a session slot to conclude
-  "nothing to do". Session delivery keeps the unconditional exemption — "merge on
-  green" wants exactly that green run. An outcome the payload does not state
-  counts as a failure: a swallowed break is the one error worth avoiding twice
-  over. A watch carrying [`include`/`exclude` predicates](#include--exclude-payload-predicates-0110-renamed-from-whendrop-in-0140)
-  replaces this brake with its own rules (0.11.0): the consumer owns the whole
-  spawn decision, including whether a green run is news to it. Either way an
-  event a watch declines is logged to stderr — a deliberate drop must stay
-  distinguishable from a watch that quietly broke.
+  that session opened its peer socket and declared the topic. Without the
+  re-check every failing run cost exactly two sessions, ~60 s apart. Only a
+  follow-up batch is re-examined: the first event on an idle key still spawns
+  immediately.
+- **A watch with no rules spawns nothing (0.23.0).** Every event a watch
+  matches costs a whole agent session, so the watch has to say which events are
+  worth one: a dispatch entry carrying neither `include` nor `exclude` matches
+  nothing, `webhook_subscribe` refuses to create one, and each declined event
+  is logged to stderr naming the reason. Through 0.22.x such an entry inherited
+  a built-in brake instead — a GitHub CI-outcome event spawned only for a
+  terminal non-success (`failure`, `timed_out`, `action_required`,
+  `startup_failure`, `stale`, plus `error` for `status`/`deployment_status`),
+  and an unstated outcome counted as a failure. That default was useful and
+  wrong in the same way: useful because it stopped a session per green build,
+  wrong because a source-agnostic bus was deciding, for one source, which
+  events matter, and a consumer that disagreed could not override it without
+  writing rules that made the default moot anyway. Write the same policy as a
+  predicate and it is visible, per-watch and yours (#16):
+
+  ```json
+  { "any": [ { "path": "action", "in": ["opened", "reopened"] },
+             { "path": "workflow_run.conclusion",
+               "in": ["failure", "timed_out", "startup_failure", "stale"] } ] }
+  ```
+
+  On agent-box that policy lives in `services.agent-box.webhook.watchPolicy`,
+  which re-applies it to the box's own watches whenever the receiver daemon
+  starts.
 - **A live owner suppresses the spawn (0.10.0).** A standing watch is for events
-  nobody owns, so before spawning for a CI event the ingress owner asks whether
-  a live session peer's own filter already covers it — if so, that session is
-  getting this delivery and a second agent on the same PR (sharing one working
-  tree) is not help. Liveness comes from the peer's `instances/<key>.<pid>.sock`
+  nobody owns, so before spawning the ingress owner asks whether a live session
+  peer's own filter already claims this event — if so, that session is getting
+  this delivery and a second agent on the same PR (sharing one working tree) is
+  not help. Liveness comes from the peer's `instances/<key>.<pid>.sock`
   entry, pid-checked, so a crashed session cannot mute a watch; the probe is
   read-only, so it never renews the subscription it consults. Suppression is
-  logged. **Two regimes, split by precision (0.19.0).** A CI event is claimed by
-  any live peer subscribed to the topic — coarse, but a build result is
-  repo-shaped anyway. Every other event is claimed only by a peer whose entry
-  carries an `include` predicate: a session that declared what it is working on
-  has said something precise enough to act on, while a bare repo-wide entry has
-  not. An `exclude` never claims — a new session subscription is seeded with the
-  default noise-exclude, so counting those would make every session an owner. That is the difference between "a session
-  is watching this repo" and "a session is working this PR", and it is why
-  `issues.opened` still spawns while a session holds one PR (#16 — honouring a
-  rule-less entry for every event would silence the watch for the whole repo
-  until that session exits).
+  logged. **A claim must be declared (0.19.0, unified in 0.23.0).** An event is
+  claimed only by a live peer whose entry carries an `include` predicate that
+  matches it: a session that declared what it is working on has said something
+  precise enough to act on, while a bare repo-wide entry has not. An `exclude`
+  never claims — a new session subscription is seeded with the default
+  noise-exclude, so counting those would make every session an owner. That is
+  the difference between "a session is watching this repo" and "a session is
+  working this PR", and it is why `issues.opened` still spawns while a session
+  holds one PR (#16 — honouring a rule-less entry for every event would silence
+  the watch for the whole repo until that session exits). Until 0.22.x a
+  CI-outcome event took a coarser route (any live peer on the topic claimed
+  it), because a session had no way to claim its own run; 0.23.0 dropped that
+  along with the rest of the CI vocabulary, so a session claims its build by
+  naming its branch — `{"path": "workflow_run.head_branch", "in": ["fix/…"]}` —
+  and agent-box seeds exactly such a claim into every session it spawns
+  (agent-box#251).
 
   So a session that wants to stop the watch from starting a second agent onto
   its work says what its work is:
 
   ```
   webhook_subscribe(topic="defangdevs/agent-box",
-                    include={"path": "pull_request.number", "in": [317]},
+                    include={"any": [{"path": "pull_request.number", "in": [317]},
+                                     {"path": "workflow_run.head_branch",
+                                      "in": ["fix/317-thing"]}]},
                     note="PR #317: waiting on CI + review")
   ```
 
   This also narrows what that session receives, which is usually what it wanted
   anyway. Before 0.18.0 the probe was gated on `event in CI_EVENTS`, so a review
   or a comment on work a live session held spawned a duplicate session
-  regardless (agent-box#319).
+  regardless (agent-box#319); since 0.23.0 the same predicate is what claims
+  that PR's CI too, which is why the example names the branch as well.
 
 ### Per-identity filters
 
@@ -430,7 +446,9 @@ the two paths can't drift on TTL/renew semantics:
     python3 webhook.py subscribe owner/repo --note "waiting on PR 146 CI" --ttl 8
     python3 webhook.py subscribe 'github:defangdevs/*' --ignore-sender @self
     python3 webhook.py subscribe 'github:defangdevs/*' --deliver-to subagent \
-        --note "standing watch: new issues/PRs spawn a fresh session"
+        --include '{"any":[{"path":"action","in":["opened","reopened"]},
+                           {"path":"workflow_run.conclusion","in":["failure"]}]}' \
+        --note "standing watch: new issues/PRs and failing CI spawn a fresh session"
     python3 webhook.py ls
     python3 webhook.py unsubscribe owner/repo
     python3 webhook.py status        # state dir, session, sources (no secrets)

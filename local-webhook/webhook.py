@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.22.0'
+VERSION = '0.23.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -245,14 +245,17 @@ def verify(secret, sig_header, body):
 #         "note": "waiting on CI for PR 42", "subscribedAt": "2026-07-16T..." } ] }
 # A string entry forwards everything on the topic; an object entry can list
 # senders whose events are dropped as echoes of this session's own actions
-# ("@self" resolves to LOCAL_WEBHOOK_SELF). CI-outcome events are EXEMPT from
-# sender-ignore: GitHub stamps workflow_run etc. with whoever triggered the
-# run, so muting your own login would also mute CI results for your own pushes
-# — the main thing the channel exists to deliver. That exemption is
-# unconditional for session delivery (one extra message, in a session that
-# asked for the repo). Dispatch is stricter than an exemption: there a CI event
-# spawns only on a FAILURE, sender irrelevant, because the same event costs a
-# whole spawned session — see ci_outcome_is_news and dispatch_event.
+# ("@self" resolves to LOCAL_WEBHOOK_SELF) — a PURE sender mute since 0.23.0,
+# with no carve-out for any event.
+#
+# Through 0.22.x this repo carried a hardcoded set of GitHub CI-outcome events
+# that overrode the mute (GitHub stamps workflow_run and friends with whoever
+# triggered the run, so muting your own login also muted your own build
+# results), and dispatch carried its mirror image: a CI event spawned a session
+# only on a FAILURE. Both were this repo holding one consumer's policy, and
+# both are gone (#16). An entry now says what it wants with include/exclude
+# predicates, and a sender rule meant for some events and not others is written
+# positionally ({path: "sender.login", notIn: [...]}) instead of inherited.
 # Missing file, bad JSON, or missing keys forward NOTHING (0.13.0); the two
 # error states stay distinguishable for reporting — see read_filter.
 #
@@ -323,15 +326,16 @@ FILTER_COMMENT = (
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
     "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; entries {topic, note, "
     "ignoreSenders, include, exclude, ttlHours, "
-    "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; "
-    "CI-outcome events like workflow_run are never sender-ignored on this path) and expire ttlHours after "
+    "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; a pure "
+    "sender mute since 0.23.0 — no event overrides it, so keep CI results by writing the sender rule inside "
+    "the predicate instead) and expire ttlHours after "
     "subscribedAt (per-entry ttlHours beats the top-level one; 0 = never; the clock resets on re-subscribe "
     "and on 'warm' deliveries <10min after the previous one, or on EVERY delivery when renewOnEvent:true; "
     "entries without timestamps don't expire until a write stamps them). Optional include/exclude are payload "
     "predicates ({any/all: [...]} over {path, in/notIn} whole-value leaves and {path, "
     "contains/notContains} case-insensitive substring leaves, and path may address \"event\"): exclude refuses "
-    "matching events, include accepts ONLY matching ones, and an entry carrying either opts out of the "
-    "built-in CI carve-outs — the predicate is authoritative. (Old names when/drop are read as aliases; a "
+    "matching events, include accepts ONLY matching ones, and together they are the whole policy — this "
+    "file holds no built-in event vocabulary any more (0.23.0). (Old names when/drop are read as aliases; a "
     "new write always uses include/exclude.) A brand-new session subscription with no exclude given is seeded "
     "with a default noise-exclude (stars/watches/forks/... — see DEFAULT_SESSION_EXCLUDE); a re-subscribe never "
     "reapplies it. Nothing fails open (0.13.0): a missing, unparseable or empty-topics file forwards "
@@ -357,75 +361,30 @@ DISPATCH_COMMENT = (
     "session per event batch (without a spawn command these entries are inert). Same schema and TTL "
     "semantics as a session filter file, but entries subscribed through the tools default to ttlHours:0 "
     "(a pinned standing watch). Like a session filter, dispatch fails CLOSED: a missing or corrupt "
-    "file means spawn nothing. Two extra brakes apply here only, because a spawn costs a whole session: "
-    "a CI-outcome event spawns ONLY when it reports a FAILURE — a green, queued or in-progress run is "
-    "dropped whoever triggered it, and a failure overrides ignoreSenders — and no CI-outcome event spawns "
-    "at all while a live session peer is subscribed to the same topic, since it is already getting that "
-    "delivery. For any OTHER event the same probe runs, but only entries carrying their own "
-    "include/exclude predicates count as claims: a session that declared what it is working on is "
-    "precise enough to trust, while a rule-less repo-wide entry would silence the watch for the whole "
-    "repo (#16). So a new issue still spawns while a session holds one PR. An entry "
-    "with include/exclude payload predicates (old names when/drop still accepted) replaces the "
-    "failures-only brake with its own rules (the live-peer brake still applies); see the session filter "
-    "comment for the predicate shape. Dispatch entries are unaffected by the default noise-exclude — they "
-    "already narrow via their own curated rules."
+    "file means spawn nothing, and so does an entry that declares no include/exclude rules (0.23.0) — a "
+    "watch that has not said which events deserve a whole session gets none, and webhook_subscribe "
+    "refuses to create one. Until 0.22.x a rule-less entry inherited a built-in GitHub brake instead "
+    "(spawn only for a CI-outcome event reporting a FAILURE); that policy now belongs to whoever "
+    "configures the watch (#16), which is why the rules are mandatory rather than optional here. "
+    "The one brake left is not policy but session coordination: no event spawns while a LIVE session "
+    "peer's own filter claims it, since that session is already getting the delivery. Only entries "
+    "carrying an include predicate claim: a session that declared what it is working on is precise "
+    "enough to trust, while a rule-less repo-wide entry would silence the watch for the whole repo "
+    "(#16). So a new issue still spawns while a session holds one PR. See the session filter comment "
+    "for the predicate shape. Dispatch entries are unaffected by the default noise-exclude — their own "
+    "rules are curated."
 )
 
-# CI-outcome events: their payload sender is merely who triggered the run,
-# while the content (CI verdict, deploy status) is news. Three rules key on this
-# set — the sender-ignore exemption below, the dispatch failure-only spawn gate,
-# and the dispatch ownership probe (both in dispatch_event, and both only ever
-# suppress a spawn for one of these).
-CI_EVENTS = {
-    'workflow_run',
-    'workflow_job',
-    'check_run',
-    'check_suite',
-    'status',
-    'deployment_status',
-}
-# The outcomes the exemption exists FOR. A run also reports itself queued, in
-# progress and finished-fine, and "your own build passed" is not the news that
-# justifies overriding an explicit ignoreSenders — see ci_outcome_is_news.
-CI_FAILURE_STATES = {
-    'failure',
-    'timed_out',
-    'action_required',
-    'startup_failure',
-    'stale',
-    'error',
-}
-
-
-def ci_outcome_is_news(event, payload):
-    """Is this CI event a terminal, non-success outcome?
-
-    Only consulted where over-delivering is expensive (dispatch spawns a whole
-    agent session), so it answers narrowly: on that path it decides the spawn
-    outright, not merely whether a CI event may override an ignored sender.
-    Non-CI events are not its business and get False — callers gate on
-    CI_EVENTS first, and the flag is inert for anything else. When the payload
-    does not say (missing conclusion, a shape GitHub changed under us) it
-    answers True: swallowing a real failure is the one error this must not make.
-    """
-    if event not in CI_EVENTS:
-        return False
-    if event == 'status':
-        return s(g(payload, 'state')) in CI_FAILURE_STATES
-    if event == 'deployment_status':
-        return s(g(payload, 'deployment_status', 'state')) in CI_FAILURE_STATES
-    # workflow_run / workflow_job / check_run / check_suite all carry their
-    # verdict as .conclusion on the event's own object, valid only once
-    # .action is "completed" — anything earlier is a lifecycle ping.
-    action = s(g(payload, 'action'))
-    if action and action != 'completed':
-        return False
-    obj = (g(payload, 'workflow_run') or g(payload, 'workflow_job')
-           or g(payload, 'check_run') or g(payload, 'check_suite'))
-    conclusion = g(obj, 'conclusion')
-    if conclusion is None:
-        return True
-    return s(conclusion) in CI_FAILURE_STATES
+# 0.23.0 removed the GitHub CI vocabulary that used to live here — CI_EVENTS,
+# CI_FAILURE_STATES and ci_outcome_is_news, plus the two rules that keyed on
+# them (the sender-ignore exemption in entry_forwards and the failures-only
+# spawn gate in dispatch_event). A bus that carries any HMAC-signing source
+# should not know that "workflow_run.conclusion == failure" is the interesting
+# case, and a consumer that disagreed with the built-in answer could not
+# override it. Both are now written where the policy belongs: as include/
+# exclude predicates on the subscription itself (#16 — see the DISPATCH_COMMENT
+# for what a watch must declare, and agent-box's services.agent-box.webhook.
+# watchPolicy for the consumer-side replacement this repo was carrying).
 
 # Topics are "source:key" with the same wildcard rules the old repo filter
 # had, generalized: "github:owner/*", "github:owner/name".
@@ -766,32 +725,23 @@ def predicate_error(pred, where='predicate'):
     return None
 
 
-# An entry's sender-ignore drops the event only for non-CI events whose sender
-# matches; "@self" resolves to LOCAL_WEBHOOK_SELF. With several entries
-# matching the same topic, the most permissive one wins (any yes → forward).
+# An entry's sender-ignore drops the event when its sender matches; "@self"
+# resolves to LOCAL_WEBHOOK_SELF. With several entries matching the same topic,
+# the most permissive one wins (any yes → forward).
 #
-# ci_exempt is that CI carve-out, made conditional for callers that can afford
-# it less. Session delivery keeps it unconditional (True): the cost of one
-# extra message in a session that asked for the repo is nil, and "merge on
-# green" wants precisely its own successful run. Dispatch passes
-# ci_outcome_is_news(), so a standing watch overrides ignoreSenders only for an
-# actual failure — a spawned session per green build is not a notification, it
-# is a fleet. Note this flag alone does not make dispatch failures-only: it
-# decides who may override an ignore list, and an unignored sender never needed
-# one. dispatch_event owns that verdict.
-#
-# An entry carrying include/exclude predicates is DECLARATIVE: its rules were
-# written by whoever configured it, so the built-in CI carve-out steps aside —
-# a predicate entry that wants "CI failures override my mute" says so
-# positionally ({path: workflow_run.conclusion, in: [failure, …]} under
-# `include`) instead of inheriting the welded-on exemption whose entanglement
-# with ignoreSenders is what this field exists to end. ignoreSenders still
-# applies to such an entry, but as a PURE sender mute (it now silences even
-# that sender's CI failures — prefer expressing sender rules inside the
-# predicate).
-def entry_forwards(e, sender, event, payload=None, ci_exempt=True):
-    declarative = e['include'] is not None or e['exclude'] is not None
-    if declarative:
+# A PURE sender mute since 0.23.0, for every entry alike. It used to carry a
+# carve-out — a hardcoded set of GitHub CI-outcome events overrode the mute,
+# because GitHub stamps a run with whoever triggered it and muting your own
+# login also muted your own build results — and 0.11.0 already suspended that
+# carve-out for entries carrying predicates. Keeping it for the rest meant this
+# file deciding, for one source, which events are important enough to override
+# a consumer's explicit instruction. An entry that wants "CI failures reach me
+# anyway" says so positionally instead, and can then say it precisely:
+#   include: {any: [{path: "workflow_run.conclusion", in: ["failure", ...]},
+#                   {all: [{path: "sender.login", notIn: ["me"]}, ...]}]}
+# See #16 for the whole retirement.
+def entry_forwards(e, sender, event, payload=None):
+    if e['include'] is not None or e['exclude'] is not None:
         # Most GitHub payloads carry no field of their own named "event" (the
         # X-GitHub-Event header is passed to us separately), so a predicate
         # can only address it if we put it there — setdefault so a payload
@@ -804,8 +754,6 @@ def entry_forwards(e, sender, event, payload=None, ci_exempt=True):
         if e['include'] is not None and not match_predicate(e['include'], ctx):
             return False
     if not e['ignoreSenders'] or not sender:
-        return True
-    if not declarative and ci_exempt and event in CI_EVENTS:
         return True
     sl = sender.lower()
     for x in e['ignoreSenders']:
@@ -838,19 +786,29 @@ def entry_forwards(e, sender, event, payload=None, ci_exempt=True):
 # re-subscribe and still reached dispatch and every configured session. Losing
 # events is the cheaper failure, so both error states take it. read_filter
 # still tells the two apart, and webhook_subscriptions reports which.
-def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, ci_exempt=True):
+#
+# require_rules is the dispatch path's third error state (0.23.0): an entry
+# carrying neither include nor exclude declares no policy, and since 0.23.0 no
+# built-in policy stands in for it, so it matches nothing rather than
+# everything. Skipped entries are reported back as 'ruleless' so the caller can
+# say WHICH silence this is — a watch that never spawned once reads exactly
+# like a broken one otherwise (agent-box#170). Session delivery never passes
+# it: there a rule-less entry means "everything on this topic", which is the
+# whole point of subscribing to a repo you are working in.
+def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, require_rules=False):
     with FILTER_LOCK:
         f = read_filter(path)
         if not f['enabled']:
-            return {'forward': False, 'entry': None, 'refused': False}
+            return {'forward': False, 'entry': None, 'refused': False, 'ruleless': False}
         if not f['topicsConfigured']:
-            return {'forward': False, 'entry': None, 'refused': False}
+            return {'forward': False, 'entry': None, 'refused': False, 'ruleless': False}
         now = now_ms()
         live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
         pruned = len(live) != len(f['topics'])
         forward = False
         matched = None
         topic_hit = False  # some entry matched the topic, whatever it then said
+        ruleless = False   # ...and was skipped for declaring no rules at all
         if not key:
             # Keyless payloads (an org-level github ping; every event of a
             # source wired without a keyPath) are no longer deliverable to a
@@ -870,7 +828,10 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, ci_e
                 if not match_topic(source, key, e['topic']):
                     continue
                 topic_hit = True
-                if not entry_forwards(e, sender, event, payload, ci_exempt):
+                if require_rules and e['include'] is None and e['exclude'] is None:
+                    ruleless = True
+                    continue
+                if not entry_forwards(e, sender, event, payload):
                     continue
                 forward = True
                 if matched is None:
@@ -888,8 +849,12 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, ci_e
         # refused: subscribed to the topic, but every matching entry said no
         # (predicates or ignoreSenders). Distinct from "not subscribed" so the
         # dispatch path can log the suppression (agent-box#170) without
-        # narrating every delivery for a repo nobody watches.
-        return {'forward': forward, 'entry': matched, 'refused': topic_hit and not forward}
+        # narrating every delivery for a repo nobody watches. ruleless is the
+        # narrower case inside it: a watch that declared nothing, which needs
+        # its own message because the fix is to write rules, not to read them.
+        return {'forward': forward, 'entry': matched,
+                'refused': topic_hit and not forward,
+                'ruleless': ruleless and not forward}
 
 
 # Read-only counterpart to route_event, for asking about SOMEONE ELSE's
@@ -901,19 +866,22 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, ci_e
 #     claims nothing", because here a yes SUPPRESSES a spawn: failing open
 #     would silently mute standing watches, the one outcome dispatch is built
 #     to avoid.
-#   - it answers about the filter as its owner would see it, so ci_exempt keeps
-#     the session default.
+#   - it answers about the filter as its owner would see it.
 # Expiry is read, never applied: an expired entry claims nothing.
-def filter_claims(path, source, key, sender, event, payload=None, declared_only=False):
-    """Does the filter at `path` claim this event?
+def filter_claims(path, source, key, sender, event, payload=None):
+    """Does the filter at `path` DECLARE a claim on this event?
 
-    declared_only restricts the answer to entries carrying an `include`
-    predicate. That is the difference between "a session is watching this repo"
-    and "a session said what it is working on", and the dispatch probe needs
-    the second one for non-CI events — see #16: a rule-less repo-wide entry is
-    not precise enough to mean a claim, so honouring it for every event would
-    let one hook session silence the standing watch for the whole repo until it
-    exits.
+    Only entries carrying an `include` predicate are consulted. That is the
+    difference between "a session is watching this repo" and "a session said
+    what it is working on", and a claim suppresses a standing watch, so it has
+    to be the second one — see #16: a rule-less repo-wide entry is not precise
+    enough to mean a claim, and honouring it would let one hook session silence
+    the watch for every issue and PR in that repo until it exits. Through
+    0.22.x a CI-outcome event was exempt from this rule (any live peer on the
+    topic claimed it, coarsely); 0.23.0 retired that vocabulary along with the
+    rest, so a session that wants its branch's CI says so —
+    {path: "workflow_run.head_branch", in: ["fix/…"]} — and agent-box seeds
+    exactly such a claim into every session it spawns (agent-box#251).
 
     INCLUDE only, deliberately. `exclude` cannot claim anything: a new session
     subscription is seeded with the default noise-exclude, so counting excludes
@@ -928,7 +896,7 @@ def filter_claims(path, source, key, sender, event, payload=None, declared_only=
         return False
     now = now_ms()
     for e in f['topics']:
-        if declared_only and e['include'] is None:
+        if e['include'] is None:
             continue
         if entry_expired(e, f['ttlHours'], now):
             continue
@@ -1163,7 +1131,7 @@ if not RECEIVER_ONLY and not CLI:
 #     last spawn start, further events COALESCE into one pending batch that
 #     becomes a single follow-up spawn — a 10-PR dependabot burst costs two
 #     sessions, not ten;
-#   - a CI line in that follow-up batch is re-checked against live session
+#   - every line in that follow-up batch is re-checked against live session
 #     ownership the moment the batch starts, and dropped if the session the
 #     first spawn just started now claims it (0.11.1, issue #17): the whole
 #     point of waiting is that the answer changes while you wait — the
@@ -1222,7 +1190,7 @@ class Dispatcher:
         self.pending_max = pending_max
         self.clock = clock  # injectable for tests; monotonic so a clock step can't wedge a key
         # Who owns a queued line NOW, asked again when its batch starts.
-        # Injectable for tests; None means the real probe (ci_owner_now).
+        # Injectable for tests; None means the real probe (owner_now).
         self.owner_of = owner_of
         self.lock = threading.Lock()
         self.active = 0
@@ -1416,22 +1384,18 @@ DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) i
 
 
 # A standing watch is for events NOBODY owns. A live session peer whose own
-# subscription covers the event is exactly the signal that somebody does — it
+# subscription DECLARES the event is exactly the signal that somebody does — it
 # is already getting this delivery — so spawning a second agent for it just
 # puts two of them on one PR, sharing one working tree.
 #
-# Scoped to CI events on purpose. Those are what a session driving a PR is
-# already watching, and they are the whole duplicate-spawn problem. Genuinely
-# new work — issues.opened, someone else's pull_request — must still spawn its
-# own session no matter who is subscribed: topics are repo-granular while
-# ownership is object-granular, so a session working one PR would otherwise
+# Ownership is object-granular while topics are repo-granular, which is why a
+# claim has to be declared (filter_claims): a session working one PR must not
 # silence the watch for every unrelated issue in that repo for the life of its
 # subscription.
-def owned_by_live_session(env, declared_only=False):
+def owned_by_live_session(env):
     for key in peer_scopes_live():
         if filter_claims(filter_path_of(key), env.get('source', ''), env.get('key', ''),
-                         env.get('sender', ''), env.get('event', ''), env.get('payload'),
-                         declared_only=declared_only):
+                         env.get('sender', ''), env.get('event', ''), env.get('payload')):
             return key or '(unscoped)'
     return None
 
@@ -1445,28 +1409,17 @@ def owned_by_live_session(env, declared_only=False):
 def owner_now(env):
     """The live session already handling this event, if any.
 
-    Two regimes, and the difference is precision — #16's open question about
-    what should scope this probe once the CI vocabulary goes:
-
-      - a CI event is claimed by ANY live peer subscribed to the topic. Coarse,
-        but a build result is repo-shaped anyway, and this is the 0.10.0
-        behaviour nothing should change under it.
-      - every OTHER event is claimed only by a peer whose entry carries an
-        `include` predicate. A session that declared what it is working on has
-        said something precise enough to act on; a bare repo-wide entry has
-        not, and treating it as a claim would silence the watch for every
-        unrelated issue and PR in that repo. Excludes never claim — the default
-        noise-exclude would otherwise turn every session into an owner.
+    One regime since 0.23.0, and it is #16's open question answered: an event
+    is claimed by a live peer whose entry carries an `include` predicate that
+    matches it, whatever kind of event it is. Until 0.22.x a CI-outcome event
+    took a coarser route — any live peer subscribed to the topic claimed it —
+    because the sessions that needed to claim their own CI could not say so.
+    They can (agent-box#251 seeds the predicate at spawn), so the mechanism
+    asks one question and the consumer's own filter answers it.
     """
     if not env:
         return None
-    if env.get('event', '') in CI_EVENTS:
-        return owned_by_live_session(env)
-    return owned_by_live_session(env, declared_only=True)
-
-
-# The old name, kept for callers that only ever meant the CI question.
-ci_owner_now = owner_now
+    return owned_by_live_session(env)
 
 
 def dispatch_event(env):
@@ -1475,11 +1428,24 @@ def dispatch_event(env):
     if DISPATCHER is None:
         return
     event = env.get('event', '')
-    news = ci_outcome_is_news(event, env.get('payload'))
+    # require_rules: a watch that declares no include/exclude spawns nothing.
+    # Until 0.22.x such an entry inherited this repo's own GitHub policy (spawn
+    # for a CI-outcome event, but only a failing one); with that vocabulary
+    # retired (#16) there is nothing left to inherit, and "everything on the
+    # topic" is the wrong default on the one path where each event costs a
+    # whole agent session. webhook_subscribe refuses to create such an entry,
+    # so in practice this catches a hand-edited file or one written before
+    # 0.23.0.
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
-                    event, env.get('payload'), path=DISPATCH_FILE, ci_exempt=news)
+                    event, env.get('payload'), path=DISPATCH_FILE, require_rules=True)
     if not r['forward']:
-        if r['refused']:
+        if r['ruleless']:
+            print('local-webhook: not spawning for %s on %s — the watch on this topic declares no '
+                  'include/exclude rules, so it says nothing about which events deserve a session '
+                  '(0.23.0 retired the built-in failures-only CI brake that used to stand in for '
+                  'them). Re-subscribe with rules to bring it back.'
+                  % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
+        elif r['refused']:
             # A watch covers this topic and turned the event down. Said out
             # loud, like every other suppressed spawn: a deliberate drop must
             # stay distinguishable from a watch that broke (agent-box#170).
@@ -1487,50 +1453,23 @@ def dispatch_event(env):
                   'declined it (include/exclude rules or ignoreSenders)'
                   % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
         return
-    # A declarative entry (include/exclude) already ruled on this event inside
-    # entry_forwards — its rules REPLACE the hardcoded failures-only brake, or
-    # the consumer could never spawn on anything the brake drops. The live-peer
-    # probe below is NOT policy, it is session coordination, so it applies to
-    # every entry alike.
-    declarative = r['entry'] is not None and (
-        r['entry']['include'] is not None or r['entry']['exclude'] is not None)
-    if event in CI_EVENTS:
-        # A green (or queued, or in-progress) run is not news for a watch on
-        # events NOBODY owns, whoever triggered it. 0.10.0 only reached this
-        # verdict through ignoreSenders — the outcome merely decided whether a
-        # CI event could override an ignored sender — so a watch whose ignore
-        # list didn't happen to name the pusher spawned a session per green
-        # build anyway: one merge to master emitted check_run.completed,
-        # workflow_run success and a Pages deployment, and each took a hook
-        # session slot to conclude "nothing to do". The sender is the wrong
-        # question here; the outcome is the whole question.
-        if not news and not declarative:
-            print('local-webhook: not spawning for %s on %s — no failing outcome, '
-                  'and a standing watch is not a build log'
-                  % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
-            return
-        owner = owned_by_live_session(env)
-        if owner:
-            # Said out loud: a suppressed spawn is indistinguishable from a
-            # watch that quietly stopped working, and that ambiguity is its own
-            # bug (agent-box#170).
-            print('local-webhook: not spawning for %s on %s — session %s is subscribed to it'
-                  % (event or '(none)', env.get('key', '') or '(none)', owner), file=sys.stderr)
-            return
-    else:
-        # Not a CI event, so the brake above never looked. A live peer that
-        # DECLARED what it is working on is already receiving this delivery and
-        # holds the context for it: spawning a second session onto the same
-        # object is what happened twice in one hour on agent-box#319, where a
-        # human's review of a box-authored PR started a fresh session while the
-        # session that opened the PR was live — and the duplicate pushed to its
-        # branch. Entries with no `include` are deliberately NOT claims (#16).
-        owner = owned_by_live_session(env, declared_only=True)
-        if owner:
-            print('local-webhook: not spawning for %s on %s — session %s declared it'
-                  % (event or '(none)', env.get('key', '') or '(none)', owner),
-                  file=sys.stderr)
-            return
+    # The watch's own rules have now ruled on this event; the one brake left is
+    # not policy but session coordination. A live peer that DECLARED what it is
+    # working on is already receiving this delivery and holds the context for
+    # it: spawning a second session onto the same object is what happened twice
+    # in one hour on agent-box#319, where a human's review of a box-authored PR
+    # started a fresh session while the session that opened the PR was live —
+    # and the duplicate pushed to its branch. Entries with no `include` are
+    # deliberately NOT claims (#16), so new work in the same repo still spawns.
+    owner = owned_by_live_session(env)
+    if owner:
+        # Said out loud: a suppressed spawn is indistinguishable from a watch
+        # that quietly stopped working, and that ambiguity is its own bug
+        # (agent-box#170).
+        print('local-webhook: not spawning for %s on %s — session %s declared it'
+              % (event or '(none)', env.get('key', '') or '(none)', owner),
+              file=sys.stderr)
+        return
     entry = r['entry']
     text, payload_meta = format_delivery(env, entry)
     DISPATCHER.add(env.get('key', '') or '(none)', text, {
@@ -1687,15 +1626,17 @@ INSTRUCTIONS = (
     'rather than landing here — those subscriptions are shared across sessions, survive this one, and '
     'default to pinned (ttl 0), which is safe there because nothing gets interrupted. '
     'To mute echoes of your own actions (your comments, your issue edits) pass ignore_senders — e.g. '
-    'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe; CI-outcome '
-    'events (workflow_run etc.) are always delivered to a SESSION regardless, so "merge on green" still '
-    'works while your own comments stay muted. Standing watches are stricter, so they cannot pile up '
-    'sessions behind you: they spawn on a CI event only if it reports a failure, and never while a live '
-    'session is subscribed to that topic (a new issue or someone else\'s PR still spawns either way). '
-    'Subscriptions can also filter on payload CONTENT with include/exclude predicates (see '
-    'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, or '
-    'exclude close/merge echoes without muting their sender; an entry carrying them sets its own policy '
-    'and the built-in CI carve-outs step aside for it. A brand-new session subscription gets a default '
+    'your own GitHub login, or "@self" if LOCAL_WEBHOOK_SELF is set — to webhook_subscribe. Since 0.23.0 '
+    'that is a PURE sender mute: it silences your own CI results too (GitHub stamps a run with whoever '
+    'triggered it), so if you want "merge on green" while your comments stay muted, say it in the rules '
+    'instead of in ignore_senders. A standing watch must carry include/exclude rules: every event it '
+    'matches costs a whole session, so it has to say which ones are worth one, and a rule-less watch is '
+    'refused. It never spawns for an event a live session has DECLARED it is working on (a new issue or '
+    'someone else\'s PR still spawns either way). '
+    'Subscriptions filter on payload CONTENT with include/exclude predicates (see '
+    'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, '
+    'exclude close/merge echoes without muting their sender, or claim the one PR you are working on. '
+    'A brand-new session subscription gets a default '
     'noise-exclude (stars, watches, forks, ...) unless you pass your own exclude; a re-subscribe never '
     'reapplies it, so clearing it with exclude:{} sticks. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
@@ -1737,7 +1678,8 @@ TOOLS = [
             'ignore_senders / ttl_hours / renew_on_event in place), as does a "warm" delivery <10min after the '
             'previous; renew_on_event:true resets it on every delivery instead. For a standing watch that '
             'should NOT land in this session, pass deliver_to:"subagent" — each matching event batch then '
-            'spawns a fresh session.' % DEFAULT_TTL_HOURS,
+            'spawns a fresh session, and such a subscription must carry include/exclude rules saying which '
+            'events are worth one.' % DEFAULT_TTL_HOURS,
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -1747,7 +1689,8 @@ TOOLS = [
                         'There is no pattern for a whole source or for everything. A "prefix/*" topic delivered to '
                         'this session is refused unless it also carries an include predicate — owner-wide traffic '
                         'interrupting a working session is a firehose, not a watch. Name one key, narrow it with '
-                        'include, or pass deliver_to:"subagent".',
+                        'include, or pass deliver_to:"subagent" (which is free to be owner-wide, but needs '
+                        'rules of its own).',
                 },
                 'note': {
                     'type': 'string',
@@ -1776,7 +1719,10 @@ TOOLS = [
                         'Where matching events go. "session" (default): into THIS session as channel '
                         'messages. "subagent": the receiver daemon spawns a FRESH agent session per event '
                         'batch instead of interrupting anyone — the right shape for a standing watch (new '
-                        'issues, failing CI on a repo no session is working on). Subagent subscriptions are '
+                        'issues, failing CI on a repo no session is working on). Such a watch MUST carry '
+                        'include/exclude rules saying which events deserve a session, or it is refused: '
+                        'every match costs a whole agent, and 0.23.0 retired the built-in failures-only CI '
+                        'brake that used to decide it for you. Subagent subscriptions are '
                         'SHARED across sessions, survive this one, and default to ttl_hours 0 (pinned). '
                         'Bursts coalesce: events arriving while a spawned session is starting are batched '
                         'into one follow-up session rather than one each.',
@@ -1796,9 +1742,12 @@ TOOLS = [
                     'items': {'type': 'string'},
                     'description':
                         'Optional senders whose events on this topic are dropped as echoes of your own actions '
-                        '(e.g. your own GitHub login; "@self" resolves to LOCAL_WEBHOOK_SELF). CI-outcome events '
-                        '(workflow_run, check_run, ...) are exempt and always delivered to a session; on a '
-                        'deliver_to:"subagent" watch only a FAILING one is. Omit or pass [] to clear.',
+                        '(e.g. your own GitHub login; "@self" resolves to LOCAL_WEBHOOK_SELF). A PURE sender '
+                        'mute since 0.23.0: nothing is exempt, so it also silences CI runs YOU triggered '
+                        '(GitHub stamps a run with whoever started it). To keep those, drop the sender from '
+                        'this list and write the rule positionally in "include" instead, e.g. {"any": '
+                        '[{"path": "workflow_run.conclusion", "in": ["failure"]}, {"all": [{"path": '
+                        '"sender.login", "notIn": ["me"]}]}]}. Omit or pass [] to clear.',
                 },
                 'include': {
                     'type': 'object',
@@ -1812,10 +1761,12 @@ TOOLS = [
                         '{"path": "comment.body", "contains": ["@mybot"]}. A leaf carries exactly one of the '
                         'four. Example — opened issues/PRs plus failing CI: '
                         '{"any": [{"path": "action", "in": ["opened", "reopened"]}, '
-                        '{"path": "workflow_run.conclusion", "in": ["failure", "timed_out"]}]}. An entry with '
-                        'include/exclude is declarative: the built-in CI carve-outs step aside and these rules '
-                        'are the whole policy (express sender muting inside the predicate, e.g. {"path": '
-                        '"sender.login", "notIn": [...]}, rather than combining with ignore_senders). Omit to '
+                        '{"path": "workflow_run.conclusion", "in": ["failure", "timed_out"]}]}. These rules '
+                        'are the WHOLE policy — this plugin carries no built-in event vocabulary of its own '
+                        '(0.23.0) — so express sender muting inside the predicate too, e.g. {"path": '
+                        '"sender.login", "notIn": [...]}, rather than combining with ignore_senders. On a '
+                        'session subscription an include is also a CLAIM: while this session lives, a '
+                        'standing watch will not spawn a second agent for an event it matches. Omit to '
                         'keep on renew; pass {} to clear. Accepts the old name "when" as an alias.',
                 },
                 'exclude': {
@@ -1952,6 +1903,22 @@ def call_tool(params):
                 if info is not None and not info.get('spawn'):
                     body['dispatch']['warning'] = ('receiver daemon has no LOCAL_WEBHOOK_SPAWN_CMD '
                                                    'configured; dispatch topics are inert')
+                # An entry left rule-less by a pre-0.23.0 write spawns nothing
+                # now (see route_event's require_rules). Say which entries, in
+                # the one place an operator looks to ask whether a watch works
+                # — an inert watch that reads as a working one is the same bug
+                # as a silent drop (agent-box#170).
+                mute = [e['topic'] for e in d['topics']
+                        if e['include'] is None and e['exclude'] is None]
+                if mute:
+                    body['dispatch']['rulelessTopics'] = mute
+                    body['dispatch'].setdefault('warning', '')
+                    body['dispatch']['warning'] += (
+                        ('; ' if body['dispatch']['warning'] else '')
+                        + 'these watches declare no include/exclude rules and so spawn NOTHING '
+                          '(0.23.0 retired the built-in failures-only CI brake they used to '
+                          'inherit): %s. Re-subscribe with rules saying which events deserve a '
+                          'session.' % ', '.join(mute))
                 expired = expired + dexpired
             expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
             return text(pretty(body) + expired_note)
@@ -2064,6 +2031,29 @@ def call_tool(params):
                         'says which events matter (e.g. {"any":[{"path":"action","in":["opened"]}]}), '
                         'or pass deliver_to:"subagent" to make it a standing watch that spawns a fresh '
                         'session instead of interrupting this one.' % topic)
+            # A standing watch must say what deserves a session (0.23.0). Its
+            # topic may be as broad as it likes — a spawn interrupts nobody, so
+            # an org-wide watch is the documented shape — but every matching
+            # event costs a whole agent, and until 0.22.x the policy deciding
+            # which ones were worth it was hardcoded here (spawn only for a
+            # FAILING GitHub CI outcome). That vocabulary is retired (#16), and
+            # nothing silently replaces it: a rule-less watch is refused at
+            # creation rather than left to spawn for everything, or to look
+            # subscribed while dispatch declines every event it matches.
+            if dispatch:
+                eff = [raw if raw is not _MISSING
+                       else (f['topics'][idx][k] if idx >= 0 else None)
+                       for k, raw in (('include', raw_include), ('exclude', raw_exclude))]
+                if not eff[0] and not eff[1]:
+                    return text(
+                        'error: a standing watch on "%s" needs include/exclude rules: every event it '
+                        'matches spawns a whole session, so it has to say which ones are worth one. '
+                        'Pass an include predicate (e.g. {"any":[{"path":"action","in":["opened"]},'
+                        '{"path":"workflow_run.conclusion","in":["failure","timed_out"]}]}) and/or an '
+                        'exclude one. Until 0.22.x a rule-less watch inherited a built-in '
+                        'failures-only CI brake; that policy now belongs to whoever configures the '
+                        'watch. For delivery into THIS session instead, which needs no rules, drop '
+                        'deliver_to:"subagent".' % topic)
             if idx >= 0:
                 # Re-subscribe = renew: the TTL clock restarts even if nothing changed.
                 e = {**f['topics'][idx], 'subscribedAt': now_iso}
@@ -2401,16 +2391,19 @@ source or for everything: name a key or a prefix.
                        "subagent": the receiver spawns a FRESH session per
                        event batch — the standing-watch shape; shared across
                        sessions, survives this one, pinned (ttl 0) by default.
-                       Two brakes keep a watch from piling up sessions behind
-                       you: a CI event spawns only if it reports a FAILURE, and
-                       never while a live session is subscribed to that topic.
-                       A new issue or someone else's PR spawns either way
+                       REQUIRES --include and/or --exclude: every event a watch
+                       matches costs a whole session, so it must say which ones
+                       are worth one (0.23.0 retired the built-in failures-only
+                       CI brake that used to decide that). It never spawns for
+                       an event a live session has DECLARED with its own
+                       --include; a new issue or someone else's PR spawns anyway
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
                        own actions (repeatable; "@self" = $LOCAL_WEBHOOK_SELF).
-                       CI-outcome events reach a session anyway; a standing
-                       watch takes only the failing ones.
+                       A pure sender mute since 0.23.0: it silences CI runs you
+                       triggered too, so keep those by writing the rule inside
+                       --include instead of muting the sender outright.
   --include JSON       deliver ONLY events whose payload matches this predicate:
                        {"any"/"all": [...]} over {"path": "a.b.c", "in"/"notIn":
                        [values]} leaves; null in a list matches an absent path;
@@ -2420,10 +2413,12 @@ source or for everything: name a key or a prefix.
                        for free text no list of whole values can enumerate
                        ({"path": "comment.body", "contains": ["@mybot"]}).
                        Exactly one of the four per leaf.
-                       An entry with --include/--exclude is declarative — the
-                       built-in CI carve-outs step aside and these rules are
-                       the whole policy (put sender rules IN the predicate,
-                       e.g. {"path": "sender.login", "notIn": [...]})
+                       These rules are the WHOLE policy — nothing built in
+                       adds to them (put sender rules IN the predicate, e.g.
+                       {"path": "sender.login", "notIn": [...]}). On a session
+                       subscription an --include also CLAIMS the events it
+                       matches, so a standing watch starts no second agent on
+                       work this session declared
   --exclude JSON       never deliver events matching this predicate (evaluated
                        first, wins over --include). Same shape. Pass '{}' to
                        clear either on re-subscribe. A brand-new "session"
