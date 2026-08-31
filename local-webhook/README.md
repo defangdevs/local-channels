@@ -208,9 +208,10 @@ stderr — for `include` that mutes the entry, for `exclude` it forwards, and
 either way the misconfiguration is distinguishable from a watch that quietly
 stopped working. Omit both on re-subscribe to keep them; pass `{}` to clear.
 
-#### Default noise-exclude for a brand-new session subscription (0.15.0)
+#### Default noise-exclude for a brand-new session subscription (0.15.0, github-only since 0.24.0)
 
-A brand-new `deliver_to:"session"` subscription (never a renew, and never a
+A brand-new `deliver_to:"session"` subscription **on a github-format source**
+(never a renew, and never a
 `deliver_to:"subagent"` entry, which already narrows via its own curated
 rules) that names no `exclude` of its own is seeded with a built-in
 noise-exclude instead of `None` — most agents never think to filter out a
@@ -222,6 +223,15 @@ Deliberately left alone: `label`, `milestone`, `commit_comment` — those carry
 actual human intent, not pure plumbing. Pass `exclude: {}` explicitly to opt
 out, or your own predicate to replace it; a re-subscribe never reapplies the
 default, so once you've broadened with `exclude: {}` it stays broadened.
+
+Every name in that list is a GitHub event name, so since 0.24.0 the seed is
+applied only where its vocabulary is real: the source's `format` (defaulted
+the same way the ingress defaults it — `github` iff the source is named
+`github`) decides. A Linear subscription used to come back carrying
+`event notIn [… "project" …]`, which matched nothing only because Linear
+spells its entity type `Project` with a capital. A default that depends on
+another sender's casing is not a default. A non-github source is seeded with
+`None`, exactly as if you had passed `exclude: {}`.
 
 ### Subscription expiry and notes (0.5.x)
 
