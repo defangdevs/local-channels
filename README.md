@@ -11,7 +11,7 @@ acts on; there is no reply path back over the channel.
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.23.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
+| [`local-webhook`](local-webhook/) | 0.24.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
 
 ## Requirements
 
@@ -233,9 +233,11 @@ e.g. "issues being opened, not closed" or "only failing `workflow_run`
 conclusions". These rules are the whole policy: nothing built in adds to them,
 which is why sender rules belong inside them
 (`{"path": "sender.login", "notIn": […]}`). A brand-new
-`deliver_to:"session"` subscription that passes no
+`deliver_to:"session"` subscription on a **github-format source** that passes no
 `exclude` is seeded with a default noise-exclude (stars, watches, forks,
-team/member pings, ...); pass `exclude: {}` to opt out. See the
+team/member pings, ...); pass `exclude: {}` to opt out. Since 0.24.0 no other
+source is seeded — those event names are GitHub's, and a seed built from them
+is inert or misleading anywhere else. See the
 [local-webhook README](local-webhook/README.md) for the shape.
 
 ### Per-session filters

@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.23.0'
+VERSION = '0.24.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -338,7 +338,8 @@ FILTER_COMMENT = (
     "matching events, include accepts ONLY matching ones, and together they are the whole policy — this "
     "file holds no built-in event vocabulary any more (0.23.0). (Old names when/drop are read as aliases; a "
     "new write always uses include/exclude.) A brand-new session subscription with no exclude given is seeded "
-    "with a default noise-exclude (stars/watches/forks/... — see DEFAULT_SESSION_EXCLUDE); a re-subscribe never "
+    "with a default noise-exclude (stars/watches/forks/... — see DEFAULT_SESSION_EXCLUDE) when its source is "
+    "github-format; a re-subscribe never "
     "reapplies it. Nothing fails open (0.13.0): a missing, unparseable or empty-topics file forwards "
     "NOTHING, so deleting this file does not bring traffic back — it unsubscribes the session. To receive "
     "events again, subscribe to a topic (webhook_subscribe, or `webhook.py subscribe <topic>`); "
@@ -887,8 +888,8 @@ def filter_claims(path, source, key, sender, event, payload=None):
     {path: "workflow_run.head_branch", in: ["fix/…"]} — and agent-box seeds
     exactly such a claim into every session it spawns (agent-box#251).
 
-    INCLUDE only, deliberately. `exclude` cannot claim anything: a new session
-    subscription is seeded with the default noise-exclude, so counting excludes
+    INCLUDE only, deliberately. `exclude` cannot claim anything: a new github
+    session subscription is seeded with the default noise-exclude, so counting excludes
     would make almost every session entry a claim and reintroduce exactly the
     repo-wide silence this guards against (caught by
     test_emit_reaches_sessions_and_standing_watches, whose peer subscribes with
@@ -1583,13 +1584,43 @@ def summarize_github(event, p):
 # Generic sources get the event name, the routing key, and a short preview of
 # the payload's top-level scalar fields — enough to decide whether to go read
 # the real thing, without trusting any of it.
+# A generic sender puts the envelope at the top level and the thing that
+# happened one level down: Linear's issue title and its ENG-42 identifier live
+# under `data`, Stripe's under `data.object`, while the top level carries ids
+# and timestamps. Previewing the top level alone therefore spent all six slots
+# on fields no reader can act on — a Linear issue arrived as
+# "Issue for ENG: action=create type=Issue ... webhookId=..." with the title
+# nowhere in it. So look one envelope deep as well, and order by how much a
+# name identifies the event rather than by payload order.
+GENERIC_ENVELOPE_KEYS = ('data', 'object', 'payload')
+GENERIC_PREFERRED = ('identifier', 'title', 'name', 'summary', 'action',
+                     'type', 'status', 'number', 'url')
+GENERIC_PREVIEW_MAX = 6
+
+
+def generic_scalars(p, prefix=''):
+    """The scalar leaves of one object, in payload order, as (name, value)."""
+    return [(prefix + s(k), v) for k, v in (p.items() if isinstance(p, dict) else [])
+            if isinstance(v, (str, int, float, bool)) and v is not None]
+
+
 def summarize_generic(event, key, p):
     meta = {'event': event, 'key': key}
-    items = list(p.items()) if isinstance(p, dict) else []
-    preview = ' '.join(
-        '%s=%s' % (s(k), u(v)) for k, v in
-        [(k, v) for k, v in items if isinstance(v, (str, int, float, bool)) and v is not None][:6]
-    )
+    fields = generic_scalars(p)
+    for env_key in GENERIC_ENVELOPE_KEYS:
+        if isinstance(p, dict) and isinstance(p.get(env_key), dict):
+            fields += generic_scalars(p[env_key], env_key + '.')
+            break
+
+    # Stable sort: preferred names first in the order listed above, everything
+    # else after them in the order the sender wrote it.
+    def rank(item):
+        name = item[0].rsplit('.', 1)[-1].lower()
+        return (GENERIC_PREFERRED.index(name) if name in GENERIC_PREFERRED
+                else len(GENERIC_PREFERRED))
+
+    fields.sort(key=rank)
+    preview = ' '.join('%s=%s' % (k, u(v)) for k, v in fields[:GENERIC_PREVIEW_MAX])
     content = '%s%s%s' % (event or 'delivery', ' for %s' % key if key else '',
                           ': %s' % preview if preview else '')
     return content, meta
@@ -1640,9 +1671,10 @@ INSTRUCTIONS = (
     'Subscriptions filter on payload CONTENT with include/exclude predicates (see '
     'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, '
     'exclude close/merge echoes without muting their sender, or claim the one PR you are working on. '
-    'A brand-new session subscription gets a default '
+    'A brand-new session subscription on a github-format source gets a default '
     'noise-exclude (stars, watches, forks, ...) unless you pass your own exclude; a re-subscribe never '
-    'reapplies it, so clearing it with exclude:{} sticks. '
+    'reapplies it, so clearing it with exclude:{} sticks. Another sender is never seeded — those are '
+    'GitHub event names. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -1667,6 +1699,26 @@ DEFAULT_SESSION_EXCLUDE = {
         {'path': 'workflow_run.event', 'in': ['schedule']},
     ],
 }
+
+
+def topic_source(pat):
+    """The source a topic pattern addresses, lowercased ('' if it does not
+    parse). GH_SHORTHAND is expanded before a topic reaches here."""
+    if not TOPIC_PATTERN.match(pat):
+        return ''
+    i = pat.find(':')
+    return pat[:i].lower() if i >= 0 else ''
+
+
+def source_format(name):
+    """The wire format configured for a source, defaulted exactly the way the
+    ingress defaults it (github iff the source is named github) so the two can
+    never disagree about the shape of a payload."""
+    src = read_sources()['sources'].get(name)
+    fmt = src.get('format') if isinstance(src, dict) else None
+    if fmt in ('generic', 'github'):
+        return fmt
+    return 'github' if name == 'github' else 'generic'
 
 TOOLS = [
     {
@@ -1781,10 +1833,12 @@ TOOLS = [
                         'Optional payload predicate: NEVER deliver events matching it (evaluated before '
                         '"include", wins over it). Same shape as "include". E.g. {"path": "action", "in": '
                         '["closed", "merged"]} silences close/merge echoes without muting the sender. Omit to '
-                        'keep on renew; pass {} to clear. A brand-new deliver_to:"session" subscription that '
+                        'keep on renew; pass {} to clear. A brand-new deliver_to:"session" subscription on a '
+                        'github-format source that '
                         'omits this gets a default noise-exclude (stars, watches, forks, team/member pings, '
                         '...) seeded automatically; pass {} explicitly to opt out of that default, or your own '
-                        'predicate to replace it — a renew never reapplies the default. Accepts the old name '
+                        'predicate to replace it — a renew never reapplies the default. A non-github source '
+                        'is never seeded: every name in that list is a GitHub event name. Accepts the old name '
                         '"drop" as an alias.',
                 },
             },
@@ -2087,7 +2141,16 @@ def call_tool(params):
             # agent that never thinks about repo/social-graph pings doesn't
             # drink them by default. Passing exclude:{} explicitly opts out
             # (raw_exclude becomes {} below, distinct from _MISSING).
+            #
+            # Only for a github-format source. Every name in that list is a
+            # GitHub event, so on any other sender the seed is at best inert
+            # and at worst a trap: a Linear subscription came back carrying
+            # `event notIn [... "project" ...]`, which matched nothing only
+            # because Linear spells its entity type "Project" with a capital.
+            # A default that silently depends on another sender's casing is
+            # not a default, so it now applies where its vocabulary is real.
             default_exclude = (None if dispatch or raw_exclude is not _MISSING
+                                or source_format(topic_source(topic)) != 'github'
                                 else DEFAULT_SESSION_EXCLUDE)
             entry = {
                 'topic': topic,
