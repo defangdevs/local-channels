@@ -491,6 +491,13 @@ naming the spawn command's environment: a config free to set `PATH` or
   for no visible cause.
 - **Always set** on the spawn command, `{}` when the entry carries none — a
   consumer can `.get()` an empty object but not a missing variable.
+- **Two configs never coalesce into one batch.** Events queue per (routing key,
+  `spawnConfig`), not per key: a coalesced batch runs one spawn command and is
+  handed the newest line's metadata, so without the split a repo's `new-issues`
+  event arriving while the `red-CI` watch's spawn was in flight would reach a
+  session started as the wrong worker. Same-config lines still coalesce, which
+  is what the window is for — one failing run emits `check_run` and then
+  `workflow_run`, both matched by the same watch, and they stay one session.
 - **Dispatch only.** `webhook_subscribe` refuses it on a `deliver_to:"session"`
   subscription, which spawns nothing and would silently ignore it.
 - **Not a secret store.** It is written to `filter.dispatch.json`, echoed by

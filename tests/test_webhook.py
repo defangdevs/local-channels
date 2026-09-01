@@ -851,8 +851,12 @@ class TestSpawnConfig(StateDirCase):
         # normalize_entry already takes for a malformed topic or predicate.
         self.write_json('filter.dispatch.json', {'enabled': True, 'topics': [
             {'topic': 'github:o/r', 'include': ANY_EVENT, 'ttlHours': 0,
-             'spawnConfig': {'profile': 'ok', 'bad key': 'x', 'n': 7}}]})
+             'spawnConfig': {'profile': 'ok', 'bad key': 'x', 'n': 7,
+                             'toolong': 'x' * 301}}]})
         f = self.mod.read_filter(self.mod.DISPATCH_FILE)
+        # Dropped, never repaired: subscribe REFUSES a 301-character value, so
+        # silently storing a 300-character one would make the same text mean
+        # one thing typed and another hand-edited.
         self.assertEqual(f['topics'][0]['spawnConfig'], {'profile': 'ok'})
 
     def test_it_is_normalized_on_a_session_file_too(self):
@@ -1136,10 +1140,13 @@ class TestDispatchEvent(StateDirCase):
         """The whole point of the field: same repo, same spawn command, two
         watches, and the event decides which config arrives."""
         out = os.path.join(self.state, 'spawned_two.txt')
-        # Window 0: two events on one key would otherwise coalesce into a
-        # single follow-up batch, and this test is about the second SPAWN.
+        # The DEFAULT 60s window, deliberately: this is the regression test for
+        # coalescing across configs. Both events land on one repo while the
+        # first spawn is in flight, so bucketing by key alone would fold the
+        # second into the first's follow-up batch — one session, started as
+        # cheap-triage, handed the deep-fix watch's event.
         mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat >/dev/null; echo "CFG=$LOCAL_WEBHOOK_SPAWN_CONFIG"; } >> %s' % out,
-                        LOCAL_WEBHOOK_SPAWN_WINDOW='0', LOCAL_WEBHOOK_STATE_DIR=self.state)
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
         self.mod = mod
         # Written by hand: two entries on ONE topic is a shape webhook_subscribe
         # will not create (a re-subscribe renews the entry in place), but the
@@ -1152,7 +1159,6 @@ class TestDispatchEvent(StateDirCase):
              'spawnConfig': {'profile': 'deep-fix'}, 'ttlHours': 0},
         ]})
         mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
-        self.assertEqual(json.loads(self._read_spawned(out, 'CFG=')), {'profile': 'cheap-triage'})
         ci = {'source': 'github', 'format': 'github', 'event': 'workflow_run',
               'key': 'o/r', 'sender': 'x', 'delivery': 'd2',
               'payload': {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'x'},
@@ -1163,13 +1169,37 @@ class TestDispatchEvent(StateDirCase):
         deadline = time.time() + 10
         cfgs = []
         while time.time() < deadline:
-            with open(out, encoding='utf-8') as f:
-                cfgs = [json.loads(ln[len('CFG='):]) for ln in f.read().splitlines()
-                        if ln.startswith('CFG=')]
-            if len(cfgs) >= 2:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    cfgs = [json.loads(ln[len('CFG='):]) for ln in f.read().splitlines()
+                            if ln.startswith('CFG=')]
+                if len(cfgs) >= 2:
+                    break
+            time.sleep(0.05)
+        # Sorted: separate buckets are free to run concurrently, so arrival
+        # order is not the claim — that BOTH configs arrive is.
+        self.assertEqual(sorted(c['profile'] for c in cfgs), ['cheap-triage', 'deep-fix'])
+
+    def test_one_config_still_coalesces_inside_the_window(self):
+        """The fork-bomb bound the split must not have removed: one failing run
+        emits check_run and then workflow_run, both matched by the same watch,
+        and they must stay ONE session."""
+        out = os.path.join(self.state, 'spawned_coalesce.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat >/dev/null; echo SPAWN; } >> %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT,
+                  spawn_config={'profile': 'cheap-triage'})
+        for i in (1, 2, 3):
+            mod.dispatch_event(self.env(action='opened', issue={'number': i, 'title': 't'}))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if os.path.exists(out):
                 break
             time.sleep(0.05)
-        self.assertEqual(cfgs, [{'profile': 'cheap-triage'}, {'profile': 'deep-fix'}])
+        time.sleep(0.5)   # any second spawn would have to be immediate to be a bug
+        with open(out, encoding='utf-8') as f:
+            self.assertEqual(f.read().count('SPAWN'), 1)
 
     def test_no_spawn_config_is_an_empty_object_not_absent(self):
         # Same rule as META: a consumer can `.get()` an empty object, but a

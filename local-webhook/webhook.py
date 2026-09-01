@@ -486,14 +486,21 @@ def spawn_config_error(v):
 def clean_spawn_config(v):
     """The stored form. Applied on READ, so a hand-edited file with one bad pair
     keeps the rest of the watch working instead of taking the entry down — the
-    same direction normalize_entry already takes for a malformed topic."""
+    same direction normalize_entry already takes for a malformed topic.
+
+    A bad pair is DROPPED, never repaired. Truncating an over-long value would
+    be a third behaviour: subscribe REFUSES that value, so silently storing a
+    shortened one means the same text means one thing typed and another
+    hand-edited — and the spawn command would receive a setting nobody wrote.
+    """
     if not isinstance(v, dict):
         return {}
     out = {}
     for k in sorted(v, key=s):
         val = v[k]
-        if isinstance(k, str) and SPAWN_CONFIG_KEY.match(k) and isinstance(val, str):
-            out[k] = val[:SPAWN_CONFIG_MAX_VALUE]
+        if (isinstance(k, str) and SPAWN_CONFIG_KEY.match(k)
+                and isinstance(val, str) and len(val) <= SPAWN_CONFIG_MAX_VALUE):
+            out[k] = val
         if len(out) >= SPAWN_CONFIG_MAX_KEYS:
             break
     return out
@@ -1286,11 +1293,38 @@ class Dispatcher:
         #         defer_since: float|None, defer_n: int}
         self.keys = {}
 
+    # What COALESCES together. Not the routing key alone: a coalesced batch
+    # runs one spawn command and _pump hands it the NEWEST line's meta, so two
+    # watches on one repo carrying different spawnConfig would put one watch's
+    # events into a session started as the other worker — silently, and only
+    # while a spawn is in flight, which is the hardest kind of wrong to notice.
+    # So the config joins the key, and lines that differ in it queue apart.
+    #
+    # Same-config lines still coalesce, which is the whole point of the window:
+    # one failing run emits check_run and then workflow_run, both matched by the
+    # same watch, and they must stay one session. The fork-bomb bound is now per
+    # (key, config) rather than per key — a repo with N watches can hold N
+    # streams — but SPAWN_MAX still caps what runs at once, which is the bound
+    # that actually stops a fork bomb.
+    @staticmethod
+    def _bucket(key, meta):
+        cfg = (meta or {}).get('spawnConfig') or {}
+        return key if not cfg else '%s\x00%s' % (key, json.dumps(cfg, sort_keys=True))
+
+    # The routing key a bucket belongs to. Every message says what an operator
+    # subscribed to, never the internal separation: a log line reading
+    # "owner/repo\x00{...}" would send someone looking for a topic that does
+    # not exist.
+    @staticmethod
+    def _label(key):
+        return key.split('\x00', 1)[0]
+
     # env is the routing envelope the line came from, kept per line so a
     # coalesced batch can be re-examined line by line before it spawns;
     # callers with nothing to re-check (tests, non-github paths) may omit it.
     def add(self, key, text, meta, env=None):
         with self.lock:
+            key = self._bucket(key, meta)
             st = self.keys.setdefault(key, {'pending': [], 'running': False,
                                             'last_start': None, 'timer': None,
                                             'defer_since': None, 'defer_n': 0})
@@ -1360,7 +1394,8 @@ class Dispatcher:
                 # quietly stopped working (agent-box#170).
                 print('local-webhook: not spawning for %s on %s — session %s claimed it '
                       'while the batch waited'
-                      % ((env or {}).get('event', '') or '(none)', key or '(none)', owner),
+                      % ((env or {}).get('event', '') or '(none)',
+                         self._label(key) or '(none)', owner),
                       file=sys.stderr)
                 continue
             kept.append(item)
@@ -1381,7 +1416,7 @@ class Dispatcher:
         if waited >= self.defer_max:
             print('local-webhook: dropping %d event(s) for %s — the spawn command declined '
                   'them %d time(s) over %ds, past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=%s'
-                  % (len(items), key or '(none)', st['defer_n'] + 1, round(waited),
+                  % (len(items), self._label(key) or '(none)', st['defer_n'] + 1, round(waited),
                      self.defer_max), file=sys.stderr)
             st['defer_since'] = None
             st['defer_n'] = 0
@@ -1403,7 +1438,7 @@ class Dispatcher:
         del st['pending'][:over]
         print('local-webhook: pending batch for %s hit the %d-line cap — dropped %d '
               'oldest event(s); the spawn command is not keeping up'
-              % (key or '(none)', self.pending_max, over), file=sys.stderr)
+              % (self._label(key) or '(none)', self.pending_max, over), file=sys.stderr)
 
     def _on_timer(self, key):
         with self.lock:
@@ -1414,6 +1449,7 @@ class Dispatcher:
 
     def _run(self, key, items, meta):
         batch = [t for t, _, _ in items]
+        label = self._label(key) or '(none)'
         defer = False
         try:
             env = dict(os.environ)
@@ -1445,16 +1481,16 @@ class Dispatcher:
                 defer = True
                 print('local-webhook: spawn command declined %d event(s) for %s for now '
                       '(exit %d) — keeping the batch: %s'
-                      % (len(batch), key, SPAWN_DEFER_EXIT,
+                      % (len(batch), label, SPAWN_DEFER_EXIT,
                          p.stdout.decode('utf-8', 'replace').strip()[:500]), file=sys.stderr)
             elif p.returncode != 0:
                 print('local-webhook: spawn command exited %d for %s: %s'
-                      % (p.returncode, key, p.stdout.decode('utf-8', 'replace').strip()[:500]),
+                      % (p.returncode, label, p.stdout.decode('utf-8', 'replace').strip()[:500]),
                       file=sys.stderr)
         except subprocess.TimeoutExpired:
-            print('local-webhook: spawn command timed out (%ss) for %s' % (self.timeout, key), file=sys.stderr)
+            print('local-webhook: spawn command timed out (%ss) for %s' % (self.timeout, label), file=sys.stderr)
         except OSError as e:
-            print('local-webhook: spawn command failed for %s: %s' % (key, e), file=sys.stderr)
+            print('local-webhook: spawn command failed for %s: %s' % (label, e), file=sys.stderr)
         finally:
             with self.lock:
                 self.active -= 1
