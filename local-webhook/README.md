@@ -3,7 +3,8 @@
 One-way MCP **channel** plugin: receives HMAC-signed webhook deliveries over
 HTTP (GitHub or any other sender that signs the raw body with HMAC-SHA256) and
 pushes a concise, untrusted-marked summary of each event into the Claude Code
-session that spawned it. Ships MCP tools (`webhook_subscribe`,
+session that spawned it — or, since 0.26.0, into a
+[codex session](#delivering-into-a-codex-session-0260) via `codex queue`. Ships MCP tools (`webhook_subscribe`,
 `webhook_unsubscribe`, `webhook_subscriptions`) so the agent can route which
 topics reach it — hot-reloaded per delivery, no session restart needed — plus an
 equivalent [CLI](#cli) for callers with no MCP client.
@@ -24,8 +25,8 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
                     ┌───────────────────┼───────────────────┐
                     ▼                    ▼                    ▼
      <state>/instances/<pid>.sock   …/<pid>.sock         …/<pid>.sock
-       webhook.py (session A)     webhook.py (B)      webhook.py (C)
-         ──stdio/MCP──> claude       ──> claude          ──> claude
+       webhook.py (session A)     webhook.py (B)      webhook.py (codex C)
+         ──stdio/MCP──> claude       ──> claude       ──`codex queue`──> codex
                                         │
                           ~/.local/state/local-webhook/
                             sources.json           (who may deliver, secrets)
@@ -34,6 +35,8 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
                             filter.dispatch.json   (shared standing watches →
                                                     spawn a fresh session, 0.9.0)
                             receiver.json          (daemon advertisement)
+                            codex/<session>.json   (codex delivery peer: pid +
+                                                    thread, 0.26.0)
 ```
 
 - The **ingress owner** verifies the HMAC once and re-broadcasts each event to
@@ -45,6 +48,11 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
     ingress (a systemd-socket-activated unix socket) and has no session of its
     own; every session runs with `LOCAL_WEBHOOK_PORT=0` as a pure IPC peer. This
     keeps the box's one webhook endpoint up regardless of which sessions exist.
+- A **codex** session peer is the same peer with a different last inch: a
+  detached `webhook.py codex-peer` process that hands each delivery to
+  `codex queue` instead of writing an MCP notification. It is started by the
+  session's own `subscribe` (see
+  [Delivering into a codex session](#delivering-into-a-codex-session-0260)).
 - Subscriptions are **per session**: set `LOCAL_WEBHOOK_SESSION=<id>` and each
   session gets its own `filter.<session>.json`, so a `webhook_subscribe` in one
   session never leaks into a sibling that happens to act as the same identity.
@@ -542,9 +550,88 @@ mirror the tool arguments;
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.
 
-A CLI invocation binds nothing: it is not a session peer and never owns the
-ingress (`emit` connects to it as a client), so it is safe to run alongside the
-daemon and any number of sessions.
+`--codex-thread ID` and `--no-codex-peer` control codex delivery and are
+documented in the next section.
+
+A CLI invocation binds nothing itself: it is not a session peer and never owns
+the ingress (`emit` connects to it as a client), so it is safe to run alongside
+the daemon and any number of sessions. Run from inside a codex session,
+`subscribe` additionally *starts* that session's delivery peer (a separate
+detached process) and `unsubscribe` stops it.
+
+## Delivering into a codex session (0.26.0)
+
+codex cannot host this plugin. It has no channel notification to receive, and it
+spawns its MCP servers with a scrubbed environment (`PATH` and nothing else,
+measured on codex-cli 0.149.0), so an MCP-side peer could not even learn which
+thread it belongs to. What codex has instead is an inbound path the claude side
+lacks: `codex queue --thread <id> --message <text>` hands a message to an
+existing session through the local app-server daemon, and an idle session picks
+it up straight away.
+
+A codex session peer is therefore a small **detached process** rather than an
+MCP server — same IPC socket, same `filter.<session>.json`, same
+`[UNTRUSTED webhook:…]` text out of the shared renderer, `codex queue` where a
+claude peer writes a `notifications/claude/channel` line:
+
+```
+<state>/instances/<session>.<pid>.sock      the peer, like any other
+<state>/codex/<session>.json                its pid + thread (what `status` reads)
+<state>/codex/<session>.log                 what it queued, and what failed
+```
+
+Because the socket is real, so is everything keyed off it: `peer_scopes_live()`
+sees a codex session, and a standing watch will not spawn a second session onto
+an object this one **claimed** with an `--include`.
+
+### Starting it
+
+Run `subscribe` from inside the codex session; the peer starts itself:
+
+    python3 webhook.py subscribe owner/repo --note "PR 42: waiting on CI" \
+        --include '{"path":"pull_request.number","in":[42]}'
+    subscribed to github:owner/repo "PR 42: waiting on CI" [include+exclude rules]; …
+    codex delivery: started peer for thread 01a05e6c-… (pid 4136707) — deliveries
+    arrive as a queued message at the next turn boundary
+
+The thread id is the one thing only the session knows: codex exports
+`CODEX_THREAD_ID` (and `CODEX_SESSION_ID`) into the environment of the shell
+tool it runs, which is where the agent's own `subscribe` happens. Resolution
+order is `LOCAL_WEBHOOK_CODEX_THREAD` (an outside supervisor that knows the id),
+then `CODEX_THREAD_ID`, then `CODEX_SESSION_ID`. `--codex-thread ID` overrides
+all three; `--no-codex-peer` writes the subscription and starts nothing, for a
+supervisor that runs `webhook.py codex-peer --thread <id>` itself.
+
+Subscribing again with a **different** thread retargets the peer (one session,
+one filter, one peer); `--deliver-to subagent` starts none, since a standing
+watch is not delivered into this session at all.
+
+### When it stops
+
+- `unsubscribe` that leaves no live subscription stops it immediately.
+- Otherwise it exits once no unexpired subscription has been left for
+  `LOCAL_WEBHOOK_CODEX_IDLE` seconds (default 300) — a lapsed TTL is how a quiet
+  session says it is done.
+- It gives up after `LOCAL_WEBHOOK_CODEX_FAIL_MAX` (3) consecutive
+  `codex queue` failures: a deleted or archived thread fails every time, and the
+  events are gone either way.
+- SIGTERM/SIGINT/SIGHUP are clean exits, so no stale `instances/*.sock` is left.
+
+### Two properties of `codex queue` worth knowing
+
+- **Delivery lands at the next turn boundary.** An idle session wakes at once; a
+  message queued mid-turn waits for that turn to end (measured: queued 12s into
+  a 45s turn, delivered when it finished). Mid-turn injection exists in the
+  app-server protocol as `turn/steer`, has no CLI, and is not used here.
+- **Queueing to a thread that exists but is not running succeeds.** The message
+  is stored and surfaces whenever that thread is next resumed — which is why the
+  peer's life is bounded by the subscriptions above rather than by any signal
+  from codex. A peer left running against a finished session would stockpile
+  events for whoever resumes it.
+
+The delivery text is passed as one argv element to `codex queue` with no shell
+involved: payload strings are hostile, and this is the equivalent of the
+stdin-only rule the dispatch path follows for spawn prompts.
 
 ## Wiring a GitHub repo
 
@@ -608,6 +695,11 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SPAWN_TIMEOUT` | `600` | seconds before a running spawn command is killed (and its batch dropped) |
 | `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S` | `300` | how long a batch the spawn command keeps declining (exit `75`) is kept before it is dropped; `0` disables deferral |
 | `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` | `200` | max event lines waiting per key; past it the oldest are dropped |
+| `LOCAL_WEBHOOK_CODEX_THREAD` | — | codex thread (UUID or exact session name) this process delivers to; wins over `CODEX_THREAD_ID` / `CODEX_SESSION_ID`, which codex itself exports |
+| `LOCAL_WEBHOOK_CODEX_BIN` | `codex` | the codex CLI to hand deliveries to (`codex queue`) |
+| `LOCAL_WEBHOOK_CODEX_IDLE` | `300` | seconds with no live subscription before a codex peer exits (min 30) |
+| `LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT` | `30` | seconds before one `codex queue` call is abandoned |
+| `LOCAL_WEBHOOK_CODEX_FAIL_MAX` | `3` | consecutive `codex queue` failures before the peer gives up |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source if `sources.json` is absent |
 
 When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress

@@ -3,6 +3,12 @@
 # deliveries — from GitHub or any other sender that signs the raw body with
 # HMAC-SHA256 — into the Claude Code session that spawned it.
 #
+# Since 0.26.0 a codex session gets the same channel by a different last inch:
+# it cannot host an MCP channel, so a detached session peer delivers with
+# `codex queue` instead (see "codex delivery"). Everything before that inch —
+# ingress, HMAC, topic routing, TTLs, claims, standing-watch suppression — is
+# one implementation for both.
+#
 # Deliberately dependency-free (no MCP SDK, no pip packages): the stdio side
 # is a small hand-rolled JSON-RPC loop, the HTTP side is http.server. That
 # keeps the plugin a single file that runs from any plugin-cache directory
@@ -23,6 +29,8 @@ import json
 import math
 import os
 import re
+import shutil
+import signal
 import socket
 import socketserver
 import subprocess
@@ -33,7 +41,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.25.0'
+VERSION = '0.26.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -42,7 +50,11 @@ VERSION = '0.25.0'
 # is not a session peer (no IPC socket to claim, no stdio loop) and must never
 # steal the ingress from the daemon — it reads/writes the filter file and exits.
 CLI_ARGV = sys.argv[1:]
-CLI = len(CLI_ARGV) > 0
+# `codex-peer` is the one argv that is NOT a one-shot CLI call: it IS a session
+# peer (see "codex delivery"), so it must claim an IPC socket and run forever
+# like the stdio peer does, not read the filter file and exit.
+CODEX_PEER = len(CLI_ARGV) > 0 and CLI_ARGV[0] == 'codex-peer'
+CLI = len(CLI_ARGV) > 0 and not CODEX_PEER
 
 
 def _int_env(*names, default=0):
@@ -1004,6 +1016,375 @@ def filter_claims(path, source, key, sender, event, payload=None):
     return False
 
 
+# --------------------------------------------------------- codex delivery ---
+# A codex session cannot host this plugin the way a claude session does. codex
+# has no channel notification to receive, and it spawns its MCP servers with a
+# scrubbed environment (PATH and nothing else, measured on codex-cli 0.149.0),
+# so an MCP-side peer could not even learn which thread it belongs to. What
+# codex has instead is an inbound path the claude side lacks:
+# `codex queue --thread <id> --message <text>` hands a message to an EXISTING
+# session through the local app-server daemon, and an idle one picks it up
+# straight away.
+#
+# So a codex session peer is a small detached process rather than an MCP
+# server: same IPC socket, same per-session filter file, same UNTRUSTED
+# framing out of format_delivery — only the last inch differs, `codex queue`
+# where a claude peer writes a notifications/claude/channel line. Everything
+# that keys off a peer socket therefore keeps working for a codex session,
+# including the one that matters most: peer_scopes_live(), and so the
+# standing-watch suppression that stops a second session being spawned onto
+# work this session has declared.
+#
+# The thread id is the one thing only the session itself knows. codex exports
+# CODEX_THREAD_ID into the environment of the shell tool it runs, so a
+# `webhook.py subscribe` invoked BY the codex agent sees it and starts (or
+# retargets) the peer for that thread. That is why the peer is started from
+# subscribe rather than by a supervisor: outside the session's own shell there
+# is nothing to read the id from. A supervisor that does know it can pass
+# LOCAL_WEBHOOK_CODEX_THREAD instead.
+#
+# Two properties of `codex queue` — not of this code — shape the rest:
+#   - Delivery lands at the next TURN BOUNDARY. A queued message wakes an idle
+#     session at once, but one queued mid-turn waits for that turn to finish
+#     (measured: queued 12s into a 45s turn, delivered when the turn ended).
+#     Mid-turn injection exists in the app-server protocol (turn/steer) and has
+#     no CLI, so it is not used here.
+#   - A queue to a thread that exists but is NOT running SUCCEEDS: the message
+#     is stored and surfaces whenever that thread is next resumed. So a peer
+#     left pointing at a finished session does not fail loudly — it quietly
+#     stockpiles events that ambush whoever resumes the thread days later.
+#     That is what the idle exit below is for, and why the peer's life is
+#     bounded by the subscriptions rather than by a signal from codex.
+CODEX_BIN = (os.environ.get('LOCAL_WEBHOOK_CODEX_BIN') or '').strip() or 'codex'
+CODEX_DIR = os.path.join(STATE_DIR, 'codex')
+# Grace period before a peer with no live subscriptions left exits. Not a
+# heartbeat: it is the answer to "this session has stopped subscribing", so it
+# only has to be short enough that a finished session's peer does not outlive
+# it by long, and long enough that an unsubscribe/re-subscribe pair (or a
+# lapsed TTL the agent renews) does not cost a restart.
+CODEX_PEER_IDLE_S = max(30, _int_env('LOCAL_WEBHOOK_CODEX_IDLE', default=300))
+CODEX_QUEUE_TIMEOUT_S = max(5, _int_env('LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT', default=30))
+# Consecutive `codex queue` failures before the peer stops trying. A thread
+# that has been deleted, or a codex install that has gone away, fails every
+# time, and a peer that keeps retrying it just fills its log; the events are
+# gone either way (like a failed spawn, there is nothing to retry into). One
+# failure is not enough — the app-server daemon can be restarting.
+CODEX_FAIL_MAX = max(1, _int_env('LOCAL_WEBHOOK_CODEX_FAIL_MAX', default=3))
+# Bound on the text handed to `codex queue`. The message is one argv element
+# and no shell is involved, so nothing in it is parsed — this is about ARG_MAX
+# and about not pasting a pathological payload into a session's context. The
+# summaries are one line and already field-truncated by s(), so this only ever
+# catches something unforeseen.
+CODEX_MSG_MAX = 8000
+
+
+def codex_thread_from_env(env=None):
+    """The codex thread this process should deliver to, from the environment.
+
+    LOCAL_WEBHOOK_CODEX_THREAD is the explicit override (a supervisor that
+    started the session knows the id without being inside it); CODEX_THREAD_ID
+    and CODEX_SESSION_ID are what codex itself exports into the shell tool's
+    environment, which is where the agent's own `subscribe` call runs.
+    """
+    env = os.environ if env is None else env
+    for name in ('LOCAL_WEBHOOK_CODEX_THREAD', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID'):
+        v = (env.get(name) or '').strip()
+        if v:
+            return v
+    return ''
+
+
+def codex_thread_invalid_reason(thread):
+    """Why this thread handle is unusable, or None. `codex queue --thread`
+    takes a session UUID or an exact session name, so the value is not ours to
+    validate beyond the two things that would misfire: nothing to pass, and a
+    leading dash, which codex's own argument parser would read as a flag."""
+    if not thread:
+        return 'no codex thread id (CODEX_THREAD_ID is unset — is this a codex session?)'
+    if thread.startswith('-'):
+        return 'a codex thread id must not start with "-" (it would parse as a flag)'
+    if len(thread) > 200 or re.search(r'[\x00-\x1f\x7f]', thread):
+        return 'implausible codex thread id (too long, or contains control characters)'
+    return None
+
+
+def codex_peer_file(key):
+    """Where the peer for a filter key records itself. Keyed by filter key, not
+    by thread: one session has one filter and so deserves exactly one peer, and
+    a thread handle (which may be a free-text session name) never has to be
+    made safe for a filename."""
+    return os.path.join(CODEX_DIR, '%s.json' % (key or '_'))
+
+
+def read_codex_peer(key):
+    try:
+        with open(codex_peer_file(key), encoding='utf-8') as fh:
+            info = json.load(fh)
+        return info if isinstance(info, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_codex_peer(key, info):
+    try:
+        os.makedirs(CODEX_DIR, mode=0o700, exist_ok=True)
+        with open(codex_peer_file(key), 'w', encoding='utf-8') as fh:
+            fh.write(pretty(info) + '\n')
+        return True
+    except OSError as e:
+        print('local-webhook: could not record the codex peer (%s)' % e, file=sys.stderr)
+        return False
+
+
+def clear_codex_peer(key, only_pid=None):
+    """Remove the record, unless it has been claimed by a newer peer — a peer
+    exiting must not delete the file its own replacement just wrote."""
+    if only_pid is not None:
+        info = read_codex_peer(key)
+        if info and info.get('pid') != only_pid:
+            return
+    try:
+        os.unlink(codex_peer_file(key))
+    except OSError:
+        pass
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # EPERM: alive, just not ours to signal
+    return True
+
+
+def codex_queue(thread, text):
+    """Hand one delivery to a codex session. Returns (ok, detail).
+
+    argv, never a shell: the text is attacker-influenced (it is a rendered
+    webhook payload), and the whole reason dispatch puts spawn text on stdin is
+    to keep such strings away from shell parsing. `codex queue` has no stdin
+    input path, so the equivalent guarantee here is that the message is one
+    argv element of a command run WITHOUT shell=True.
+    """
+    reason = codex_thread_invalid_reason(thread)
+    if reason:
+        return False, reason
+    msg = text if len(text) <= CODEX_MSG_MAX else text[:CODEX_MSG_MAX - 3] + '...'
+    try:
+        p = subprocess.run([CODEX_BIN, 'queue', '--thread', thread, '--message', msg],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=CODEX_QUEUE_TIMEOUT_S)
+    except FileNotFoundError:
+        return False, '%s: command not found (set LOCAL_WEBHOOK_CODEX_BIN)' % CODEX_BIN
+    except subprocess.TimeoutExpired:
+        return False, 'codex queue timed out after %ds' % CODEX_QUEUE_TIMEOUT_S
+    except OSError as e:
+        return False, 'codex queue could not run (%s)' % e
+    out_text = (p.stdout or b'').decode('utf-8', 'replace').strip()
+    if p.returncode != 0:
+        return False, out_text or 'codex queue exited %d' % p.returncode
+    return True, out_text
+
+
+# Set at import so it is in place before the IPC listener below starts
+# accepting deliveries; a peer that learned its thread in main() could be
+# handed an event first.
+CODEX_PEER_THREAD = ''
+if CODEX_PEER:
+    _rest = CLI_ARGV[1:]
+    for _i, _a in enumerate(_rest):
+        if _a in ('--thread', '--codex-thread') and _i + 1 < len(_rest):
+            CODEX_PEER_THREAD = _rest[_i + 1].strip()
+        elif _a.startswith('--thread='):
+            CODEX_PEER_THREAD = _a.split('=', 1)[1].strip()
+    if not CODEX_PEER_THREAD:
+        CODEX_PEER_THREAD = codex_thread_from_env()
+
+# Delivery counters, read by the peer's own idle loop. Written from the IPC
+# thread, read from the main one; both are single assignments of ints, and the
+# only consumer is a log line and a give-up test, so no lock earns its keep.
+CODEX_STATS = {'delivered': 0, 'failed': 0, 'consecutiveFailures': 0, 'lastAt': 0, 'lastError': ''}
+
+
+def codex_deliver(text, meta):
+    ok, detail = codex_queue(CODEX_PEER_THREAD, text)
+    CODEX_STATS['lastAt'] = now_ms()
+    if ok:
+        CODEX_STATS['delivered'] += 1
+        CODEX_STATS['consecutiveFailures'] = 0
+        print('local-webhook: queued %s delivery for codex thread %s'
+              % (meta.get('source', '?'), CODEX_PEER_THREAD), file=sys.stderr)
+    else:
+        CODEX_STATS['failed'] += 1
+        CODEX_STATS['consecutiveFailures'] += 1
+        CODEX_STATS['lastError'] = detail
+        print('local-webhook: codex delivery failed (%s)' % detail, file=sys.stderr)
+
+
+def live_topic_count(path=None, now=None):
+    """Unexpired subscriptions in a filter file — what the peer's idle exit
+    asks about. Uses read_filter's own clamping/expiry rules so "live" here and
+    "forwards" at delivery time can never disagree."""
+    f = read_filter(path or FILTER_FILE)
+    now = now_ms() if now is None else now
+    return sum(0 if entry_expired(e, f['ttlHours'], now) else 1 for e in f['topics'])
+
+
+def ensure_codex_peer(thread, key=None, argv0=None):
+    """Start the codex delivery peer for this session, or confirm one is up.
+
+    Returns a dict with 'state': 'running' (already up for this thread),
+    'started', 'retargeted' (a peer was up for a DIFFERENT thread — the session
+    was resumed, or a filter key got reused — so it is replaced) or 'failed'.
+    """
+    key = FILTER_KEY if key is None else key
+    reason = codex_thread_invalid_reason(thread)
+    if reason:
+        return {'state': 'failed', 'error': reason}
+    # Fail here rather than three seconds later in a log nobody reads: without
+    # the binary the peer can accept deliveries and drop every one of them.
+    if not shutil.which(CODEX_BIN):
+        return {'state': 'failed',
+                'error': '%s: command not found (set LOCAL_WEBHOOK_CODEX_BIN)' % CODEX_BIN}
+    state = 'started'
+    cur = read_codex_peer(key)
+    if cur and pid_alive(cur.get('pid')):
+        if (cur.get('thread') or '') == thread:
+            return {'state': 'running', 'pid': cur['pid'], 'thread': thread}
+        state = 'retargeted'
+        try:
+            os.kill(cur['pid'], 15)
+        except OSError:
+            pass
+    try:
+        os.makedirs(CODEX_DIR, mode=0o700, exist_ok=True)
+        log = open(os.path.join(CODEX_DIR, '%s.log' % (key or '_')), 'a', encoding='utf-8')
+    except OSError as e:
+        return {'state': 'failed', 'error': 'could not open the peer log (%s)' % e}
+    script = argv0 or os.path.abspath(__file__)
+    env = dict(os.environ)
+    # The child IS a session peer, so it must resolve the same filter key and
+    # bind no ingress of its own (the daemon owns it; in the legacy shape
+    # whichever session won the port race does).
+    env['LOCAL_WEBHOOK_SESSION'] = key
+    env['LOCAL_WEBHOOK_CODEX_THREAD'] = thread
+    env['LOCAL_WEBHOOK_PORT'] = '0'
+    env.pop('LOCAL_WEBHOOK_RECEIVER_ONLY', None)
+    try:
+        with log:
+            p = subprocess.Popen([sys.executable, script, 'codex-peer', '--thread', thread],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 env=env, start_new_session=True, close_fds=True)
+    except OSError as e:
+        return {'state': 'failed', 'error': 'could not start the peer (%s)' % e}
+    info = {'pid': p.pid, 'thread': thread, 'key': key, 'version': VERSION,
+            'startedAt': iso_at(now_ms())}
+    write_codex_peer(key, info)
+    # A peer that dies on startup (no codex, an unwritable state dir) must not
+    # be reported as running: it would look subscribed and deliver nothing.
+    time.sleep(0.4)
+    if p.poll() is not None:
+        clear_codex_peer(key, only_pid=p.pid)
+        return {'state': 'failed',
+                'error': 'the peer exited immediately (%d); see %s'
+                         % (p.returncode, os.path.join(CODEX_DIR, '%s.log' % (key or '_')))}
+    return {'state': state, 'pid': p.pid, 'thread': thread}
+
+
+def stop_codex_peer(key=None):
+    """Stop this session's codex peer, if one is running. Returns the pid it
+    signalled, or None."""
+    key = FILTER_KEY if key is None else key
+    cur = read_codex_peer(key)
+    if not cur or not pid_alive(cur.get('pid')):
+        clear_codex_peer(key)
+        return None
+    try:
+        os.kill(cur['pid'], 15)
+    except OSError:
+        pass
+    clear_codex_peer(key, only_pid=cur.get('pid'))
+    return cur.get('pid')
+
+
+def codex_peer_status(key=None):
+    """What `status` reports about this session's codex delivery peer."""
+    key = FILTER_KEY if key is None else key
+    cur = read_codex_peer(key)
+    if not cur:
+        return None
+    cur = dict(cur)
+    cur['alive'] = pid_alive(cur.get('pid'))
+    return cur
+
+
+def run_codex_peer():
+    """The peer process: an IPC listener (opened at import, like any session
+    peer) plus this loop, whose only job is deciding when to stop existing."""
+    reason = codex_thread_invalid_reason(CODEX_PEER_THREAD)
+    if reason:
+        print('local-webhook: codex peer refusing to start — %s' % reason, file=sys.stderr)
+        sys.exit(2)
+    # The IPC socket is this peer's ONLY input: unlike the stdio peer, which
+    # would at least still answer MCP calls, a codex peer that failed to bind
+    # (a state dir whose path exceeds the AF_UNIX limit is the one that bites —
+    # observed on first run) can never receive a delivery. Exit instead of
+    # holding a pid file and a thread handle that promise delivery.
+    if not os.path.exists(IPC_SOCK):
+        print('local-webhook: codex peer has no IPC socket (%s) — nothing can reach it; exiting'
+              % IPC_SOCK, file=sys.stderr)
+        sys.exit(1)
+    key = FILTER_KEY
+    # Reclaim the record whatever started us: a supervisor may run the peer
+    # directly, in which case nothing else has written one.
+    write_codex_peer(key, {'pid': os.getpid(), 'thread': CODEX_PEER_THREAD, 'key': key,
+                           'version': VERSION, 'startedAt': iso_at(now_ms())})
+    atexit.register(clear_codex_peer, key, os.getpid())
+    # A retarget or an unsubscribe stops this process with SIGTERM, whose
+    # default action skips atexit — which would leave the pid record and, worse,
+    # a stale instances/*.sock behind. Turning the signal into a normal exit is
+    # what makes "no stale socket left behind" true for this peer too.
+    def _stop(signum, _frame):
+        print('local-webhook: codex peer stopping (signal %d)' % signum, file=sys.stderr)
+        sys.exit(0)
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _stop)
+        except (OSError, ValueError):  # not available / not the main thread
+            pass
+    print('local-webhook %s: codex peer up for thread %s (filter %s, socket %s)'
+          % (VERSION, CODEX_PEER_THREAD, FILTER_FILE, IPC_SOCK), file=sys.stderr)
+    empty_since = None
+    while True:
+        time.sleep(5)
+        if CODEX_STATS['consecutiveFailures'] >= CODEX_FAIL_MAX:
+            print('local-webhook: codex peer giving up after %d consecutive delivery failures '
+                  '(last: %s)' % (CODEX_STATS['consecutiveFailures'], CODEX_STATS['lastError']),
+                  file=sys.stderr)
+            return
+        live = live_topic_count()
+        if live:
+            empty_since = None
+            continue
+        # Nothing left to deliver. Not an error — a session unsubscribes when
+        # it wraps up, and a TTL lapses when it goes quiet — so exit rather
+        # than sit on a socket and a thread handle that may outlive the
+        # session it points at.
+        now = time.monotonic()
+        if empty_since is None:
+            empty_since = now
+        elif now - empty_since >= CODEX_PEER_IDLE_S:
+            print('local-webhook: codex peer exiting — no live subscriptions for %ds '
+                  '(delivered %d, failed %d)'
+                  % (CODEX_PEER_IDLE_S, CODEX_STATS['delivered'], CODEX_STATS['failed']),
+                  file=sys.stderr)
+            return
+
+
 # ---------------------------------------------------------------- fan-out ---
 # One process owns the HTTP ingress (the RECEIVER_ONLY daemon on agent-box, or
 # whichever session won the port race in the legacy setup); every session runs
@@ -1063,13 +1444,8 @@ def peer_scopes_live():
         # session peer (deliver() self-delivers before broadcasting), so its
         # subscription owns the event exactly like any sibling's. The
         # RECEIVER_ONLY daemon opens no socket and so never appears here.
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        except OSError:
-            pass  # EPERM: alive, just not ours to signal
-        scopes.append(key)
+        if pid_alive(pid):
+            scopes.append(key)
     return scopes
 
 
@@ -1101,6 +1477,11 @@ def handle_event(env):
     if not r['forward']:
         return
     text, meta = format_delivery(env, r['entry'])
+    if CODEX_PEER:
+        # Same text, same meta, same UNTRUSTED framing — a codex session just
+        # has to be handed it rather than notified.
+        codex_deliver(text, meta)
+        return
     out({
         'jsonrpc': '2.0',
         'method': 'notifications/claude/channel',
@@ -2671,6 +3052,19 @@ source or for everything: name a key or a prefix.
                        max. Echoed by `ls` and readable from the spawned
                        process's environment: routing config, not secrets.
                        --no-spawn-config clears it on re-subscribe
+  --codex-thread ID    deliver into this codex thread (a session UUID or an
+                       exact session name) instead of the one this process's
+                       environment names. Rarely needed: run from inside a
+                       codex session, CODEX_THREAD_ID already says which
+  --no-codex-peer      subscribe WITHOUT starting a codex delivery peer — the
+                       filter entry is written and nothing delivers into this
+                       session (for a supervisor that runs its own peer)
+
+In a CODEX session, subscribe also starts the small detached peer that delivers
+into it: codex has no channel to attach at startup, so `codex queue` carries
+each event in as a message at the next turn boundary. It stops itself once no
+live subscription is left. `status` reports the thread and the peer, which is
+where to look when subscriptions seem healthy but nothing arrives.
 
 emit puts a BOX-LOCAL event (a budget warning, a full disk, an OOM kill) on the
 same bus as any webhook: the JSON payload — an argument, or stdin when omitted
@@ -2822,6 +3216,12 @@ def run_cli(argv):
             'session': SESSION or None,
             'self': SELF or None,
             'filterFile': FILTER_FILE,
+            # Which last inch this session's deliveries take. A claude session
+            # is its own peer (the MCP stdio process), so it has no record
+            # here; a codex session's peer is a separate process that can be
+            # missing or dead while the subscriptions look perfectly healthy.
+            'codexThread': codex_thread_from_env() or None,
+            'codexPeer': codex_peer_status(),
             'enabled': f['enabled'],
             'topicCount': len(f['topics']),
             'dispatchTopicCount': len(read_filter(DISPATCH_FILE)['topics']),
@@ -2847,6 +3247,11 @@ def run_cli(argv):
     saw_ignore = False
     spawn_config = {}
     saw_spawn_config = False
+    # Codex delivery is decided here, not in call_tool: it is a property of the
+    # PROCESS that subscribed (does its environment carry a codex thread?), not
+    # of the subscription, and the MCP tool path only ever runs inside claude.
+    codex_thread = ''
+    codex_peer = True
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -2875,6 +3280,10 @@ def run_cli(argv):
             if v not in ('session', 'subagent'):
                 die('--deliver-to must be "session" or "subagent"')
             args['deliver_to'] = v
+        elif a == '--codex-thread':
+            codex_thread = value().strip()
+        elif a == '--no-codex-peer':
+            codex_peer = False
         elif a == '--renew-on-event':
             args['renew_on_event'] = True
         elif a == '--no-renew-on-event':
@@ -2924,6 +3333,37 @@ def run_cli(argv):
     res = call_tool({'name': tool, 'arguments': args})
     text = '\n'.join(c['text'] for c in res['content'])
     print(text)
+    failed = text.startswith('error: ')
+    thread = codex_thread or codex_thread_from_env()
+    if not failed and codex_peer and thread:
+        # A codex session has no channel to attach at startup, so the peer that
+        # delivers into it is started by the act of subscribing — the first
+        # moment anything knows both the thread id and that there is something
+        # to deliver. A "subagent" watch is not delivered into THIS session, so
+        # it needs no peer.
+        if tool == 'webhook_subscribe' and args.get('deliver_to', 'session') == 'session':
+            r = ensure_codex_peer(thread)
+            if r['state'] == 'failed':
+                # Not fatal to the subscription — the filter entry is written
+                # and a later subscribe (or a supervisor) can still bring the
+                # peer up — but it must be loud: the events would otherwise go
+                # nowhere and look subscribed.
+                print('local-webhook: WARNING — subscribed, but codex delivery is NOT wired: %s'
+                      % r['error'], file=sys.stderr)
+            elif r['state'] == 'running':
+                print('codex delivery: peer already running for thread %s (pid %d)'
+                      % (r['thread'], r['pid']))
+            else:
+                print('codex delivery: %s peer for thread %s (pid %d) — deliveries arrive as a '
+                      'queued message at the next turn boundary'
+                      % ('started' if r['state'] == 'started' else 'retargeted the',
+                         r['thread'], r['pid']))
+        elif tool == 'webhook_unsubscribe' and live_topic_count() == 0:
+            # Last live subscription gone: stop delivering rather than leave a
+            # peer holding a thread handle that may outlive the session.
+            pid = stop_codex_peer()
+            if pid:
+                print('codex delivery: stopped the peer (pid %d) — no live subscriptions left' % pid)
     # call_tool reports argument/pattern problems in-band (the MCP convention);
     # for a CLI those must be a non-zero exit so callers and `set -e` notice.
     if text.startswith('error: '):
@@ -2935,7 +3375,13 @@ def run_cli(argv):
 # its pieces; .mcp.json and the daemon run the script directly, so nothing
 # changes for real callers.
 def main():
-    if CLI:
+    if CODEX_PEER:
+        # A session peer with no stdio transport: the IPC listener is already
+        # up (opened at import, like every peer's), so all that is left is the
+        # loop that decides when this session's deliveries stop mattering. It
+        # binds no ingress — the daemon owns that.
+        run_codex_peer()
+    elif CLI:
         run_cli(CLI_ARGV)
     elif RECEIVER_ONLY:
         httpd = listen_ingress()

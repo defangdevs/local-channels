@@ -1865,6 +1865,193 @@ class TestDispatcher(StateDirCase):
         self.assertIn('hit the 3-line cap', err.getvalue())
 
 
+class CodexFake:
+    """A stand-in `codex` binary that records how it was called.
+
+    The point of every codex test: nothing here may depend on a real codex
+    install, and the recording has to preserve argv BOUNDARIES — the delivery
+    text is a rendered webhook payload, so "was it one argv element, unparsed"
+    is the security property under test, not a detail.
+    """
+
+    def __init__(self, dirpath, exit_code=0, message=''):
+        # Its own directory: the state dir already owns a "codex" entry (the
+        # peer records live in STATE_DIR/codex/), and a fake binary sitting on
+        # that name would fail the peer for the wrong reason.
+        bindir = os.path.join(dirpath, 'fake-bin')
+        os.makedirs(bindir, exist_ok=True)
+        self.log = os.path.join(bindir, 'codex-calls.jsonl')
+        self.path = os.path.join(bindir, 'codex')
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write('#!%s\n' % PYTHON)
+            f.write('import json, sys\n')
+            f.write('open(%r, "a").write(json.dumps(sys.argv[1:]) + "\\n")\n' % self.log)
+            f.write('sys.stdout.write(%r)\n' % (message or ''))
+            f.write('sys.exit(%d)\n' % exit_code)
+        os.chmod(self.path, 0o755)
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding='utf-8') as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def messages(self):
+        # The value of --message, per call.
+        out = []
+        for argv in self.calls():
+            if '--message' in argv:
+                out.append(argv[argv.index('--message') + 1])
+        return out
+
+
+class TestCodexDelivery(StateDirCase):
+    """The codex last inch (0.26.0): thread resolution, `codex queue`, and the
+    peer bookkeeping around it."""
+
+    def test_thread_resolution_precedence(self):
+        f = self.mod.codex_thread_from_env
+        self.assertEqual(f({}), '')
+        self.assertEqual(f({'CODEX_SESSION_ID': 'sess'}), 'sess')
+        # codex exports both; the thread id is the handle `codex queue` wants.
+        self.assertEqual(f({'CODEX_SESSION_ID': 'sess', 'CODEX_THREAD_ID': 'thr'}), 'thr')
+        # An explicit override wins over both: a supervisor that started the
+        # session knows the id without being inside it.
+        self.assertEqual(f({'CODEX_THREAD_ID': 'thr',
+                            'LOCAL_WEBHOOK_CODEX_THREAD': 'told'}), 'told')
+        self.assertEqual(f({'CODEX_THREAD_ID': '  '}), '')
+
+    def test_thread_validation(self):
+        bad = self.mod.codex_thread_invalid_reason
+        self.assertIn('CODEX_THREAD_ID', bad(''))
+        # Would be read as a flag by codex's own parser, not as a value.
+        self.assertIn('must not start', bad('--help'))
+        self.assertIn('implausible', bad('thr\nqueue'))
+        self.assertIn('implausible', bad('t' * 201))
+        # A UUID and a free-text session name are both legal handles.
+        self.assertIsNone(bad('01a05e6c-b5f2-7cf1-b3e6-54339755dfc5'))
+        self.assertIsNone(bad('my session name'))
+
+    def test_queue_passes_the_message_as_one_unparsed_argv_element(self):
+        fake = CodexFake(self.state)
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        hostile = 'PR #1 opened by $(whoami); rm -rf ~ `id` && echo "quoted"'
+        ok, detail = mod.codex_queue('thr-1', hostile)
+        self.assertTrue(ok, detail)
+        self.assertEqual(fake.calls(), [['queue', '--thread', 'thr-1', '--message', hostile]])
+
+    def test_queue_truncates_a_pathological_payload(self):
+        fake = CodexFake(self.state)
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        ok, _ = mod.codex_queue('thr-1', 'x' * (mod.CODEX_MSG_MAX + 500))
+        self.assertTrue(ok)
+        sent = fake.messages()[0]
+        self.assertEqual(len(sent), mod.CODEX_MSG_MAX)
+        self.assertTrue(sent.endswith('...'))
+
+    def test_queue_reports_failures(self):
+        fake = CodexFake(self.state, exit_code=1,
+                         message='Error: no rollout found for thread id thr-1')
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        ok, detail = mod.codex_queue('thr-1', 'hi')
+        self.assertFalse(ok)
+        self.assertIn('no rollout found', detail)
+        # A missing install is the same shape, not a traceback: the peer has to
+        # keep running and say what is wrong.
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=os.path.join(self.state, 'nope'))
+        ok, detail = mod.codex_queue('thr-1', 'hi')
+        self.assertFalse(ok)
+        self.assertIn('not found', detail)
+        # And an unusable handle never reaches the binary at all.
+        ok, detail = mod.codex_queue('', 'hi')
+        self.assertFalse(ok)
+        self.assertIn('CODEX_THREAD_ID', detail)
+
+    def test_handle_event_routes_to_codex_instead_of_the_channel(self):
+        """The whole divergence between the two harnesses, asserted once: same
+        routing, same UNTRUSTED text, delivered with `codex queue` and NOT as a
+        notifications/claude/channel line on stdout."""
+        fake = CodexFake(self.state)
+        argv = sys.argv
+        sys.argv = ['webhook.py', 'codex-peer', '--thread', 'thr-9']
+        try:
+            mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        finally:
+            sys.argv = argv
+        self.assertTrue(mod.CODEX_PEER)
+        self.assertFalse(mod.CLI, 'codex-peer must not be treated as a one-shot CLI call')
+        self.assertEqual(mod.CODEX_PEER_THREAD, 'thr-9')
+        res = mod.call_tool({'name': 'webhook_subscribe',
+                             'arguments': {'topic': 'github:o/r', 'note': 'why I care'}})
+        self.assertNotIn('error:', res['content'][0]['text'])
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            mod.handle_event({'source': 'github', 'key': 'o/r', 'sender': 'someone',
+                              'event': 'issues', 'format': 'github',
+                              'payload': {'action': 'opened',
+                                          'issue': {'number': 5, 'title': 'a title'}}})
+        self.assertEqual(stdout.getvalue(), '', 'a codex peer must write no MCP notification')
+        sent = fake.messages()
+        self.assertEqual(len(sent), 1)
+        self.assertIn('[UNTRUSTED webhook:github', sent[0])
+        self.assertIn('⟪UNTRUSTED:a title⟫', sent[0])
+        self.assertIn('why I care', sent[0])  # the note rides along, as it does for claude
+        self.assertEqual(mod.CODEX_STATS['delivered'], 1)
+
+    def test_a_failed_delivery_counts_towards_giving_up(self):
+        fake = CodexFake(self.state, exit_code=1, message='Error: thread is archived')
+        argv = sys.argv
+        sys.argv = ['webhook.py', 'codex-peer', '--thread', 'thr-9']
+        try:
+            mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        finally:
+            sys.argv = argv
+        mod.call_tool({'name': 'webhook_subscribe', 'arguments': {'topic': 'github:o/r'}})
+        for _ in range(2):
+            with contextlib.redirect_stderr(io.StringIO()):
+                mod.handle_event({'source': 'github', 'key': 'o/r', 'sender': 's',
+                                  'event': 'issues', 'format': 'github',
+                                  'payload': {'action': 'opened', 'issue': {'number': 1}}})
+        self.assertEqual(mod.CODEX_STATS['failed'], 2)
+        self.assertEqual(mod.CODEX_STATS['consecutiveFailures'], 2)
+        self.assertIn('archived', mod.CODEX_STATS['lastError'])
+
+    def test_live_topic_count_ignores_expired_subscriptions(self):
+        # What the peer's idle exit asks about, so it must agree with the expiry
+        # rules routing already applies rather than count raw entries.
+        self.call('webhook_subscribe', topic='github:o/r', ttl_hours=1)
+        self.assertEqual(self.mod.live_topic_count(), 1)
+        f = self.read_json('filter.testsess.json')
+        f['topics'][0]['subscribedAt'] = '2020-01-01T00:00:00.000Z'
+        with open(os.path.join(self.state, 'filter.testsess.json'), 'w', encoding='utf-8') as fh:
+            json.dump(f, fh)
+        self.assertEqual(self.mod.live_topic_count(), 0)
+
+    def test_ensure_peer_refuses_without_a_usable_codex(self):
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=os.path.join(self.state, 'not-installed'))
+        r = mod.ensure_codex_peer('thr-1')
+        self.assertEqual(r['state'], 'failed')
+        self.assertIn('not found', r['error'])
+        # Nothing recorded: a pid file that promises delivery is worse than none.
+        self.assertIsNone(mod.codex_peer_status())
+        r = mod.ensure_codex_peer('')
+        self.assertEqual(r['state'], 'failed')
+
+    def test_peer_record_is_per_filter_key_and_survives_a_thread_name(self):
+        # The record is keyed by filter key so a free-text session name never
+        # has to be made safe for a filename.
+        mod = self.load()
+        self.assertTrue(mod.write_codex_peer('sess-a', {'pid': os.getpid(), 'thread': 'a/b c'}))
+        self.assertEqual(mod.read_codex_peer('sess-a')['thread'], 'a/b c')
+        self.assertTrue(mod.codex_peer_status('sess-a')['alive'])
+        self.assertIsNone(mod.read_codex_peer('sess-b'))
+        # A peer exiting must not delete the record its replacement just wrote.
+        mod.clear_codex_peer('sess-a', only_pid=os.getpid() + 1)
+        self.assertIsNotNone(mod.read_codex_peer('sess-a'))
+        mod.clear_codex_peer('sess-a', only_pid=os.getpid())
+        self.assertIsNone(mod.read_codex_peer('sess-a'))
+
+
 class TestResolveIngress(StateDirCase):
     """emit's ingress discovery: caller's env > receiver.json advertisement >
     the legacy loopback TCP port (whose owner writes no receiver.json)."""
@@ -1984,8 +2171,11 @@ class TestEndToEnd(unittest.TestCase):
             time.sleep(0.05)
         self.fail('peer never registered its IPC socket')
 
-    def cli(self, *args, session='testsess', stdin=None):
+    def cli(self, *args, session='testsess', stdin=None, extra_env=None):
+        # extra_env is how a test subscribes AS a codex session: what makes one
+        # is the CALLER's environment (CODEX_THREAD_ID), not an argument.
         env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0')
+        env.update(extra_env or {})
         return subprocess.run([PYTHON, WEBHOOK_PY] + list(args), env=env, input=stdin,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -2473,6 +2663,135 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(body['dispatchTopicCount'], 1)
         self.assertEqual(body['topicCount'], 0)
         self.assertTrue(body['sources']['github']['hasSecret'])
+
+
+    # -- codex delivery (0.26.0) ---------------------------------------------
+    def codex_peer_record(self, session):
+        path = os.path.join(self.state, 'codex', '%s.json' % session)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+
+    def reap_codex_peer(self, session):
+        # The peer is deliberately detached (it outlives the subscribe that
+        # started it), so it is not in self.procs and teardown must find it.
+        rec = self.codex_peer_record(session)
+        if rec and isinstance(rec.get('pid'), int):
+            try:
+                os.kill(rec['pid'], 9)
+            except OSError:
+                pass
+
+    def wait_gone(self, pid, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_codex_session_peer_end_to_end(self):
+        """A real signed delivery reaching a codex session: subscribe starts the
+        peer, the peer hands the rendered event to `codex queue`, unsubscribe
+        stops it and leaves no socket behind. Same bar as the stdio path — the
+        channel's own e2e — because it is the same routing up to the last inch."""
+        fake = CodexFake(self.state)
+        env = {'LOCAL_WEBHOOK_CODEX_BIN': fake.path, 'CODEX_THREAD_ID': 'thr-e2e'}
+        self.addCleanup(self.reap_codex_peer, 'codexsess')
+
+        r = self.cli('subscribe', 'o/r', '--note', 'PR 1: waiting on CI',
+                     session='codexsess', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b'codex delivery: started peer for thread thr-e2e', r.stdout)
+
+        rec = self.codex_peer_record('codexsess')
+        self.assertEqual(rec['thread'], 'thr-e2e')
+        # The peer registers the SAME socket shape every other peer does: that
+        # filename is what peer_scopes_live parses, so a codex session claims
+        # its work exactly like a claude one.
+        inst = os.path.join(self.state, 'instances')
+        self.assertTrue(self.wait_file(os.path.join(inst, 'codexsess.%d.sock' % rec['pid'])))
+
+        self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+        self.assertTrue(self.wait_file(fake.log, contains='UNTRUSTED'),
+                        'the codex peer never queued the delivery')
+        sent = fake.messages()
+        self.assertEqual(len(sent), 1)
+        self.assertIn('[UNTRUSTED webhook:github', sent[0])
+        self.assertIn('title here', sent[0])
+        self.assertIn('PR 1: waiting on CI', sent[0])  # the note, as on the channel path
+        self.assertEqual(fake.calls()[0][:3], ['queue', '--thread', 'thr-e2e'])
+
+        r = self.cli('unsubscribe', 'o/r', session='codexsess', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b'stopped the peer', r.stdout)
+        self.assertTrue(self.wait_gone(rec['pid']), 'the peer outlived its last subscription')
+        self.assertIsNone(self.codex_peer_record('codexsess'))
+        self.assertEqual([f for f in os.listdir(inst) if f.startswith('codexsess.')], [],
+                         'a stale instances/*.sock was left behind')
+
+    def test_a_codex_peer_claims_work_like_any_other_peer(self):
+        """The reason the peer holds a real IPC socket instead of just shelling
+        out: a standing watch must not spawn a second session onto work a codex
+        session has declared, and must take over once that session is gone."""
+        fake = CodexFake(self.state)
+        env = {'LOCAL_WEBHOOK_CODEX_BIN': fake.path, 'CODEX_THREAD_ID': 'thr-claim'}
+        self.addCleanup(self.reap_codex_peer, 'codexowner')
+
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',
+                     '--include', self.ANY_EVENT_JSON)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'o/r', '--note', 'working issue 5',
+                     '--include', json.dumps({'path': 'issue.number', 'in': [5]}),
+                     session='codexowner', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = self.codex_peer_record('codexowner')
+        self.assertIsNotNone(rec, r.stdout + r.stderr)
+        self.start_daemon()
+
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+        self.assertTrue(self.wait_file(fake.log, contains='UNTRUSTED'),
+                        'the claiming codex session never got its own event')
+        time.sleep(1)
+        self.assertFalse(os.path.exists(self.spawn_log),
+                         'spawned a session onto work the codex session declared')
+
+        os.kill(rec['pid'], 9)
+        self.assertTrue(self.wait_gone(rec['pid']))
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+        self.assertTrue(self.wait_file(self.spawn_log, contains='title here'),
+                        'no spawn once the claiming codex session was gone')
+
+    def test_codex_delivery_can_be_declined_and_fails_loudly(self):
+        env = {'CODEX_THREAD_ID': 'thr-x'}
+        # A supervisor running its own peer subscribes without starting one.
+        r = self.cli('subscribe', 'o/r', '--no-codex-peer', session='optout', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(b'codex delivery', r.stdout)
+        self.assertIsNone(self.codex_peer_record('optout'))
+
+        # No codex on the box: the subscription is still written (a later
+        # subscribe can wire it), but silence would look exactly like working
+        # delivery, so it warns.
+        r = self.cli('subscribe', 'o/r', session='nocodex',
+                     extra_env={'CODEX_THREAD_ID': 'thr-x',
+                                'LOCAL_WEBHOOK_CODEX_BIN': os.path.join(self.state, 'absent')})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b'codex delivery is NOT wired', r.stderr)
+        self.assertIsNone(self.codex_peer_record('nocodex'))
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'filter.nocodex.json')))
+
+    def test_a_claude_session_is_untouched_by_codex_support(self):
+        # No codex thread in the environment => no peer, no extra output: the
+        # stdio path must not pay for the codex one.
+        r = self.cli('subscribe', 'o/r', '--note', 'plain claude session')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(b'codex', r.stdout.lower())
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'codex')))
 
 
 class TestVersionConsistency(unittest.TestCase):

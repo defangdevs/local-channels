@@ -54,7 +54,10 @@ new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
   when you touch it; a change that invalidates a comment must update it.
 - **Terminology is fixed:** channel, delivery, ingress owner, session peer,
   topic (`source:key`), subscription, warm/cold delivery, echo muting. Reuse the
-  existing words rather than inventing synonyms.
+  existing words rather than inventing synonyms. A codex session's peer is a
+  *codex peer* — a session peer whose last inch is `codex queue` (0.26.0); it is
+  not a second kind of channel, and everything above that inch is one
+  implementation for both harnesses.
 - **Tool descriptions and `INSTRUCTIONS` are docs too.** They are what a session
   actually reads, so behaviour changes must be reflected there, in
   `FILTER_COMMENT`, in `CLI_USAGE`, and in `local-webhook/README.md` — in the
