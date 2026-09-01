@@ -9,9 +9,17 @@ an imminent token-budget limit the moment it happens instead of polling for it.
 A channel is one-way. Deliveries arrive as untrusted data the session reads and
 acts on; there is no reply path back over the channel.
 
+Since `local-webhook` 0.26.0 the same deliveries also reach a **codex** session.
+codex has no channel to attach at startup, so only the last inch differs: a
+small detached peer hands each event to `codex queue`, which lands it as a
+message at that session's next turn boundary. Everything before that inch —
+ingress, HMAC verification, topic routing, TTLs, claims, standing watches — is
+one implementation for both harnesses. See
+[Delivering into a codex session](#delivering-into-a-codex-session-0260).
+
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.25.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, and a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus |
+| [`local-webhook`](local-webhook/) | 0.26.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, and codex-session delivery via `codex queue` |
 
 ## Requirements
 
@@ -280,8 +288,61 @@ subscribed session, or spawn a fresh one via a standing watch. See the
 and [#19](https://github.com/defangdevs/local-channels/issues/19) for the
 planned sensor set.
 
-A CLI invocation binds nothing — no stdio loop, no peer socket, never the
-ingress — so it is safe to run alongside the daemon and any number of sessions.
+A CLI invocation binds nothing itself — no stdio loop, no peer socket, never
+the ingress — so it is safe to run alongside the daemon and any number of
+sessions. The one thing it may *start* is a codex session's delivery peer, and
+only when run from inside such a session (next section).
+
+## Delivering into a codex session (0.26.0)
+
+A codex session cannot host a channel plugin: codex has no channel notification
+to receive, and it spawns its MCP servers with a scrubbed environment, so an
+MCP-side peer could not even learn which thread it belongs to. What codex has
+instead is an inbound path Claude Code lacks — `codex queue --thread <id>
+--message <text>` hands a message to an existing session through the local
+app-server daemon.
+
+So a codex session peer is a small **detached process** rather than an MCP
+server: the same IPC socket, the same per-session filter file, the same
+`[UNTRUSTED webhook:…]` framing — only the last inch differs. Everything that
+keys off a peer socket keeps working, including the one that matters most: a
+standing watch still refuses to spawn a second session onto work a codex
+session has **claimed** with an `--include`.
+
+Nothing to configure. Run `subscribe` **from inside the codex session** and the
+peer starts itself:
+
+```
+python3 webhook.py subscribe owner/repo --note "PR 42: waiting on CI" \
+    --include '{"path":"pull_request.number","in":[42]}'
+# -> subscribed to github:owner/repo ...
+# -> codex delivery: started peer for thread 01a05e6c-… (pid 4136707)
+```
+
+The thread id is the one thing only the session itself knows: codex exports
+`CODEX_THREAD_ID` into the environment of the shell tool it runs, which is
+exactly where the agent's own `subscribe` call happens. A supervisor that knows
+the id from outside can pass `LOCAL_WEBHOOK_CODEX_THREAD` instead, or run the
+peer itself (`webhook.py codex-peer --thread <id>`) and subscribe with
+`--no-codex-peer`.
+
+Two properties of `codex queue` shape the rest, and both are worth knowing
+before you rely on it:
+
+- **Delivery lands at the next turn boundary.** A queued message wakes an
+  **idle** session immediately; one queued mid-turn waits for that turn to
+  finish. (Mid-turn injection exists in codex's app-server protocol as
+  `turn/steer` and has no CLI, so it is not used.)
+- **A queue to a thread that is not running still succeeds** — the message is
+  stored and surfaces when that thread is next resumed. A peer left pointing at
+  a finished session would quietly stockpile events, so the peer's life is
+  bounded by the subscriptions: it exits once no live subscription is left
+  (`unsubscribe` stops it at once), and gives up after three consecutive
+  `codex queue` failures.
+
+`webhook.py status` reports `codexThread` and `codexPeer` (pid, thread, whether
+it is alive) — the first place to look when subscriptions look healthy but
+nothing arrives.
 
 ## Configuration
 
