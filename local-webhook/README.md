@@ -329,6 +329,10 @@ whatever the source's summarizer produced is visible, not that a given key
 exists for every event type; an event with nothing to add still gets `{}`,
 never a missing variable.
 
+Every one of those describes the **event**. `LOCAL_WEBHOOK_SPAWN_CONFIG`
+(0.25.0) describes the **watch** — see
+[Per-watch spawn config](#per-watch-spawn-config-0250) below.
+
 Differences from session routing, all deliberate:
 
 - **Fails closed for a bigger reason.** No spawn command, no dispatch file, or
@@ -440,6 +444,68 @@ Differences from session routing, all deliberate:
   regardless (agent-box#319); since 0.23.0 the same predicate is what claims
   that PR's CI too, which is why the example names the branch as well.
 
+#### Per-watch spawn config (0.25.0)
+
+`LOCAL_WEBHOOK_SPAWN_SOURCE`, `_KEY`, `_EVENT`, `_TOPIC`, `_NOTE`, `_COUNT` and
+`_META` all describe the **event**. None of them describes the **watch** that
+matched it, so two watches on one repo — "new issues" and "failing CI on
+`main`" — reach the spawn command as the same seven strings. A consumer that
+wanted to start a different worker for each had nothing to key on, and had to
+fall back to one setting for the whole box. That is the gap
+[defangdevs/agent-box#321](https://github.com/defangdevs/agent-box/issues/321)
+sat on: an agent profile (which CLI, which model, which effort) it could set
+box-wide but not per watch.
+
+A dispatch entry may carry `spawnConfig`: a flat map of strings, JSON-encoded
+into `LOCAL_WEBHOOK_SPAWN_CONFIG`.
+
+    python3 webhook.py subscribe 'github:defangdevs/*' --deliver-to subagent \
+        --include '{"any":[{"path":"action","in":["opened","reopened"]}]}' \
+        --spawn-config profile=cheap-triage \
+        --note "standing watch: new issues and PRs"
+
+```json
+{ "topic": "github:defangdevs/*",
+  "include": { "any": [ { "path": "action", "in": ["opened", "reopened"] } ] },
+  "spawnConfig": { "profile": "cheap-triage" },
+  "note": "standing watch: new issues and PRs", "ttlHours": 0,
+  "subscribedAt": "2026-09-01T00:00:00Z" }
+```
+
+The spawn command then reads it like any other JSON blob:
+
+    profile=$(printf '%s' "${LOCAL_WEBHOOK_SPAWN_CONFIG:-{\}}" | jq -r '.profile // empty')
+
+What the keys mean is **the spawner's business, not this plugin's**. Nothing
+here interprets them, and nothing here ships a vocabulary of its own —
+0.23.0 retired the last built-in GitHub policy for exactly that reason, so a
+`profile` field naming one consumer's concept would be the same mistake in a
+new place. One JSON object in one variable also keeps the subscriber from
+naming the spawn command's environment: a config free to set `PATH` or
+`LD_PRELOAD` would be a hole opened at subscribe time.
+
+- **Strings only**, at most 16 pairs; keys are 1–64 characters of
+  `[A-Za-z0-9_-]`, values at most 300 characters. Quote numbers and booleans.
+- **Validated at subscribe time**, like the predicates: a config that only
+  failed when an event arrived would read as a watch starting the wrong worker
+  for no visible cause.
+- **Always set** on the spawn command, `{}` when the entry carries none — a
+  consumer can `.get()` an empty object but not a missing variable.
+- **Two configs never coalesce into one batch.** Events queue per (routing key,
+  `spawnConfig`), not per key: a coalesced batch runs one spawn command and is
+  handed the newest line's metadata, so without the split a repo's `new-issues`
+  event arriving while the `red-CI` watch's spawn was in flight would reach a
+  session started as the wrong worker. Same-config lines still coalesce, which
+  is what the window is for — one failing run emits `check_run` and then
+  `workflow_run`, both matched by the same watch, and they stay one session.
+- **Dispatch only.** `webhook_subscribe` refuses it on a `deliver_to:"session"`
+  subscription, which spawns nothing and would silently ignore it.
+- **Not a secret store.** It is written to `filter.dispatch.json`, echoed by
+  `webhook_subscriptions`, and readable from the spawned process's environment.
+  Put a lookup key there, never the credential it looks up.
+- Omit it on re-subscribe to keep the existing map; pass `{}` (CLI:
+  `--no-spawn-config`) to clear it.
+
 ### Per-identity filters
 
 Set `LOCAL_WEBHOOK_SELF=<name>` in a session's environment and its instance
@@ -469,7 +535,9 @@ the two paths can't drift on TTL/renew semantics:
 
 `--note`, `--ttl`, `--deliver-to`, `--renew-on-event`, `--ignore-sender`
 (repeatable, or one comma-separated list), `--include` and `--exclude` (JSON
-predicate objects; `--when`/`--drop` still work as aliases) mirror the tool arguments;
+predicate objects; `--when`/`--drop` still work as aliases) and `--spawn-config
+KEY=VALUE` (repeatable, standing watches only; `--no-spawn-config` clears it)
+mirror the tool arguments;
 `webhook.py --help` prints the details. Subscriptions are per session, so export the same
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.
