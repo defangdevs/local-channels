@@ -53,7 +53,11 @@ def load_webhook(env):
     base.update(env)
     saved = {}
     for k in list(os.environ):
-        if k.startswith('LOCAL_WEBHOOK_') or k in ('WEBHOOK_SECRET', 'WEBHOOK_PORT', 'LISTEN_FDS', 'LISTEN_PID'):
+        # CODEX_* too: run inside a codex session, an inherited CODEX_THREAD_ID
+        # would make the module resolve a real thread and answer differently
+        # than it does in CI. Only what a test passes may decide that.
+        if (k.startswith('LOCAL_WEBHOOK_') or k.startswith('CODEX_')
+                or k in ('WEBHOOK_SECRET', 'WEBHOOK_PORT', 'LISTEN_FDS', 'LISTEN_PID')):
             saved[k] = os.environ.pop(k)
     os.environ.update(base)
     try:
@@ -2131,9 +2135,16 @@ class TestEndToEnd(unittest.TestCase):
                     f.close()
 
     def base_env(self, **extra):
+        # CODEX_* is stripped for the same reason LOCAL_WEBHOOK_* is, with a
+        # sharper failure: run inside a codex session, an inherited
+        # CODEX_THREAD_ID makes every cli('subscribe', ...) start a REAL
+        # detached peer aimed at that session's own thread — deliveries into
+        # the agent running the suite, peers left behind, and
+        # test_a_claude_session_is_untouched_by_codex_support failing on a box
+        # where nothing is wrong. Only extra_env may make a test a codex one.
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith('LOCAL_WEBHOOK_') and k not in ('WEBHOOK_SECRET', 'WEBHOOK_PORT',
-                                                                   'LISTEN_FDS', 'LISTEN_PID')}
+               if not k.startswith('LOCAL_WEBHOOK_') and not k.startswith('CODEX_')
+               and k not in ('WEBHOOK_SECRET', 'WEBHOOK_PORT', 'LISTEN_FDS', 'LISTEN_PID')}
         env['LOCAL_WEBHOOK_STATE_DIR'] = self.state
         env.update(extra)
         return env
