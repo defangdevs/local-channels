@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.24.0'
+VERSION = '0.25.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -326,7 +326,7 @@ FILTER_COMMENT = (
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
     "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; entries {topic, note, "
     "ignoreSenders, include, exclude, ttlHours, "
-    "renewOnEvent, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; a pure "
+    "renewOnEvent, spawnConfig, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; a pure "
     "sender mute since 0.23.0 — no event overrides it, and it is applied after the predicates and wins, so "
     "keep your own CI results by dropping the mute and putting the sender rule inside `include`) "
     "and expire ttlHours after "
@@ -343,7 +343,9 @@ FILTER_COMMENT = (
     "reapplies it. Nothing fails open (0.13.0): a missing, unparseable or empty-topics file forwards "
     "NOTHING, so deleting this file does not bring traffic back — it unsubscribes the session. To receive "
     "events again, subscribe to a topic (webhook_subscribe, or `webhook.py subscribe <topic>`); "
-    "webhook_subscriptions reports which of the three states you are in as filterState absent/invalid/ok."
+    "webhook_subscriptions reports which of the three states you are in as filterState absent/invalid/ok. "
+    "spawnConfig does nothing in THIS file — it is a dispatch-only field (see the dispatch comment) and "
+    "webhook_subscribe refuses it on a session subscription."
 )
 
 # Dispatch subscriptions (issue #1): entries in this file ask for delivery into
@@ -374,7 +376,13 @@ DISPATCH_COMMENT = (
     "enough to trust, while a rule-less repo-wide entry would silence the watch for the whole repo "
     "(#16). So a new issue still spawns while a session holds one PR. See the session filter comment "
     "for the predicate shape. Dispatch entries are unaffected by the default noise-exclude — their own "
-    "rules are curated."
+    "rules are curated. "
+    "An entry may carry spawnConfig: a flat map of strings, opaque to this plugin, handed to the spawn "
+    "command as LOCAL_WEBHOOK_SPAWN_CONFIG (JSON, always set, {} when the entry has none). Every other "
+    "LOCAL_WEBHOOK_SPAWN_* variable describes the EVENT; this one describes the WATCH, so two watches on "
+    "one repo can start different workers. Keys are [A-Za-z0-9_-]{1,64}, values are strings, at most 16 "
+    "pairs. It is echoed in listings and readable from the spawned process's environment: routing config, "
+    "not a place for secrets."
 )
 
 # 0.23.0 removed the GitHub CI vocabulary that used to live here — CI_EVENTS,
@@ -423,14 +431,82 @@ def topic_invalid_reason(pat):
 FILTER_LOCK = threading.RLock()
 
 
+# Per-watch spawn config: an opaque, consumer-defined map carried on a
+# dispatch entry and handed to LOCAL_WEBHOOK_SPAWN_CMD as
+# LOCAL_WEBHOOK_SPAWN_CONFIG. Every other SPAWN_* variable describes the EVENT;
+# this one describes the WATCH that matched it, and that is the piece a spawner
+# cannot recover any other way — two watches on one repo reach the spawn command
+# as the same seven strings, so "run THIS watch differently" was unsayable.
+# agent-box wanted exactly that (pick the agent profile per watch) and had only
+# one box-wide setting to say it with (defangdevs/agent-box#321).
+#
+# Deliberately opaque: the keys mean nothing here. This repo stopped carrying
+# consumer vocabulary in 0.23.0, so a `profile` field naming one consumer's
+# concept would be that same mistake in a new place. A flat map of strings,
+# JSON-encoded into ONE variable, is the shape LOCAL_WEBHOOK_SPAWN_META already
+# established — one thing to parse, and nothing of the subscriber's choosing
+# injected into the spawn command's environment under a name it never picked
+# (a config free to set PATH or LD_PRELOAD would be a subscribe-time hole).
+#
+# Not a secret store. It is written to the filter file, echoed by
+# webhook_subscriptions, and readable from the spawned process's environment by
+# anything that can read /proc. Put a lookup KEY there, never a credential.
+SPAWN_CONFIG_KEY = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+SPAWN_CONFIG_MAX_KEYS = 16
+SPAWN_CONFIG_MAX_VALUE = 300
+
+
+def spawn_config_error(v):
+    """'' if v is a usable spawn config, else why not.
+
+    Validated at subscribe time like the predicates, and for the same reason: a
+    config that only failed once an event arrived would read as a watch that
+    spawned the wrong worker for no visible cause (agent-box#170).
+    """
+    if not isinstance(v, dict):
+        return 'spawn_config must be an object whose values are strings'
+    if len(v) > SPAWN_CONFIG_MAX_KEYS:
+        return ('spawn_config has %d keys; the maximum is %d — it rides in one environment '
+                'variable, it is not a config file' % (len(v), SPAWN_CONFIG_MAX_KEYS))
+    for k in sorted(v, key=s):
+        val = v[k]
+        if not (isinstance(k, str) and SPAWN_CONFIG_KEY.match(k)):
+            return ('spawn_config key "%s" is not usable; expected 1-64 characters of '
+                    '[A-Za-z0-9_-]' % s(k))
+        if not isinstance(val, str):
+            return ('spawn_config["%s"] must be a string (got %s): the map reaches the spawn '
+                    'command as JSON in one variable, so quote numbers and booleans'
+                    % (k, type(val).__name__))
+        if len(val) > SPAWN_CONFIG_MAX_VALUE:
+            return ('spawn_config["%s"] is %d characters; the maximum is %d'
+                    % (k, len(val), SPAWN_CONFIG_MAX_VALUE))
+    return ''
+
+
+def clean_spawn_config(v):
+    """The stored form. Applied on READ, so a hand-edited file with one bad pair
+    keeps the rest of the watch working instead of taking the entry down — the
+    same direction normalize_entry already takes for a malformed topic."""
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for k in sorted(v, key=s):
+        val = v[k]
+        if isinstance(k, str) and SPAWN_CONFIG_KEY.match(k) and isinstance(val, str):
+            out[k] = val[:SPAWN_CONFIG_MAX_VALUE]
+        if len(out) >= SPAWN_CONFIG_MAX_KEYS:
+            break
+    return out
+
+
 # missing/parse-error → topicsConfigured=false, and since 0.13.0 that forwards
 # NOTHING (deleting the file unsubscribes the session; it does not forward all).
 # An explicit but empty topics array is the same outcome reached deliberately,
 # and is preserved separately so read_filter can still report which of the three
 # states a session is in. A legacy "repos" array from
 # gh-webhook 0.2.x is read as github topics. Entries normalize to
-# { topic, note, ignoreSenders, subscribedAt, lastActivityAt } so string and
-# object forms mix freely.
+# { topic, note, ignoreSenders, spawnConfig, subscribedAt, lastActivityAt } so
+# string and object forms mix freely.
 def normalize_entry(t):
     if isinstance(t, str):
         t = {'topic': t}
@@ -454,6 +530,10 @@ def normalize_entry(t):
             'include': t.get('include', t.get('when', None)),
             'exclude': t.get('exclude', t.get('drop', None)),
             'note': t['note'][:300] if isinstance(t.get('note'), str) else '',
+            # Opaque to this repo; only a dispatch entry can do anything with
+            # it, but it is normalized on both files so a mis-filed one stays
+            # visible in webhook_subscriptions rather than vanishing on read.
+            'spawnConfig': clean_spawn_config(t.get('spawnConfig')),
             'ttlHours': ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else None,
             'renewOnEvent': t.get('renewOnEvent') is True,
             'subscribedAt': iso(t.get('subscribedAt')),
@@ -534,6 +614,8 @@ def write_filter(f, path=FILTER_FILE):
             o['include'] = e['include']
         if e['exclude'] is not None:
             o['exclude'] = e['exclude']
+        if e['spawnConfig']:
+            o['spawnConfig'] = e['spawnConfig']
         if e['lastActivityAt']:
             o['lastActivityAt'] = e['lastActivityAt']
         topics.append(o)
@@ -1346,6 +1428,11 @@ class Dispatcher:
                 # dict, never absent: an empty object beats no variable, since
                 # a consumer can `.get()` a JSON object but not a missing var.
                 'LOCAL_WEBHOOK_SPAWN_META': json.dumps(meta.get('payload') or {}, sort_keys=True),
+                # The WATCH's own config (agent-box#321) — opaque here, meaningful only to
+                # the spawn command. Same never-absent rule as META, and for the
+                # same reason: `.get()` on an empty object works, on a missing
+                # variable it does not.
+                'LOCAL_WEBHOOK_SPAWN_CONFIG': json.dumps(meta.get('spawnConfig') or {}, sort_keys=True),
             })
             p = subprocess.run(self.cmd, shell=True, env=env,
                                input=('\n'.join(batch) + '\n').encode('utf-8'),
@@ -1483,6 +1570,9 @@ def dispatch_event(env):
         'event': env.get('event', ''),
         'topic': entry['topic'] if entry else '',
         'note': entry['note'] if entry else '',
+        # Which watch matched, in the watch's own words (agent-box#321). Flat and separate
+        # from 'payload' so the two can never shadow each other.
+        'spawnConfig': entry['spawnConfig'] if entry else {},
         # Object identity (number, action, conclusion, ...) — whatever the
         # source's summarizer put in the same meta a channel notification
         # gets. Kept nested so it can ride to LOCAL_WEBHOOK_SPAWN_META as one
@@ -1675,6 +1765,9 @@ INSTRUCTIONS = (
     'noise-exclude (stars, watches, forks, ...) unless you pass your own exclude; a re-subscribe never '
     'reapplies it, so clearing it with exclude:{} sticks. Another sender is never seeded — those are '
     'GitHub event names. '
+    'A standing watch may also carry spawn_config, a small map of strings passed through to whatever '
+    'starts the fresh session (LOCAL_WEBHOOK_SPAWN_CONFIG) — that is how two watches on one repo start '
+    'different workers; it means nothing to this plugin and is not a place for secrets. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -1807,6 +1900,21 @@ TOOLS = [
                         '"sender.login", "notIn": ["me"]}]}: your failing runs and everyone else\'s events, '
                         'without your own echoes. Omit or pass [] to clear.',
                 },
+                'spawn_config': {
+                    'type': 'object',
+                    'description':
+                        'Standing watches only (deliver_to:"subagent"): a small map of strings handed to '
+                        'the command that starts the fresh session, as JSON in LOCAL_WEBHOOK_SPAWN_CONFIG. '
+                        'Every other variable that command receives describes the EVENT; this one '
+                        'describes the WATCH, so two watches on the same repo can start different workers '
+                        '(e.g. {"profile": "cheap-triage"} on the new-issues watch and {"profile": '
+                        '"deep-fix"} on the failing-CI one — what those names mean is the spawner\'s '
+                        'business, not this plugin\'s). Keys are 1-64 chars of [A-Za-z0-9_-], values must '
+                        'be strings (quote numbers), at most 16 pairs. Echoed by webhook_subscriptions and '
+                        'readable from the spawned process\'s environment, so put a lookup key there, '
+                        'never a credential. Refused on a deliver_to:"session" subscription, which spawns '
+                        'nothing. Omit to keep on renew; pass {} to clear.',
+                },
                 'include': {
                     'type': 'object',
                     'description':
@@ -1926,6 +2034,8 @@ def call_tool(params):
                 o['include'] = e['include']
             if e['exclude'] is not None:
                 o['exclude'] = e['exclude']
+            if e['spawnConfig']:
+                o['spawnConfig'] = e['spawnConfig']
             if e['subscribedAt']:
                 o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
             if e['lastActivityAt']:
@@ -1999,9 +2109,11 @@ def call_tool(params):
 
         def show(e):
             rules = [k for k, v in (('include', e['include']), ('exclude', e['exclude'])) if v is not None]
+            cfg = ', '.join('%s=%s' % (k, e['spawnConfig'][k]) for k in sorted(e['spawnConfig']))
             return e['topic'] + (' "%s"' % e['note'] if e['note'] else '') + \
                 (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
-                (' [%s rules]' % '+'.join(rules) if rules else '')
+                (' [%s rules]' % '+'.join(rules) if rules else '') + \
+                (' [spawn config: %s]' % cfg if cfg else '')
 
         def listing(ts):
             return ', '.join(show(e) for e in ts) or '(none)'
@@ -2047,6 +2159,19 @@ def call_tool(params):
             raw_renew = arguments.get('renew_on_event', _MISSING)
             if raw_renew is not _MISSING and not isinstance(raw_renew, bool):
                 return text('error: renew_on_event must be a boolean')
+            # Refused, not ignored, on a session subscription: nothing spawns
+            # for one, so accepting the config would leave a caller believing a
+            # setting was in force that no code path ever reads.
+            raw_cfg = arguments.get('spawn_config', _MISSING)
+            if raw_cfg is not _MISSING and raw_cfg is not None and raw_cfg != {}:
+                if not dispatch:
+                    return text(
+                        'error: spawn_config only applies to a standing watch — it is handed to the '
+                        'spawn command that starts a fresh session, and a deliver_to:"session" '
+                        'subscription starts nothing. Pass deliver_to:"subagent", or drop it.')
+                err = spawn_config_error(raw_cfg)
+                if err:
+                    return text('error: %s' % err)
             raw_note = arguments.get('note', _MISSING)
             # Predicates are validated NOW, not at delivery time: a typo that
             # only surfaced as a match-nothing predicate would read as a watch
@@ -2129,6 +2254,8 @@ def call_tool(params):
                     e['include'] = raw_include or None
                 if raw_exclude is not _MISSING:
                     e['exclude'] = raw_exclude or None
+                if raw_cfg is not _MISSING:
+                    e['spawnConfig'] = clean_spawn_config(raw_cfg)
                 topics = list(f['topics'])
                 topics[idx] = e
                 write_filter({**f, 'enabled': True, 'topics': topics}, path)
@@ -2158,6 +2285,7 @@ def call_tool(params):
                 'include': (raw_include or None) if raw_include is not _MISSING else None,
                 'exclude': (raw_exclude or None) if raw_exclude is not _MISSING else default_exclude,
                 'note': '' if raw_note is _MISSING else str(raw_note).strip()[:300],
+                'spawnConfig': {} if raw_cfg is _MISSING else clean_spawn_config(raw_cfg),
                 # A dispatch entry defaults to pinned (ttlHours 0): it is a
                 # standing watch, and a spawned session has no warm cache whose
                 # loss the session-filter TTL exists to bound.
@@ -2439,6 +2567,7 @@ emit a box-local event onto the same bus.
 usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
                                   [--renew-on-event] [--ignore-sender LOGIN]...
                                   [--include JSON] [--exclude JSON]
+                                  [--spawn-config KEY=VALUE]...
        webhook.py unsubscribe TOPIC [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME]
        webhook.py ls
@@ -2496,6 +2625,16 @@ source or for everything: name a key or a prefix.
                        to opt out
   --when JSON          old name for --include, still accepted
   --drop JSON          old name for --exclude, still accepted
+  --spawn-config K=V   standing watches only: a pair handed to the spawn
+                       command as JSON in LOCAL_WEBHOOK_SPAWN_CONFIG
+                       (repeatable). Every other variable that command gets
+                       describes the EVENT; this one describes the WATCH, so
+                       two watches on one repo can start different workers
+                       (--spawn-config profile=cheap-triage). Keys are 1-64
+                       chars of [A-Za-z0-9_-], values are strings, 16 pairs
+                       max. Echoed by `ls` and readable from the spawned
+                       process's environment: routing config, not secrets.
+                       --no-spawn-config clears it on re-subscribe
 
 emit puts a BOX-LOCAL event (a budget warning, a full disk, an OOM kill) on the
 same bus as any webhook: the JSON payload — an argument, or stdin when omitted
@@ -2670,6 +2809,8 @@ def run_cli(argv):
     rest = argv[1:]
     ignore_senders = []
     saw_ignore = False
+    spawn_config = {}
+    saw_spawn_config = False
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -2708,6 +2849,18 @@ def run_cli(argv):
             for part in value().split(','):
                 if part.strip():
                     ignore_senders.append(part.strip())
+        elif a == '--spawn-config':
+            # KEY=VALUE rather than a JSON object: the map is flat strings by
+            # definition, so a second JSON syntax for it would buy nothing.
+            # Only the first "=" splits, so a value may contain one.
+            saw_spawn_config = True
+            k, sep, v = value().partition('=')
+            if not sep or not k.strip():
+                die('--spawn-config takes KEY=VALUE (e.g. --spawn-config profile=triage)')
+            spawn_config[k.strip()] = v
+        elif a == '--no-spawn-config':
+            saw_spawn_config = True
+            spawn_config = {}
         elif a in ('--include', '--exclude', '--when', '--drop'):
             # Parse errors die here; SHAPE errors are call_tool's to report
             # (predicate_error), same as every other argument problem. --when
@@ -2727,6 +2880,8 @@ def run_cli(argv):
         i += 1
     if saw_ignore:
         args['ignore_senders'] = ignore_senders
+    if saw_spawn_config:
+        args['spawn_config'] = spawn_config
     if tool != 'webhook_subscriptions' and 'topic' not in args:
         die('%s needs a TOPIC\n\n%s' % (cmd, CLI_USAGE))
 

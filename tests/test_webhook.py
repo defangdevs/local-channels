@@ -792,6 +792,77 @@ class TestCallTool(StateDirCase):
         self.assertNotIn('exclude', self.read_json('filter.testsess.json')['topics'][0])
 
 
+class TestSpawnConfig(StateDirCase):
+    """webhook_subscribe's spawn_config argument (agent-box#321): what it accepts, what
+    it refuses, and what survives a renew."""
+
+    WATCH = {'deliver_to': 'subagent', 'include': ANY_EVENT}
+
+    def watch(self, **kw):
+        return self.call('webhook_subscribe', topic='o/r', **dict(self.WATCH, **kw))
+
+    def entry(self):
+        return self.read_json('filter.dispatch.json')['topics'][0]
+
+    def test_a_watch_stores_and_echoes_its_config(self):
+        out = self.watch(spawn_config={'profile': 'cheap-triage'})
+        self.assertIn('[spawn config: profile=cheap-triage]', out)
+        self.assertEqual(self.entry()['spawnConfig'], {'profile': 'cheap-triage'})
+        listing = self.call('webhook_subscriptions')
+        self.assertIn('"profile": "cheap-triage"', listing)
+
+    def test_a_session_subscription_refuses_it(self):
+        # Refused, not ignored: nothing spawns for a session subscription, so
+        # accepting it would leave the caller believing a setting was in force.
+        out = self.call('webhook_subscribe', topic='o/r', spawn_config={'profile': 'x'})
+        self.assertTrue(out.startswith('error: spawn_config only applies to a standing watch'), out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.testsess.json')))
+
+    def test_an_empty_config_is_allowed_on_a_session_subscription(self):
+        # {} means "clear", and clearing something a session never had is not
+        # worth an error.
+        self.assertTrue(self.call('webhook_subscribe', topic='o/r',
+                                  spawn_config={}).startswith('subscribed to'))
+
+    def test_bad_shapes_are_refused_at_subscribe_time(self):
+        for cfg, expect in (
+                ([('profile', 'x')], 'must be an object'),
+                ({'pro file': 'x'}, 'is not usable'),
+                ({'profile': 3}, 'must be a string'),
+                ({'profile': 'x' * 301}, 'is 301 characters'),
+                (dict(('k%d' % i, 'v') for i in range(17)), 'the maximum is 16'),
+        ):
+            out = self.watch(spawn_config=cfg)
+            self.assertTrue(out.startswith('error: '), out)
+            self.assertIn(expect, out)
+
+    def test_renew_keeps_it_and_empty_clears_it(self):
+        self.watch(spawn_config={'profile': 'a'})
+        self.watch(note='still here')                    # omitted → kept
+        self.assertEqual(self.entry()['spawnConfig'], {'profile': 'a'})
+        self.watch(spawn_config={'profile': 'b'})        # replaced wholesale
+        self.assertEqual(self.entry()['spawnConfig'], {'profile': 'b'})
+        self.watch(spawn_config={})                      # {} → cleared
+        self.assertEqual(self.entry().get('spawnConfig'), None)
+        self.assertNotIn('spawnConfig', self.call('webhook_subscriptions'))
+
+    def test_a_hand_edited_bad_pair_loses_the_pair_not_the_watch(self):
+        # Read-side normalization keeps the entry working, the same direction
+        # normalize_entry already takes for a malformed topic or predicate.
+        self.write_json('filter.dispatch.json', {'enabled': True, 'topics': [
+            {'topic': 'github:o/r', 'include': ANY_EVENT, 'ttlHours': 0,
+             'spawnConfig': {'profile': 'ok', 'bad key': 'x', 'n': 7}}]})
+        f = self.mod.read_filter(self.mod.DISPATCH_FILE)
+        self.assertEqual(f['topics'][0]['spawnConfig'], {'profile': 'ok'})
+
+    def test_it_is_normalized_on_a_session_file_too(self):
+        # Nothing reads it there, but a mis-filed config must stay VISIBLE in
+        # webhook_subscriptions rather than disappear on read.
+        self.write_json('filter.testsess.json', {'enabled': True, 'topics': [
+            {'topic': 'github:o/r', 'spawnConfig': {'profile': 'stray'}}]})
+        self.assertIn('"profile": "stray"', self.call('webhook_subscriptions'))
+
+
 class TestSummarizeGeneric(StateDirCase):
     """A generic sender's identifying fields live one envelope down."""
 
@@ -1032,6 +1103,84 @@ class TestDispatchEvent(StateDirCase):
             time.sleep(0.05)
         line = next((ln for ln in text.splitlines() if ln.startswith('META=')), '')
         self.assertEqual(line, 'META={}')
+
+    def _read_spawned(self, out, marker):
+        text = ''
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    text = f.read()
+                if marker in text:
+                    break
+            time.sleep(0.05)
+        line = next((ln for ln in text.splitlines() if ln.startswith(marker)), '')
+        self.assertTrue(line, 'expected a %s line, got: %r' % (marker, text))
+        return line[len(marker):]
+
+    def test_spawn_config_reaches_the_spawn_command(self):
+        # agent-box#321: every other SPAWN_* variable describes the event, so a spawner
+        # could not tell WHICH watch matched — and so could not start a
+        # different worker per watch.
+        out = os.path.join(self.state, 'spawned_config.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "CFG=$LOCAL_WEBHOOK_SPAWN_CONFIG"; } > %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT,
+                  spawn_config={'profile': 'cheap-triage', 'lane': 'triage'})
+        mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
+        self.assertEqual(json.loads(self._read_spawned(out, 'CFG=')),
+                         {'profile': 'cheap-triage', 'lane': 'triage'})
+
+    def test_two_watches_on_one_repo_start_different_workers(self):
+        """The whole point of the field: same repo, same spawn command, two
+        watches, and the event decides which config arrives."""
+        out = os.path.join(self.state, 'spawned_two.txt')
+        # Window 0: two events on one key would otherwise coalesce into a
+        # single follow-up batch, and this test is about the second SPAWN.
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat >/dev/null; echo "CFG=$LOCAL_WEBHOOK_SPAWN_CONFIG"; } >> %s' % out,
+                        LOCAL_WEBHOOK_SPAWN_WINDOW='0', LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        # Written by hand: two entries on ONE topic is a shape webhook_subscribe
+        # will not create (a re-subscribe renews the entry in place), but the
+        # dispatch file is documented as hand-editable and route_event takes the
+        # first entry whose rules accept the event.
+        self.write_json('filter.dispatch.json', {'enabled': True, 'topics': [
+            {'topic': 'github:o/r', 'include': {'path': 'event', 'in': ['issues']},
+             'spawnConfig': {'profile': 'cheap-triage'}, 'ttlHours': 0},
+            {'topic': 'github:o/r', 'include': {'path': 'event', 'in': ['workflow_run']},
+             'spawnConfig': {'profile': 'deep-fix'}, 'ttlHours': 0},
+        ]})
+        mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
+        self.assertEqual(json.loads(self._read_spawned(out, 'CFG=')), {'profile': 'cheap-triage'})
+        ci = {'source': 'github', 'format': 'github', 'event': 'workflow_run',
+              'key': 'o/r', 'sender': 'x', 'delivery': 'd2',
+              'payload': {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'x'},
+                          'action': 'completed',
+                          'workflow_run': {'name': 'ci', 'conclusion': 'failure',
+                                           'head_branch': 'main', 'id': 1}}}
+        mod.dispatch_event(ci)
+        deadline = time.time() + 10
+        cfgs = []
+        while time.time() < deadline:
+            with open(out, encoding='utf-8') as f:
+                cfgs = [json.loads(ln[len('CFG='):]) for ln in f.read().splitlines()
+                        if ln.startswith('CFG=')]
+            if len(cfgs) >= 2:
+                break
+            time.sleep(0.05)
+        self.assertEqual(cfgs, [{'profile': 'cheap-triage'}, {'profile': 'deep-fix'}])
+
+    def test_no_spawn_config_is_an_empty_object_not_absent(self):
+        # Same rule as META: a consumer can `.get()` an empty object, but a
+        # missing variable makes it write a fallback it should not need.
+        out = os.path.join(self.state, 'spawned_no_config.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo "CFG=$LOCAL_WEBHOOK_SPAWN_CONFIG"; } > %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        mod.dispatch_event(self.env(action='opened', issue={'number': 7, 'title': 'boom'}))
+        self.assertEqual(self._read_spawned(out, 'CFG='), '{}')
 
     def test_unmatched_event_spawns_nothing(self):
         out = os.path.join(self.state, 'spawned.txt')
@@ -2056,8 +2205,28 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(self.cli('subscribe', 'o/r', '--ttl', '-1').returncode, 2)
         self.assertEqual(self.cli('subscribe', 'o/r', '--when', '{not json').returncode, 2)
         self.assertEqual(self.cli('subscribe', 'o/r', '--when', '{"path": "a"}').returncode, 1)
+        self.assertEqual(self.cli('subscribe', 'o/r', '--spawn-config', 'noequals').returncode, 2)
+        self.assertEqual(self.cli('subscribe', 'o/r', '--spawn-config', 'k=v').returncode, 1)
         self.assertEqual(self.cli('ls').returncode, 0)
         self.assertEqual(self.cli('status').returncode, 0)
+
+    def test_cli_spawn_config_round_trips(self):
+        """--spawn-config KEY=VALUE reaches the dispatch file and comes back out
+        of `ls`; --no-spawn-config clears it on re-subscribe."""
+        args = ('subscribe', 'o/r', '--deliver-to', 'subagent',
+                '--include', json.dumps(ANY_EVENT), '--note', 'cfg watch')
+        r = self.cli(*(args + ('--spawn-config', 'profile=cheap-triage',
+                               '--spawn-config', 'lane=a=b')))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b'[spawn config: lane=a=b, profile=cheap-triage]', r.stdout)
+        with open(os.path.join(self.state, 'filter.dispatch.json'), encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['topics'][0]['spawnConfig'],
+                             {'profile': 'cheap-triage', 'lane': 'a=b'})
+        self.assertIn(b'"profile": "cheap-triage"', self.cli('ls').stdout)
+        r = self.cli(*(args + ('--no-spawn-config',)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.state, 'filter.dispatch.json'), encoding='utf-8') as f:
+            self.assertNotIn('spawnConfig', json.load(f)['topics'][0])
 
     def test_declarative_watch_end_to_end(self):
         """Real signed deliveries against an include/exclude watch (CLI: the
