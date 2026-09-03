@@ -19,7 +19,7 @@ one implementation for both harnesses. See
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.26.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, and codex-session delivery via `codex queue` |
+| [`local-webhook`](local-webhook/) | 0.27.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
 
 ## Requirements
 

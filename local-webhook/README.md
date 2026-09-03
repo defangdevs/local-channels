@@ -337,6 +337,21 @@ whatever the source's summarizer produced is visible, not that a given key
 exists for every event type; an event with nothing to add still gets `{}`,
 never a missing variable.
 
+Since **0.27.0** a GitHub CI event also carries `sha` — the commit it reports
+on — and, where the payload has one, `branch`. One run reaches a watch as
+several event shapes (`workflow_run`, `workflow_job`, `check_run`,
+`check_suite`, a bare commit `status`, `deployment_status`), and the sha is
+the only field all six share, so it is what lets a spawn command recognise
+them as one thing. A consumer seeding a subscription can then claim the run in
+front of it — `{"any": [{"path": "workflow_run.head_sha", "in": ["<sha>"]},
+{"path": "check_run.head_sha", "in": ["<sha>"]}, ...]}` — instead of claiming
+the whole repo's CI, which is too wide, or nothing at all. The run id is
+deliberately absent: `check_run`, `check_suite` and `status` do not carry one,
+so it cannot link the shapes. `branch` is for saying out loud which ref the
+session was started for; it is not identity, and a bare commit `status`
+carries only a `branches` list, which the predicate walker cannot index, so
+that shape gets a `sha` and no `branch`.
+
 Every one of those describes the **event**. `LOCAL_WEBHOOK_SPAWN_CONFIG`
 (0.25.0) describes the **watch** — see
 [Per-watch spawn config](#per-watch-spawn-config-0250) below.
