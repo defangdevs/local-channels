@@ -871,6 +871,68 @@ class TestSpawnConfig(StateDirCase):
         self.assertIn('"profile": "stray"', self.call('webhook_subscriptions'))
 
 
+class TestSummarizeGithubCiMeta(StateDirCase):
+    """0.27.0: every CI event shape puts the commit it reports on in the meta.
+
+    One failing run reaches a watch as up to six event shapes. The sha is the
+    only field all six carry, so it is what lets a spawn command claim the run
+    in front of it rather than the whole repo (agent-box#510/#511).
+    """
+
+    def meta(self, event, payload):
+        p = {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'me'}}
+        p.update(payload)
+        return self.mod.summarize_github(event, p)[1]
+
+    SHA = 'da73cb12762a543f83f69996d4c43179df13c5e7'
+
+    def test_every_ci_shape_reports_the_same_commit(self):
+        # The point of the field: six payload shapes, one sha, so a consumer
+        # can write one predicate that recognises them as one run.
+        shapes = [
+            ('workflow_run', {'workflow_run': {'head_sha': self.SHA, 'head_branch': 'master'}}),
+            ('workflow_job', {'workflow_job': {'head_sha': self.SHA, 'head_branch': 'master'}}),
+            ('check_run', {'check_run': {'head_sha': self.SHA,
+                                         'check_suite': {'head_branch': 'master'}}}),
+            ('check_suite', {'check_suite': {'head_sha': self.SHA, 'head_branch': 'master'}}),
+            ('deployment_status', {'deployment': {'sha': self.SHA, 'ref': 'master'}}),
+        ]
+        for event, payload in shapes:
+            m = self.meta(event, payload)
+            self.assertEqual(m['sha'], self.SHA, event)
+            self.assertEqual(m['branch'], 'master', event)
+
+    def test_a_bare_commit_status_gets_a_sha_and_no_branch(self):
+        # `status` carries only a `branches` LIST, and the predicate walker
+        # cannot index one — so this shape is claimable by sha alone. It is
+        # also the shape agent-box's --claim branch: could never cover.
+        m = self.meta('status', {'sha': self.SHA, 'state': 'failure',
+                                 'branches': [{'name': 'master'}]})
+        self.assertEqual(m['sha'], self.SHA)
+        self.assertNotIn('branch', m)
+
+    def test_the_existing_workflow_run_keys_are_untouched(self):
+        m = self.meta('workflow_run', {'action': 'completed', 'workflow_run': {
+            'name': 'CI', 'status': 'completed', 'conclusion': 'failure',
+            'head_sha': self.SHA, 'head_branch': 'fix/thing'}})
+        self.assertEqual(m['action'], 'completed')
+        self.assertEqual(m['status'], 'completed')
+        self.assertEqual(m['conclusion'], 'failure')
+        self.assertEqual(m['branch'], 'fix/thing')
+
+    def test_a_ci_payload_missing_the_field_adds_no_empty_key(self):
+        # The meta promises only that what the summarizer found is visible; a
+        # key present but empty would read as "this run has no commit".
+        m = self.meta('check_run', {'check_run': {'name': 'deploy'}})
+        self.assertNotIn('sha', m)
+        self.assertNotIn('branch', m)
+
+    def test_a_non_ci_event_gains_nothing(self):
+        m = self.meta('issues', {'action': 'opened', 'issue': {'number': 7}})
+        self.assertNotIn('sha', m)
+        self.assertNotIn('branch', m)
+
+
 class TestSummarizeGeneric(StateDirCase):
     """A generic sender's identifying fields live one envelope down."""
 

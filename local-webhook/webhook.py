@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.26.0'
+VERSION = '0.27.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -2015,7 +2015,40 @@ def receiver_info():
         return None
 
 
+
+
 # ------------------------------------------------------------- formatters ---
+# One CI run reaches a watch under several event shapes — GitHub reports the
+# same failure as workflow_run, workflow_job, check_run, check_suite, a bare
+# commit status and deployment_status — and a consumer that wants to react
+# ONCE has to recognise them as one thing. The routing key cannot do it (they
+# share a repo, and so does every unrelated run), and neither can the run id:
+# check_run, check_suite and status do not carry one. The COMMIT does. Every
+# shape names the sha it is reporting on, at a path of its own, so the sha is
+# the only field that links the shapes — which is why it goes in the meta and
+# a run id does not.
+#
+# Consumers use it to scope a claim to the run in front of them instead of to
+# the whole repo: agent-box seeds a spawned session's subscription from this
+# meta, and without a sha its only options were "this repo's CI" (too wide —
+# it swallowed a red master, agent-box#384) or, once that was narrowed to
+# topic branches, nothing at all on a shared ref (too narrow — one red master
+# filed the same issue twice from two sessions, agent-box#510/#511).
+#
+# `branch` rides along because it is what a note says out loud, but it is not
+# the identity: two runs on one branch are two runs, and a bare commit status
+# carries only a `branches` LIST, which the predicate walker cannot index — so
+# status gets a sha and no branch, and is claimable all the same.
+CI_META_PATHS = {
+    'workflow_run': (('workflow_run', 'head_sha'), ('workflow_run', 'head_branch')),
+    'workflow_job': (('workflow_job', 'head_sha'), ('workflow_job', 'head_branch')),
+    'check_run': (('check_run', 'head_sha'), ('check_run', 'check_suite', 'head_branch')),
+    'check_suite': (('check_suite', 'head_sha'), ('check_suite', 'head_branch')),
+    'status': (('sha',), None),
+    'deployment_status': (('deployment', 'sha'), ('deployment', 'ref')),
+}
+
+
 # Human-readable one-liner + routing meta per event. meta keys must be
 # [A-Za-z0-9_]; anything else is silently dropped by Claude Code.
 def summarize_github(event, p):
@@ -2085,6 +2118,20 @@ def summarize_github(event, p):
     elif g(p, 'action'):
         meta['action'] = s(g(p, 'action'))
         content = '%s.%s on %s by %s' % (event, s(g(p, 'action')), repo, sender)
+
+    # Applied after the chain rather than inside each arm: five of the six CI
+    # shapes have no arm of their own (they fall through to the generic
+    # `action` one above), and the sha is the same idea for all six.
+    paths = CI_META_PATHS.get(event)
+    if paths:
+        sha_path, branch_path = paths
+        sha = s(g(p, *sha_path))
+        if sha:
+            meta['sha'] = sha
+        if branch_path:
+            branch = s(g(p, *branch_path))
+            if branch:
+                meta['branch'] = branch
     return content, meta
 
 
