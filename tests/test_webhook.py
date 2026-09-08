@@ -796,6 +796,67 @@ class TestCallTool(StateDirCase):
         self.assertNotIn('exclude', self.read_json('filter.testsess.json')['topics'][0])
 
 
+class TestCrossProcessFilterLock(StateDirCase):
+    """webhook_subscribe (a one-shot CLI process) and route_event (the daemon
+    delivering an event) never share a Python process — the CLI re-imports
+    the module fresh per invocation — so FILTER_LOCK, a threading.RLock, gives
+    them no mutual exclusion at all: each gets its own instance. Simulate
+    "two processes" with two independently loaded module instances pointed at
+    the same filter file, exactly what a CLI subscribe and the daemon are:
+    separate address spaces sharing one file on disk (agent-box#618)."""
+
+    def test_concurrent_subscribe_and_delivery_do_not_clobber(self):
+        peer = self.load()  # a second, independent module instance == a second process
+        self.call('webhook_subscribe', topic='o/r', note='initial', exclude={})
+
+        reached_replace = threading.Event()
+        resume = threading.Event()
+        orig_replace = os.replace
+        errors = []
+
+        def patched_replace(src, dst):
+            # Only the "CLI" write pauses, and only once, right where it has
+            # already written its tmp file and is about to publish it -- the
+            # exact window in which an unlocked daemon write can race it.
+            if threading.current_thread().name == 'writer-a' and not reached_replace.is_set():
+                reached_replace.set()
+                resume.wait(5)
+            return orig_replace(src, dst)
+
+        def writer_a():
+            try:
+                self.call('webhook_subscribe', topic='o/r', note='updated-by-a', exclude={})
+            except Exception as exc:  # the pre-fix race can raise FileNotFoundError here
+                errors.append(exc)
+
+        def writer_b():
+            reached_replace.wait(5)
+            peer.route_event('github', 'o/r', 'somebody', 'issue_comment', path=peer.FILTER_FILE)
+
+        os.replace = patched_replace
+        try:
+            ta = threading.Thread(target=writer_a, name='writer-a')
+            tb = threading.Thread(target=writer_b, name='writer-b')
+            ta.start()
+            tb.start()
+            # Give the daemon's delivery a real window to run unlocked before
+            # letting the CLI write finish publishing.
+            time.sleep(0.5)
+            resume.set()
+            ta.join(5)
+            tb.join(5)
+        finally:
+            os.replace = orig_replace
+
+        self.assertEqual(errors, [])
+        saved = self.read_json('filter.testsess.json')
+        self.assertEqual(len(saved['topics']), 1)
+        # Neither write is silently lost: the CLI's note survives, and the
+        # daemon's delivery still lands on top of it rather than blocked out.
+        self.assertEqual(saved['topics'][0]['note'], 'updated-by-a')
+        self.assertTrue(saved['topics'][0].get('lastActivityAt'))
+
+
 class TestSpawnConfig(StateDirCase):
     """webhook_subscribe's spawn_config argument (agent-box#321): what it accepts, what
     it refuses, and what survives a renew."""
