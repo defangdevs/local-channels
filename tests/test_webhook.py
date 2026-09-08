@@ -848,6 +848,12 @@ class TestCrossProcessFilterLock(StateDirCase):
         finally:
             os.replace = orig_replace
 
+        # A join() that timed out returns silently -- if either writer
+        # deadlocked on the new flock, that would otherwise surface as a
+        # confusing assertion failure on the file contents below instead of
+        # naming the actual failure.
+        self.assertFalse(ta.is_alive(), 'subscribe writer deadlocked on the filter lock')
+        self.assertFalse(tb.is_alive(), 'delivery writer deadlocked on the filter lock')
         self.assertEqual(errors, [])
         saved = self.read_json('filter.testsess.json')
         self.assertEqual(len(saved['topics']), 1)
