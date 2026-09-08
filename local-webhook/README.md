@@ -100,7 +100,14 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 
 ### filter.json
 
-Managed by the MCP tools; safe to hand-edit. Topics are `source:key` patterns:
+Managed by the MCP tools; safe to hand-edit. Every `filter*.json` gets a
+sibling `filter*.json.lock` (0.27.1) — an empty file, safe to ignore or
+delete when idle — that a read-modify-write of the filter holds an `flock` on
+for the duration. It closes a cross-process race: a one-shot CLI call and the
+long-running daemon never share the in-process thread lock that used to be
+the only guard, since the CLI re-imports the module fresh per invocation, so
+a subscribe landing in the same window as a delivery could silently lose one
+side's write (defangdevs/agent-box#618). Topics are `source:key` patterns:
 `github:owner/repo` (exact) or `github:owner/*` (prefix). Since 0.13.0 there is
 no wildcard for a whole source (`github:*`) or for everything (`*`); an entry
 holding one is **kept and never matches**, and `webhook_subscriptions` marks it

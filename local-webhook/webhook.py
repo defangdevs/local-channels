@@ -22,6 +22,8 @@
 # filter.json → forward nothing), so a session only ever receives what it
 # actually subscribed to.
 import atexit
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import http.client
@@ -41,7 +43,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.27.0'
+VERSION = '0.27.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -441,6 +443,30 @@ def topic_invalid_reason(pat):
 # Node is single-threaded; here the HTTP/IPC threads and the stdio loop can
 # race on the filter's read-modify-write, so one lock serializes them.
 FILTER_LOCK = threading.RLock()
+
+
+# FILTER_LOCK only serializes threads inside ONE process — the long-running
+# daemon's HTTP/IPC/stdio threads. One-shot CLI mode (and every MCP tool call
+# a fresh stdio process makes) is a SEPARATE process per invocation, re-
+# importing this module from scratch, so it gets its own FILTER_LOCK that
+# shares no memory with the daemon's. A CLI `subscribe` and a delivery landing
+# in the daemon in the same window each read the filter, mutate their own
+# in-memory copy, and write it back with no ordering between the two: whichever
+# write lands last silently wins and discards the other's change, and nothing
+# reports it (agent-box#618). This lock closes that gap: an flock on a sibling
+# ".lock" file, held for the whole read-modify-write, serializes every writer —
+# whatever process it runs in — against every other one on the same path.
+@contextlib.contextmanager
+def filter_file_lock(path):
+    fd = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # Per-watch spawn config: an opaque, consumer-defined map carried on a
@@ -902,7 +928,7 @@ def entry_forwards(e, sender, event, payload=None):
 # it: there a rule-less entry means "everything on this topic", which is the
 # whole point of subscribing to a repo you are working in.
 def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, require_rules=False):
-    with FILTER_LOCK:
+    with FILTER_LOCK, filter_file_lock(path):
         f = read_filter(path)
         if not f['enabled']:
             return {'forward': False, 'entry': None, 'refused': False, 'ruleless': False}
@@ -2463,7 +2489,10 @@ def call_tool(params):
     dispatch = raw_dt == 'subagent'
     path = DISPATCH_FILE if dispatch else FILTER_FILE
 
-    with FILTER_LOCK:
+    # webhook_subscriptions reads and prunes BOTH files regardless of `path`
+    # (see below), so both are locked here rather than only the one this call
+    # is otherwise scoped to.
+    with FILTER_LOCK, filter_file_lock(FILTER_FILE), filter_file_lock(DISPATCH_FILE):
         now = now_ms()
 
         # Every tool call is also a pruning opportunity: expired topics drop out
