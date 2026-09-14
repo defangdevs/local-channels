@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.28.0'
+VERSION = '0.28.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -357,7 +357,7 @@ FILTER_COMMENT = (
     "matching events, include accepts ONLY matching ones, and together they are the whole policy — this "
     "file holds no built-in event vocabulary any more (0.23.0). (Old names when/drop are read as aliases; a "
     "new write always uses include/exclude.) A brand-new session subscription with no exclude given is seeded "
-    "with a default noise-exclude (stars/watches/forks/... — see DEFAULT_SESSION_EXCLUDE) when its source is "
+    "with a default noise/direct-self-echo exclude (stars/watches/forks/..., plus direct events from the resolved session login) when its source is "
     "github-format; a re-subscribe never "
     "reapplies it. Nothing fails open (0.13.0): a missing, unparseable or empty-topics file forwards "
     "NOTHING, so deleting this file does not bring traffic back — it unsubscribes the session. To receive "
@@ -2320,8 +2320,8 @@ INSTRUCTIONS = (
     'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, '
     'exclude close/merge echoes without muting their sender, or claim the one PR you are working on. '
     'A brand-new session subscription on a github-format source gets a default '
-    'noise-exclude (stars, watches, forks, ...) unless you pass your own exclude; a re-subscribe never '
-    'reapplies it, so clearing it with exclude:{} sticks. Another sender is never seeded — those are '
+    'noise/direct-self-echo exclude (stars, watches, forks, and direct events from the resolved session '
+    'login) unless you pass your own exclude; a re-subscribe never reapplies it, so clearing it with exclude:{} sticks. Another sender is never seeded — those are '
     'GitHub event names. '
     'A standing watch may also carry spawn_config, a small map of strings passed through to whatever '
     'starts the fresh session (LOCAL_WEBHOOK_SPAWN_CONFIG) — that is how two watches on one repo start '
@@ -2351,6 +2351,18 @@ DEFAULT_SESSION_EXCLUDE = {
     ],
 }
 
+# A session causes these events directly when it edits GitHub: the resulting
+# delivery merely reflects an action it already knows it took. CI is
+# deliberately absent. GitHub puts the actor who triggered a workflow in
+# sender.login, so workflow_run/check_run/etc. are indirect news even when the
+# agent pushed the commit that caused them. An explicit exclude remains the
+# caller's complete policy; this list is only the fresh-session default.
+DEFAULT_DIRECT_GITHUB_ECHO_EVENTS = [
+    'commit_comment', 'create', 'discussion', 'discussion_comment', 'issue_comment',
+    'issues', 'pull_request', 'pull_request_review', 'pull_request_review_comment',
+    'pull_request_review_thread', 'push', 'release',
+]
+
 
 def topic_source(pat):
     """The source a topic pattern addresses, lowercased ('' if it does not
@@ -2370,6 +2382,19 @@ def source_format(name):
     if fmt in ('generic', 'github'):
         return fmt
     return 'github' if name == 'github' else 'generic'
+
+
+def default_session_exclude(topic):
+    # ignoreSenders is a pure mute, so express only direct self-echoes here
+    # and leave self-triggered CI outcomes deliverable.
+    clauses = list(DEFAULT_SESSION_EXCLUDE['any'])
+    if SELF and source_format(topic_source(topic)) == 'github':
+        clauses.append({'all': [
+            {'path': 'sender.login', 'in': [SELF]},
+            {'path': 'event', 'in': DEFAULT_DIRECT_GITHUB_ECHO_EVENTS},
+        ]})
+    return {'any': clauses}
+
 
 TOOLS = [
     {
@@ -2883,7 +2908,7 @@ def call_tool(params):
             # not a default, so it now applies where its vocabulary is real.
             default_exclude = (None if dispatch or raw_exclude is not _MISSING
                                 or source_format(topic_source(topic)) != 'github'
-                                else DEFAULT_SESSION_EXCLUDE)
+                                else default_session_exclude(topic))
             entry = {
                 'topic': topic,
                 'name': watch_name,

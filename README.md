@@ -19,7 +19,7 @@ one implementation for both harnesses. See
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.28.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
+| [`local-webhook`](local-webhook/) | 0.28.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
 
 ## Requirements
 
@@ -220,6 +220,8 @@ the rules instead (below), where it can be said precisely — *instead of*, not
 beside: the mute is applied after the predicates and wins, so an entry keeping
 both silences that sender's failures too. Where several entries match one
 event, the most permissive wins.
+
+New GitHub session subscriptions without an explicit `exclude` also suppress direct collaboration echoes from the resolved session login: pushes, PR/issue changes, comments, reviews, discussions, and releases. This default intentionally leaves CI events through, even when that login triggered the run; provide `exclude: {}` or your own `exclude` to replace it.
 
 A `deliver_to:"subagent"` standing watch **must carry rules** — every event it
 matches costs a whole agent session, so `webhook_subscribe` refuses one that
