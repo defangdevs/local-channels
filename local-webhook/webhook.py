@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.27.1'
+VERSION = '0.28.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -338,7 +338,12 @@ FILTER_FILE = filter_path_of(FILTER_KEY)
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
-    "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; entries {topic, note, "
+    "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; an entry's identity is "
+    "(topic, name) — name defaults to '' (unnamed) so a plain topic still finds and renews the one entry "
+    "it always did; give two subscribe calls on the same topic different names (#63) to keep them as two "
+    "independently managed entries instead of one renewing the other. When more than one entry matches an "
+    "event, the FIRST one in this array that accepts it (topic + rules) is the one that wins — file order is "
+    "the precedence, oldest surviving entry first; entries {topic, name, note, "
     "ignoreSenders, include, exclude, ttlHours, "
     "renewOnEvent, spawnConfig, subscribedAt, lastActivityAt} drop own-echo events ('@self' = LOCAL_WEBHOOK_SELF; a pure "
     "sender mute since 0.23.0 — no event overrides it, and it is applied after the predicates and wins, so "
@@ -396,7 +401,16 @@ DISPATCH_COMMENT = (
     "LOCAL_WEBHOOK_SPAWN_* variable describes the EVENT; this one describes the WATCH, so two watches on "
     "one repo can start different workers. Keys are [A-Za-z0-9_-]{1,64}, values are strings, at most 16 "
     "pairs. It is echoed in listings and readable from the spawned process's environment: routing config, "
-    "not a place for secrets."
+    "not a place for secrets. "
+    "name (#63) is what makes two such watches on the same topic possible in the first place: entries are "
+    "found and renewed by (topic, name), not topic alone, so 'new issues -> triage' and 'failing CI -> "
+    "debugger' can be two entries instead of one clobbering the other on re-subscribe. Batching keeps them "
+    "apart too — Dispatcher._bucket includes spawnConfig, so differently-configured watches on one topic "
+    "queue and spawn separately even while events for both are in flight — but only ONE entry's spawnConfig "
+    "reaches the spawn command per event: the first matching entry in file order, same precedence as the "
+    "session file above. Two watches whose rules can both match the same event should either carry the same "
+    "spawnConfig (then it does not matter which one is 'the' match) or disjoint include/exclude so at most "
+    "one of them ever claims a given event."
 )
 
 # 0.23.0 removed the GitHub CI vocabulary that used to live here — CI_EVENTS,
@@ -544,14 +558,43 @@ def clean_spawn_config(v):
     return out
 
 
+# A watch's identity, alongside its topic (#63). Before this, webhook_subscribe
+# found an existing entry by topic ALONE, so two calls naming the same topic
+# could only ever renew one entry — "new issues -> triage, failing CI ->
+# debugger" on one repo had nowhere to put a second, independently managed set
+# of rules and spawnConfig. name makes the identity (topic, name) instead of
+# topic alone: omitted (the default, '') keeps every existing subscription's
+# behavior exactly as it was — one unnamed entry per topic, found and renewed
+# the same way — while a caller that wants a second watch on the same topic
+# just gives it a name, and a third call with a different name again is a
+# third watch, entirely independent of the other two.
+#
+# Validated at subscribe time (WATCH_NAME_PATTERN / watch_name_error), like a
+# spawn_config key; kept as written on READ even when it fails that pattern —
+# same direction normalize_entry already takes for a malformed topic or
+# predicate, so a hand-edited file's typo stays a visible, matchable identity
+# rather than silently merging back into the unnamed entry.
+WATCH_NAME_PATTERN = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+
+def watch_name_error(v):
+    """'' if v is a usable watch name, else why not. None/''/omitted (the
+    unnamed identity) is always valid — this only guards a name someone
+    actually supplied."""
+    if not isinstance(v, str) or not WATCH_NAME_PATTERN.match(v):
+        return ('watch name "%s" is not usable; expected 1-64 characters of '
+                '[A-Za-z0-9._-]' % s(v))
+    return ''
+
+
 # missing/parse-error → topicsConfigured=false, and since 0.13.0 that forwards
 # NOTHING (deleting the file unsubscribes the session; it does not forward all).
 # An explicit but empty topics array is the same outcome reached deliberately,
 # and is preserved separately so read_filter can still report which of the three
 # states a session is in. A legacy "repos" array from
 # gh-webhook 0.2.x is read as github topics. Entries normalize to
-# { topic, note, ignoreSenders, spawnConfig, subscribedAt, lastActivityAt } so
-# string and object forms mix freely.
+# { topic, name, note, ignoreSenders, spawnConfig, subscribedAt, lastActivityAt }
+# so string and object forms mix freely.
 def normalize_entry(t):
     if isinstance(t, str):
         t = {'topic': t}
@@ -565,6 +608,10 @@ def normalize_entry(t):
         ttl = t.get('ttlHours')
         return {
             'topic': t['topic'],
+            # '' is the unnamed identity every pre-#63 entry has; kept as
+            # written (not pattern-checked) so a hand-edited bad name stays a
+            # distinct, visible row rather than collapsing into it.
+            'name': t['name'][:64] if isinstance(t.get('name'), str) else '',
             'ignoreSenders': ig,
             # Kept as written, even if malformed: match_predicate answers False
             # (loudly) for a bad node, and normalizing a typo'd `include` AWAY
@@ -647,6 +694,8 @@ def write_filter(f, path=FILTER_FILE):
     topics = []
     for e in f['topics']:
         o = {'topic': e['topic'], 'subscribedAt': e['subscribedAt'] or now}
+        if e.get('name'):
+            o['name'] = e['name']
         if e['note']:
             o['note'] = e['note']
         if e['ttlHours'] is not None:
@@ -896,7 +945,11 @@ def entry_forwards(e, sender, event, payload=None):
 
 
 # Decides forwarding AND prunes expired topics in one pass; the first matching
-# entry is returned so its note/age can be echoed to the session. Matching
+# entry is returned so its note/age can be echoed to the session. Since #63 let
+# more than one entry share a topic (distinguished by name), "first" is the
+# whole of the precedence policy for an event two watches both accept: file
+# order, oldest surviving entry first — see the DISPATCH_COMMENT for what that
+# means for a dispatch entry's spawnConfig. Matching
 # entries get lastActivityAt stamped, and their TTL clock (subscribedAt) is
 # reset when the delivery is "warm" — within WARM_WINDOW_MS of the previous one
 # (or on every delivery when renewOnEvent). A cold straggler is forwarded but
@@ -1713,6 +1766,11 @@ class Dispatcher:
     # (key, config) rather than per key — a repo with N watches can hold N
     # streams — but SPAWN_MAX still caps what runs at once, which is the bound
     # that actually stops a fork bomb.
+    #
+    # This is what already made two DIFFERENTLY-configured watches on one topic
+    # safe to run side by side (#63's second half — the first half, giving them
+    # independent subscription identities in the first place, is `name` on the
+    # entry itself; see webhook_subscribe).
     @staticmethod
     def _bucket(key, meta):
         cfg = (meta or {}).get('spawnConfig') or {}
@@ -2331,6 +2389,18 @@ TOOLS = [
                         'include, or pass deliver_to:"subagent" (which is free to be owner-wide, but needs '
                         'rules of its own).',
                 },
+                'name': {
+                    'type': 'string',
+                    'description':
+                        'Optional identity for this watch, distinct from another one on the SAME topic (#63). '
+                        'An entry is found and renewed by (topic, name), not topic alone: omit this (the '
+                        'default, unnamed) to keep behaving exactly as before — one entry per topic, renewed '
+                        'in place — or give two subscribe calls on the same topic different names to manage '
+                        'them independently (their own note/ttl_hours/include/exclude/spawn_config each), e.g. '
+                        'one named "triage" for opened issues/PRs and one named "debug" for failing CI, both '
+                        'on "github:owner/repo". 1-64 characters of [A-Za-z0-9._-]. Only one entry can win a '
+                        'given event, though (whichever matches first, in subscribe order) — see spawn_config.',
+                },
                 'note': {
                     'type': 'string',
                     'description':
@@ -2454,6 +2524,14 @@ TOOLS = [
             'type': 'object',
             'properties': {
                 'topic': {'type': 'string', 'description': 'Topic pattern previously passed to webhook_subscribe.'},
+                'name': {
+                    'type': 'string',
+                    'description':
+                        'The name (#63), if any, this watch was subscribed with. Identity is (topic, name): '
+                        'omit this to remove the UNNAMED entry on this topic — same as before names existed — '
+                        'not every entry sharing the topic. A named watch is only removed by passing its exact '
+                        'name back.',
+                },
                 'deliver_to': {
                     'type': 'string',
                     'enum': ['session', 'subagent'],
@@ -2515,6 +2593,8 @@ def call_tool(params):
             if reason:
                 o['invalid'] = True
                 o['reason'] = reason
+            if e['name']:
+                o['name'] = e['name']
             if e['note']:
                 o['note'] = e['note']
             if e['ttlHours'] is not None:
@@ -2597,13 +2677,24 @@ def call_tool(params):
                         '"source:prefix/*". Subscribing to a whole source or to everything was '
                         'removed in 0.13.0 — name what you want.' % topic)
 
+        # An entry's identity is (topic, name) since #63; '' is the unnamed
+        # identity every pre-#63 subscription has, so a caller that never
+        # mentions name keeps finding and renewing that same one entry.
+        raw_watch_name = arguments.get('name', _MISSING)
+        watch_name = '' if raw_watch_name is _MISSING else str(raw_watch_name).strip()
+        if watch_name:
+            err = watch_name_error(watch_name)
+            if err:
+                return text('error: %s' % err)
+
         def eq(a, b):
             return a.lower() == b.lower()
 
         def show(e):
             rules = [k for k, v in (('include', e['include']), ('exclude', e['exclude'])) if v is not None]
             cfg = ', '.join('%s=%s' % (k, e['spawnConfig'][k]) for k in sorted(e['spawnConfig']))
-            return e['topic'] + (' "%s"' % e['note'] if e['note'] else '') + \
+            return e['topic'] + (' name=%s' % e['name'] if e['name'] else '') + \
+                (' "%s"' % e['note'] if e['note'] else '') + \
                 (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
                 (' [%s rules]' % '+'.join(rules) if rules else '') + \
                 (' [spawn config: %s]' % cfg if cfg else '')
@@ -2690,7 +2781,8 @@ def call_tool(params):
                 base = '; expires %sh after (re)subscribe' % _num(ttl) if ttl else '; pinned (never expires)'
                 return '%s, renews on every event' % base if e['renewOnEvent'] else base
 
-            idx = next((i for i, e in enumerate(f['topics']) if eq(e['topic'], topic)), -1)
+            idx = next((i for i, e in enumerate(f['topics'])
+                        if eq(e['topic'], topic) and e['name'] == watch_name), -1)
             # Too broad for a session. A prefix topic is every event of every
             # repo under that owner, and pointed at an interactive session
             # that is a firehose, not a watch. Naming one repo is fine — the
@@ -2774,6 +2866,7 @@ def call_tool(params):
                                 else DEFAULT_SESSION_EXCLUDE)
             entry = {
                 'topic': topic,
+                'name': watch_name,
                 'ignoreSenders': [str(x).strip() for x in (raw_ig if raw_ig is not _MISSING else []) if str(x).strip()],
                 'include': (raw_include or None) if raw_include is not _MISSING else None,
                 'exclude': (raw_exclude or None) if raw_exclude is not _MISSING else default_exclude,
@@ -2793,14 +2886,19 @@ def call_tool(params):
                 show(entry), ttl_msg(entry), scope, ' dispatch' if dispatch else '', listing(topics), expired_note))
 
         if name == 'webhook_unsubscribe':
-            filtered = [e for e in f['topics'] if not eq(e['topic'], topic)]
+            # Identity is (topic, name), same as subscribe: with no name this
+            # removes the UNNAMED entry only, never every entry sharing the
+            # topic — a named watch survives an unsubscribe call that never
+            # mentions it, same as it survives one naming a DIFFERENT name.
+            filtered = [e for e in f['topics'] if not (eq(e['topic'], topic) and e['name'] == watch_name)]
+            watch_label = '%s name=%s' % (topic, watch_name) if watch_name else topic
             if len(filtered) == len(f['topics']):
                 return text('not subscribed to %s%s (current%s: %s)%s' % (
-                    topic, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
+                    watch_label, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
                     listing(f['topics']), expired_note))
             write_filter({**f, 'topics': filtered}, path)
             return text('unsubscribed from %s%s (current%s: %s)%s' % (
-                topic, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
+                watch_label, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
                 listing(filtered), expired_note))
 
         return text('error: unknown tool %s' % name)
@@ -3057,11 +3155,12 @@ def listen_ingress():
 CLI_USAGE = '''local-webhook %s — subscribe a session to webhook topics, or
 emit a box-local event onto the same bus.
 
-usage: webhook.py subscribe TOPIC [--note TEXT] [--ttl HOURS] [--deliver-to MODE]
-                                  [--renew-on-event] [--ignore-sender LOGIN]...
+usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
+                                  [--deliver-to MODE] [--renew-on-event]
+                                  [--ignore-sender LOGIN]...
                                   [--include JSON] [--exclude JSON]
                                   [--spawn-config KEY=VALUE]...
-       webhook.py unsubscribe TOPIC [--deliver-to MODE]
+       webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME]
        webhook.py ls
        webhook.py status
@@ -3070,6 +3169,17 @@ TOPIC is "source:key" — "github:owner/repo" (exact) or "github:owner/*"
 (prefix). A bare "owner/repo" means github. There is no wildcard for a whole
 source or for everything: name a key or a prefix.
 
+  --name NAME          identity for this watch, distinct from another one on
+                       the SAME topic (#63): an entry is found and renewed by
+                       (topic, name), not topic alone, so omitting this (the
+                       default, unnamed) behaves exactly as before — one entry
+                       per topic — while subscribing the same topic twice with
+                       different names manages two independent watches (their
+                       own note/ttl/include/exclude/spawn-config each), e.g.
+                       --name triage for opened issues/PRs and --name debug for
+                       failing CI on one repo. 1-64 chars of [A-Za-z0-9._-].
+                       Only one entry wins a given event though — whichever
+                       matches first, in subscribe order (see --spawn-config)
   --note TEXT          why you subscribed; echoed under every delivery so a
                        fresh-context session knows what the event relates to
   --ttl HOURS          per-topic expiry, counted from the last (re)subscribe or
@@ -3341,7 +3451,9 @@ def run_cli(argv):
             i += 1
             return rest[i]
 
-        if a == '--note':
+        if a == '--name':
+            args['name'] = value()
+        elif a == '--note':
             args['note'] = value()
         elif a in ('--ttl', '--ttl-hours'):
             try:

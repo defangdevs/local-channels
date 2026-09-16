@@ -938,6 +938,126 @@ class TestSpawnConfig(StateDirCase):
         self.assertIn('"profile": "stray"', self.call('webhook_subscriptions'))
 
 
+class TestNamedWatches(StateDirCase):
+    """webhook_subscribe/unsubscribe identity is (topic, name), not topic alone
+    (#63) -- so a second subscribe on the same topic can be a second,
+    independently managed watch instead of renewing the first one."""
+
+    def entries(self, path='filter.dispatch.json'):
+        return self.read_json(path)['topics']
+
+    def test_two_names_on_one_topic_are_two_entries(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  name='triage', include={'path': 'action', 'in': ['opened']})
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                  name='debug', include={'path': 'workflow_run.conclusion', 'in': ['failure']})
+        es = self.entries()
+        self.assertEqual(len(es), 2)
+        self.assertEqual({e['name'] for e in es}, {'triage', 'debug'})
+        self.assertTrue(all(e['topic'] == 'github:o/r' for e in es))
+
+    def test_no_name_keeps_the_old_one_entry_per_topic_behavior(self):
+        # Two subscribes naming no watch renew the same (unnamed) entry, same
+        # as before #63 -- the whole point of defaulting name to ''.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT, note='first')
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT, note='second')
+        es = self.entries()
+        self.assertEqual(len(es), 1)
+        self.assertEqual(es[0]['note'], 'second')
+        self.assertNotIn('name', es[0])
+
+    def test_renew_by_name_leaves_the_other_named_entry_alone(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='a',
+                  include=ANY_EVENT, spawn_config={'profile': 'a1'})
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='b',
+                  include=ANY_EVENT, spawn_config={'profile': 'b1'})
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='a',
+                  spawn_config={'profile': 'a2'})
+        by_name = {e['name']: e for e in self.entries()}
+        self.assertEqual(len(by_name), 2)
+        self.assertEqual(by_name['a']['spawnConfig'], {'profile': 'a2'})
+        self.assertEqual(by_name['b']['spawnConfig'], {'profile': 'b1'})
+
+    def test_unsubscribe_by_name_removes_only_that_entry(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='a', include=ANY_EVENT)
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='b', include=ANY_EVENT)
+        out = self.call('webhook_unsubscribe', topic='o/r', deliver_to='subagent', name='a')
+        self.assertIn('unsubscribed from', out)
+        es = self.entries()
+        self.assertEqual(len(es), 1)
+        self.assertEqual(es[0]['name'], 'b')
+
+    def test_unsubscribe_with_no_name_only_touches_the_unnamed_entry(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='a', include=ANY_EVENT)
+        self.call('webhook_unsubscribe', topic='o/r', deliver_to='subagent')
+        es = self.entries()
+        self.assertEqual(len(es), 1)
+        self.assertEqual(es[0]['name'], 'a')
+
+    def test_unsubscribe_unknown_name_reports_not_subscribed_and_changes_nothing(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='a', include=ANY_EVENT)
+        out = self.call('webhook_unsubscribe', topic='o/r', deliver_to='subagent', name='ghost')
+        self.assertIn('not subscribed to', out)
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_bad_name_is_refused_at_subscribe_time(self):
+        for bad in ('has space', 'slash/es', 'x' * 65, ''.join(['!'])):
+            out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                            name=bad, include=ANY_EVENT)
+            self.assertTrue(out.startswith('error: '), out)
+            self.assertIn('not usable', out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.dispatch.json')))
+
+    def test_name_is_scoped_per_topic(self):
+        # The same name on two DIFFERENT topics is two entries -- name
+        # disambiguates within a topic, it is not a global key.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='a', include=ANY_EVENT)
+        self.call('webhook_subscribe', topic='o/other', deliver_to='subagent', name='a', include=ANY_EVENT)
+        es = self.entries()
+        self.assertEqual(len(es), 2)
+        self.assertEqual({e['topic'] for e in es}, {'github:o/r', 'github:o/other'})
+
+    def test_name_survives_a_session_subscription_too(self):
+        self.call('webhook_subscribe', topic='o/r', name='a')
+        self.call('webhook_subscribe', topic='o/r', name='b')
+        es = self.entries('filter.testsess.json')
+        self.assertEqual({e['name'] for e in es}, {'a', 'b'})
+
+    def test_listing_shows_the_name(self):
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='triage', include=ANY_EVENT)
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='triage',
+                        include=ANY_EVENT, note='again')
+        self.assertIn('name=triage', out)
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertEqual(body['dispatch']['topics'][0]['name'], 'triage')
+
+    def test_hand_edited_unnamed_default_still_matches_empty_name(self):
+        # A pre-#63 file on disk has no "name" key at all; normalize_entry
+        # must read that the same as an explicit '' so a plain re-subscribe
+        # still renews it instead of adding a duplicate unnamed row.
+        self.write_json('filter.dispatch.json', {'enabled': True, 'topics': [
+            {'topic': 'github:o/r', 'include': ANY_EVENT, 'ttlHours': 0}]})
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='renewed')
+        es = self.entries()
+        self.assertEqual(len(es), 1)
+        self.assertEqual(es[0]['note'], 'renewed')
+
+    def test_first_matching_entry_in_file_order_wins_an_overlap(self):
+        # Two watches whose predicates can both match the same event: the
+        # earlier-subscribed one is what dispatch_event actually uses (its
+        # spawnConfig, its note) -- documented precedence, not accidental.
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='first',
+                  include=ANY_EVENT, spawn_config={'profile': 'p1'})
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name='second',
+                  include=ANY_EVENT, spawn_config={'profile': 'p2'})
+        r = self.mod.route_event('github', 'o/r', 'x', 'issues', {'action': 'opened'},
+                                 path=self.mod.DISPATCH_FILE, require_rules=True)
+        self.assertTrue(r['forward'])
+        self.assertEqual(r['entry']['name'], 'first')
+        self.assertEqual(r['entry']['spawnConfig'], {'profile': 'p1'})
+
+
 class TestSummarizeGithubCiMeta(StateDirCase):
     """0.27.0: every CI event shape puts the commit it reports on in the meta.
 

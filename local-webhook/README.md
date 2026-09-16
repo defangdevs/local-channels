@@ -121,6 +121,12 @@ one repo, narrow it with `include`, or use `deliver_to:"subagent"`, which is
 exempt: it spawns a session per event batch instead of interrupting one, and an
 org-wide standing watch is its intended shape.
 
+An entry's identity is `(topic, name)`, not topic alone (0.28.0 — see
+[Naming a watch](#naming-a-watch-0280)): `name` defaults to `''`, so a topic
+with no name still means the one entry it always did, and only a `name`
+passed to `webhook_subscribe`/`webhook_unsubscribe` selects a different row
+sharing the same topic.
+
 An entry may also be an object with `ignoreSenders`: events on that topic whose
 sender matches are dropped as echoes of the session's own actions (pass
 `ignore_senders` to `webhook_subscribe`, or hand-edit). `"@self"` resolves to
@@ -536,6 +542,52 @@ naming the spawn command's environment: a config free to set `PATH` or
 - Omit it on re-subscribe to keep the existing map; pass `{}` (CLI:
   `--no-spawn-config`) to clear it.
 
+### Naming a watch (0.28.0)
+
+`spawnConfig` lets two watches on one repo start different workers, but until
+0.28.0 there was no way to have two watches on one repo in the first place:
+`webhook_subscribe` found an existing entry by **topic alone**, so a second
+call naming the same topic renewed the first one instead of creating a second
+([defangdevs/local-channels#63](https://github.com/defangdevs/local-channels/issues/63)).
+"New issues → triage, failing CI → debugger" on one repo had nowhere to put
+the second rule set.
+
+An entry's identity is now `(topic, name)`. `name` defaults to `''` — the
+unnamed identity every subscription already had — so a plain `webhook_subscribe`
+on a topic behaves exactly as before: one entry, found and renewed the same
+way. Give it a `name` to manage a second (or third, ...) watch on the same
+topic independently, each with its own `note` / `ttl_hours` / `include` /
+`exclude` / `spawnConfig`:
+
+    python3 webhook.py subscribe 'github:defangdevs/agent-box' --deliver-to subagent \
+        --name triage --include '{"any":[{"path":"action","in":["opened","reopened"]}]}' \
+        --spawn-config profile=cheap-triage --note "new issues and PRs"
+    python3 webhook.py subscribe 'github:defangdevs/agent-box' --deliver-to subagent \
+        --name debug --include '{"path":"workflow_run.conclusion","in":["failure","timed_out"]}' \
+        --spawn-config profile=deep-fix --note "failing CI"
+
+Both rows live in `filter.dispatch.json` side by side, each with its own
+`name`. `webhook_unsubscribe` on the same topic with no `--name` removes only
+the unnamed entry — pass the same `--name` back to remove one of these
+instead.
+
+- **1–64 characters of `[A-Za-z0-9._-]`**, validated at subscribe time like a
+  `spawnConfig` key — a typo is an error now, not two watches silently merging.
+- **Scoped to the topic, not global**: `--name triage` on two different repos
+  is two unrelated entries.
+- **Batching already kept differently-configured watches apart** (see above,
+  0.25.0) — `name` is what makes creating two such watches on one topic
+  possible in the first place; it changes nothing about how they run once
+  created.
+- **Only one entry wins a given event.** If two watches' rules can both match
+  the same delivery, the earlier-subscribed one (file order) is the one whose
+  `spawnConfig` and `note` reach the spawn command — the other does not also
+  fire. Give overlapping watches the same `spawnConfig`, or disjoint
+  `include`/`exclude`, so which one "wins" never matters.
+- A pre-0.28.0 file with no `name` key on an entry reads as `''` — the same
+  unnamed identity — so an upgraded box's existing watches keep matching a
+  plain re-subscribe exactly as before.
+
 ### Per-identity filters
 
 Set `LOCAL_WEBHOOK_SELF=<name>` in a session's environment and its instance
@@ -563,11 +615,12 @@ the two paths can't drift on TTL/renew semantics:
     python3 webhook.py emit budget '{"used_pct":92,"window":"5h"}' \
         --event budget_warning       # put a box-local event on the bus
 
-`--note`, `--ttl`, `--deliver-to`, `--renew-on-event`, `--ignore-sender`
-(repeatable, or one comma-separated list), `--include` and `--exclude` (JSON
-predicate objects; `--when`/`--drop` still work as aliases) and `--spawn-config
-KEY=VALUE` (repeatable, standing watches only; `--no-spawn-config` clears it)
-mirror the tool arguments;
+`--name` (a second, independently managed watch on the same topic — see
+"Naming a watch" above), `--note`, `--ttl`, `--deliver-to`, `--renew-on-event`,
+`--ignore-sender` (repeatable, or one comma-separated list), `--include` and
+`--exclude` (JSON predicate objects; `--when`/`--drop` still work as aliases)
+and `--spawn-config KEY=VALUE` (repeatable, standing watches only;
+`--no-spawn-config` clears it) mirror the tool arguments;
 `webhook.py --help` prints the details. Subscriptions are per session, so export the same
 `LOCAL_WEBHOOK_SESSION` (and `LOCAL_WEBHOOK_STATE_DIR`) the session runs with —
 under agent-box both are already in every session's environment.
