@@ -596,6 +596,30 @@ class TestCallTool(StateDirCase):
         self.assertEqual(saved['topics'][0]['topic'], 'github:o/r')
         self.assertNotIn('ttlHours', saved['topics'][0])  # inherits file default
 
+    def test_session_default_mutes_direct_self_echoes_but_keeps_ci(self):
+        self.mod = self.load(LOCAL_WEBHOOK_SELF='me')
+        self.call('webhook_subscribe', topic='o/r')
+        entry = self.read_json('filter.testsess.json')['topics'][0]
+        self.assertIn('exclude', entry)
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'push', {'sender': {'login': 'me'}})['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'issue_comment', {'sender': {'login': 'me'}})['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'me', 'workflow_run', {'sender': {'login': 'me'}})['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'me', 'check_run', {'sender': {'login': 'me'}})['forward'])
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'human', 'push', {'sender': {'login': 'human'}})['forward'])
+
+    def test_session_default_self_echo_mute_is_case_insensitive(self):
+        # GitHub logins are case-insensitive; a delivered or configured login
+        # differing only in case from SELF must still be recognised as self.
+        self.mod = self.load(LOCAL_WEBHOOK_SELF='Me')
+        self.call('webhook_subscribe', topic='o/r')
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'me', 'push', {'sender': {'login': 'me'}})['forward'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'ME', 'issue_comment', {'sender': {'login': 'ME'}})['forward'])
+
+    def test_explicit_session_exclude_replaces_default_echo_policy(self):
+        self.mod = self.load(LOCAL_WEBHOOK_SELF='me')
+        self.call('webhook_subscribe', topic='o/r', exclude={})
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'me', 'push', {'sender': {'login': 'me'}})['forward'])
+
     def test_dispatch_subscribe_defaults_to_pinned_shared_file(self):
         out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', note='watch', include=ANY_EVENT)
         self.assertIn('dispatch', out)

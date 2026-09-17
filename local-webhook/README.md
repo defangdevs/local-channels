@@ -144,6 +144,8 @@ one `include` — `{"any": [{"path": "workflow_run.conclusion", "in":
 the carve-out meant and more, since the carve-out took that sender's green runs
 too. See [Dispatch](#dispatch-delivery-into-a-fresh-session-090).
 
+New GitHub session subscriptions without an explicit `exclude` also suppress direct collaboration echoes from the resolved session login: pushes, PR/issue changes, comments, reviews, discussions, and releases. This default leaves indirect CI events (`workflow_run`, `workflow_job`, `check_run`, `check_suite`, deployment/status events) through, even when that login triggered the run. Pass `exclude: {}` or an explicit `exclude` to replace it; dispatch watches are unchanged.
+
 ```json
 { "enabled": true, "ttlHours": 1, "topics": [
     { "topic": "github:defangdevs/*", "include": { "any": [ { "path": "action", "in": ["opened"] } ] },
