@@ -75,6 +75,12 @@ Every behaviour change to a plugin is a version bump in the same commit:
    model; patch bump for a fix or a tuned default (`0.5.3` retuned the TTL).
 4. Update `local-webhook/README.md` and the root `README.md` version table.
 
+CI tags versions as `vX.Y.Z` after the test matrix succeeds on `main`.
+`scripts/tag_versions.py` walks first-parent history and tags the first mainline
+commit carrying each version (including the historical `gh-webhook` name).
+Existing tags must match that commit; never move or reuse a version tag.
+Run it without `--push` to create and verify tags locally.
+
 Consumers pin this repo by revision — agent-box carries the pin in its
 `modules/agent-box.nix` (a generated file there; edit its `.in` source) — so a
 bump usually needs a companion PR in that repo. Mention it in the PR body.
