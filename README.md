@@ -21,6 +21,21 @@ one implementation for both harnesses. See
 |---|---|---|
 | [`local-webhook`](local-webhook/) | 0.28.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
 
+## Version tags
+
+[Tags](https://github.com/defangdevs/local-channels/tags) map each version
+(`v0.28.0`, for example) to the first commit on `main` carrying that version.
+For merged branches this is the merge commit, so the tag includes the whole
+change. Versions 0.1.0 and 0.2.0 predate the rename from `gh-webhook`.
+The early 0.5.x manifests were stale; those tags follow the versions explicitly
+named in their release commit subjects.
+Tags are immutable and CI publishes missing tags after both Python test jobs
+pass on `main`. Documentation-only commits do not move an existing tag.
+
+Use GitHub's [compare view](https://github.com/defangdevs/local-channels/compare/v0.27.1...v0.28.0)
+to see commits and changes between versions. Consumers can continue pinning
+full commit hashes, with tags providing the version lookup.
+
 ## Requirements
 
 - Claude Code with plugin-marketplace support.
