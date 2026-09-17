@@ -933,6 +933,11 @@ def entry_forwards(e, sender, event, payload=None):
         # different thing at a different path) is never clobbered.
         ctx = dict(payload) if isinstance(payload, dict) else {}
         ctx.setdefault('event', event)
+        # Same reasoning as 'event': not a real payload path, synthesized so a
+        # predicate can match a GitHub login case-insensitively (logins are
+        # case-insensitive; `sender` here is already the exact string GitHub
+        # sent, unmodified) without a case-sensitive 'sender.login' trap.
+        ctx.setdefault('_senderLower', sender.lower() if sender else None)
         if e['exclude'] is not None and match_predicate(e['exclude'], ctx):
             return False
         if e['include'] is not None and not match_predicate(e['include'], ctx):
@@ -2390,7 +2395,10 @@ def default_session_exclude(topic):
     clauses = list(DEFAULT_SESSION_EXCLUDE['any'])
     if SELF and source_format(topic_source(topic)) == 'github':
         clauses.append({'all': [
-            {'path': 'sender.login', 'in': [SELF]},
+            # '_senderLower' (not 'sender.login'): a case-sensitive match here
+            # would let a self-echo back through whenever GitHub's delivered
+            # login and the configured SELF differ only in case.
+            {'path': '_senderLower', 'in': [SELF.lower()]},
             {'path': 'event', 'in': DEFAULT_DIRECT_GITHUB_ECHO_EVENTS},
         ]})
     return {'any': clauses}
