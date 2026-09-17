@@ -609,9 +609,12 @@ def normalize_entry(t):
         return {
             'topic': t['topic'],
             # '' is the unnamed identity every pre-#63 entry has; kept as
-            # written (not pattern-checked) so a hand-edited bad name stays a
-            # distinct, visible row rather than collapsing into it.
-            'name': t['name'][:64] if isinstance(t.get('name'), str) else '',
+            # WRITTEN — unlike note, never truncated — so a hand-edited bad
+            # name stays a distinct, visible row rather than collapsing into
+            # it: two long hand-edited names sharing their first 64
+            # characters must not become the same identity just because one
+            # of them got clipped on read (CodeRabbit, PR #64).
+            'name': t['name'] if isinstance(t.get('name'), str) else '',
             'ignoreSenders': ig,
             # Kept as written, even if malformed: match_predicate answers False
             # (loudly) for a bad node, and normalizing a typo'd `include` AWAY
@@ -1019,13 +1022,20 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, requ
                 if not entry_forwards(e, sender, event, payload):
                     continue
                 forward = True
-                if matched is None:
-                    matched = e
+                matched = e
                 prev = parse_ms(e['lastActivityAt'])
                 warm = prev is not None and now - prev < WARM_WINDOW_MS
                 if e['renewOnEvent'] or warm:
                     e['subscribedAt'] = iso_at(now)
                 e['lastActivityAt'] = iso_at(now)
+                # First accepting entry wins (file order) and is the only one
+                # this event affects. Without the break, a later entry that
+                # ALSO accepts the same event — never selected, since it is
+                # not first — still got its lastActivityAt stamped and its
+                # TTL renewed on every such event, so a shadowed watch could
+                # stay alive indefinitely even though it never actually wins
+                # anything (CodeRabbit, PR #64).
+                break
         if pruned or matched:
             try:
                 write_filter({**f, 'topics': live}, path)
@@ -2679,13 +2689,23 @@ def call_tool(params):
 
         # An entry's identity is (topic, name) since #63; '' is the unnamed
         # identity every pre-#63 subscription has, so a caller that never
-        # mentions name keeps finding and renewing that same one entry.
+        # mentions name (or passes None/"" explicitly) keeps finding and
+        # renewing that same one entry. Anything else must be a STRING
+        # matching WATCH_NAME_PATTERN exactly — no coercing a non-string
+        # (str(3) == "3" would silently accept a caller's mistake) and no
+        # stripping whitespace (unlike topic/note, which are free text: name
+        # is an identity token, so " foo" is a validation error, not "foo"
+        # with the space quietly dropped — CodeRabbit, PR #64).
         raw_watch_name = arguments.get('name', _MISSING)
-        watch_name = '' if raw_watch_name is _MISSING else str(raw_watch_name).strip()
-        if watch_name:
-            err = watch_name_error(watch_name)
+        if raw_watch_name in (_MISSING, None, ''):
+            watch_name = ''
+        elif not isinstance(raw_watch_name, str):
+            return text('error: name must be a string')
+        else:
+            err = watch_name_error(raw_watch_name)
             if err:
                 return text('error: %s' % err)
+            watch_name = raw_watch_name
 
         def eq(a, b):
             return a.lower() == b.lower()

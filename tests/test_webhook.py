@@ -1002,12 +1002,19 @@ class TestNamedWatches(StateDirCase):
         self.assertEqual(len(self.entries()), 1)
 
     def test_bad_name_is_refused_at_subscribe_time(self):
-        for bad in ('has space', 'slash/es', 'x' * 65, ''.join(['!'])):
+        for bad in ('has space', 'slash/es', 'x' * 65, ''.join(['!']), ' triage', 'triage ', 3, True, ['triage']):
             out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
                             name=bad, include=ANY_EVENT)
             self.assertTrue(out.startswith('error: '), out)
-            self.assertIn('not usable', out)
         self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.dispatch.json')))
+
+    def test_max_length_name_is_accepted(self):
+        # The boundary CodeRabbit asked for beside the 65-char rejection above:
+        # exactly 64 characters must not regress into "too long".
+        name = 'x' * 64
+        out = self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name=name, include=ANY_EVENT)
+        self.assertTrue(out.startswith('subscribed to'), out)
+        self.assertEqual(self.entries()[0]['name'], name)
 
     def test_name_is_scoped_per_topic(self):
         # The same name on two DIFFERENT topics is two entries -- name
@@ -2559,6 +2566,39 @@ class TestEndToEnd(unittest.TestCase):
                 'action': action,
                 'workflow_run': {'name': 'CI', 'status': action, 'conclusion': conclusion,
                                  'head_branch': 'main', 'html_url': 'https://x/run/1'}}
+
+    def test_two_named_watches_on_one_topic_route_to_their_own_spawn_config(self):
+        """The end-to-end version of TestNamedWatches: named subscriptions
+        created through the CLI, real signed HTTP deliveries for two DIFFERENT
+        event classes on the same repo, each reaching its own spawnConfig and
+        no other (#63)."""
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--name', 'triage',
+                     '--include', json.dumps({'path': 'action', 'in': ['opened']}),
+                     '--spawn-config', 'profile=cheap-triage', '--note', 'new issues')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--name', 'debug',
+                     '--include', json.dumps({'path': 'workflow_run.conclusion', 'in': ['failure']}),
+                     '--spawn-config', 'profile=deep-fix', '--note', 'failing CI')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon(spawn_cmd='{ cat >/dev/null; printf "CFG=%s\\n" '
+                                    '"$LOCAL_WEBHOOK_SPAWN_CONFIG"; } >> ' + self.spawn_log)
+
+        # An opened issue matches only the "triage" watch's rules.
+        self.assertEqual(self.post(self.ISSUE, event='issues')[0], 200)
+        self.assertTrue(self.wait_file(self.spawn_log, contains='cheap-triage'))
+        with open(self.spawn_log, encoding='utf-8') as f:
+            first = f.read()
+        self.assertIn('cheap-triage', first)
+        self.assertNotIn('deep-fix', first, 'the issues event reached the wrong watch\'s config')
+
+        # A failing run matches only "debug"'s rules -- a second, independent
+        # spawn with its OWN config, not a repeat of the first.
+        self.assertEqual(self.post(self.run_payload('failure'), event='workflow_run')[0], 200)
+        self.assertTrue(self.wait_file(self.spawn_log, contains='deep-fix'))
+        with open(self.spawn_log, encoding='utf-8') as f:
+            both = f.read()
+        self.assertIn('cheap-triage', both)
+        self.assertIn('deep-fix', both)
 
     def test_dispatch_policy_and_ownership_end_to_end(self):
         """Real signed deliveries: a standing watch spawns for what its own
