@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -63,3 +64,20 @@ class VersionTags(unittest.TestCase):
         self.commit('1.0.0')
         with self.assertRaisesRegex(ValueError, 'reused'):
             tags.version_commits('HEAD')
+
+    def test_ref_accepts_branches_tags_and_commit_ids(self):
+        first = self.commit('1.0.0')
+        tags.git('tag', '-a', 'release', '-m', 'Release')
+        self.commit('1.1.0')
+        for ref in ('release', first, 'main~1'):
+            with self.subTest(ref=ref):
+                self.assertEqual(tags.version_commits(ref), {'1.0.0': first})
+
+    def test_invalid_ref_cannot_supply_git_options_or_create_tags(self):
+        self.commit('1.0.0')
+        for ref in ('--all', '--output=injected', 'HEAD..HEAD', 'missing'):
+            with self.subTest(ref=ref):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    tags.tag_versions(ref)
+                self.assertEqual(tags.git('tag', '--list'), '')
+                self.assertFalse(Path('injected').exists())
