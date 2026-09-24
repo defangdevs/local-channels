@@ -22,6 +22,9 @@ def git(*args):
 
 
 def version_commits(ref):
+    # Release refs use ordinary ASCII branch/tag names and revision suffixes.
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/~^{}@-]*', ref):
+        raise ValueError('Invalid release ref: ' + ref)
     # A caller supplies one revision, never rev-list options or a revision range.
     # Stop option parsing before resolving it, then walk only the verified OID.
     commit_ref = git('rev-parse', '--verify', '--end-of-options', ref + '^{commit}')
@@ -72,7 +75,8 @@ def tag_versions(ref, push=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--ref', default='HEAD')
+    parser.add_argument('--ref', default='HEAD',
+                        help='ASCII branch/tag name or commit revision (default: HEAD)')
     parser.add_argument('--push', action='store_true')
     args = parser.parse_args()
     tag_versions(args.ref, args.push)

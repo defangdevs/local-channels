@@ -75,9 +75,10 @@ class VersionTags(unittest.TestCase):
 
     def test_invalid_ref_cannot_supply_git_options_or_create_tags(self):
         self.commit('1.0.0')
-        for ref in ('--all', '--output=injected', 'HEAD..HEAD', 'missing'):
+        for ref in ('--all', '--output=injected', 'HEAD..HEAD', 'missing',
+                    '', 'HEAD;echo injected', 'HEAD\n--all'):
             with self.subTest(ref=ref):
-                with self.assertRaises(subprocess.CalledProcessError):
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
                     tags.tag_versions(ref)
                 self.assertEqual(tags.git('tag', '--list'), '')
                 self.assertFalse(Path('injected').exists())
