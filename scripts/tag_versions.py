@@ -22,9 +22,14 @@ def git(*args):
 
 
 def version_commits(ref):
+    # A caller supplies one revision, never rev-list options or a revision range.
+    # Stop option parsing before resolving it, then walk only the verified OID.
+    commit_ref = git('rev-parse', '--verify', '--end-of-options', ref + '^{commit}')
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit_ref):
+        raise ValueError('Invalid commit ID: ' + commit_ref)
     versions = {}
     previous = None
-    for commit in git('rev-list', '--first-parent', '--reverse', ref).splitlines():
+    for commit in git('rev-list', '--first-parent', '--reverse', commit_ref).splitlines():
         paths = git('ls-tree', '-r', '--name-only', commit).splitlines()
         path = next((p for p in (
             'local-webhook/.claude-plugin/plugin.json',
