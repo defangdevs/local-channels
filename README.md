@@ -19,7 +19,7 @@ one implementation for both harnesses. See
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.28.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
+| [`local-webhook`](local-webhook/) | 0.29.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
 
 ## Version tags
 
@@ -245,10 +245,13 @@ rule-less entry written before 0.23.0. That replaces the built-in
 failures-only CI brake this plugin used to apply on that path; the policy is
 now the watch's own, and on agent-box it is declared in
 `services.agent-box.webhook.watchPolicy`. What remains built in is session
-coordination, not policy: no event spawns while a live session's own `include`
-predicate claims it — a session driving a PR is already watching it, and a
-second agent on the same branch is not help. A rule-less session subscription
-claims nothing, so new work in the same repo still spawns.
+coordination, not policy: by default (`ownership: "required"`), no event
+spawns while a live session's own `include` predicate claims it — a session
+driving a PR is already watching it, and a second agent on the same branch is
+not help. A rule-less session subscription claims nothing, so new work in the
+same repo still spawns. A dispatch entry can opt out of this brake entirely
+with `ownership: "none"` (0.29.0), for a watch that only reads and comments —
+see [`local-webhook/README.md`](local-webhook/README.md#opting-a-read-only-watch-out-of-the-live-peer-brake-ownership-0290).
 
 Since 0.11.0 a subscription carries `include`/`exclude` **payload predicates**
 (`when`/`drop` are still accepted as the older names)

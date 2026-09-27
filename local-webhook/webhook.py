@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.28.1'
+VERSION = '0.29.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -389,8 +389,10 @@ DISPATCH_COMMENT = (
     "refuses to create one. Until 0.22.x a rule-less entry inherited a built-in GitHub brake instead "
     "(spawn only for a CI-outcome event reporting a FAILURE); that policy now belongs to whoever "
     "configures the watch (#16), which is why the rules are mandatory rather than optional here. "
-    "The one brake left is not policy but session coordination: no event spawns while a LIVE session "
-    "peer's own filter claims it, since that session is already getting the delivery. Only entries "
+    "The one brake left is not policy but session coordination. For an entry with ownership:\"required\" "
+    "(the default), no event spawns while a LIVE session peer's own filter claims it, since that session "
+    "is already getting the delivery; an entry with ownership:\"none\" skips this brake and spawns "
+    "regardless of a live peer's claim. Only entries "
     "carrying an include predicate claim: a session that declared what it is working on is precise "
     "enough to trust, while a rule-less repo-wide entry would silence the watch for the whole repo "
     "(#16). So a new issue still spawns while a session holds one PR. See the session filter comment "
@@ -629,6 +631,13 @@ def normalize_entry(t):
             # it, but it is normalized on both files so a mis-filed one stays
             # visible in webhook_subscriptions rather than vanishing on read.
             'spawnConfig': clean_spawn_config(t.get('spawnConfig')),
+            # #69: only a dispatch entry reads this (dispatch_event, before the
+            # owned_by_live_session brake), but normalized on both files for
+            # the same reason as spawnConfig — a mis-filed value stays visible
+            # rather than vanishing. Closed two-value vocabulary, so a bad or
+            # missing value normalizes to the safe default ('required') rather
+            # than being kept as written the way a predicate is.
+            'ownership': 'none' if t.get('ownership') == 'none' else 'required',
             'ttlHours': ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else None,
             'renewOnEvent': t.get('renewOnEvent') is True,
             'subscribedAt': iso(t.get('subscribedAt')),
@@ -713,6 +722,8 @@ def write_filter(f, path=FILTER_FILE):
             o['exclude'] = e['exclude']
         if e['spawnConfig']:
             o['spawnConfig'] = e['spawnConfig']
+        if e.get('ownership') == 'none':
+            o['ownership'] = 'none'
         if e['lastActivityAt']:
             o['lastActivityAt'] = e['lastActivityAt']
         topics.append(o)
@@ -1864,6 +1875,12 @@ class Dispatcher:
         kept = []
         for item in batch:
             text, meta, env = item
+            if (meta or {}).get('ownership') == 'none':
+                # #69: this item's watch opted out of the brake entirely — the
+                # entry it matched is long gone, so meta is the only thing
+                # still carrying that choice forward to a re-check.
+                kept.append(item)
+                continue
             try:
                 owner = probe(env)
             except Exception:  # noqa: BLE001 — a broken probe must not eat events
@@ -2000,6 +2017,15 @@ DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) i
 # claim has to be declared (filter_claims): a session working one PR must not
 # silence the watch for every unrelated issue in that repo for the life of its
 # subscription.
+#
+# That reasoning assumes the watch itself would ACT on the event — push,
+# comment as an author, merge. A watch that only reads and comments as a
+# reviewer never collides with a worker session the way two pushes to one
+# branch do (agent-box#319), so its entry can carry ownership:"none" (#69) to
+# opt out of this brake entirely: it spawns regardless of what a live peer has
+# claimed. The spawned session still gets the peer snapshot in its prompt
+# (agent-box#251), so it can hand over rather than collide if it turns out to
+# be redundant after all.
 def owned_by_live_session(env):
     for key in peer_scopes_live():
         if filter_claims(filter_path_of(key), env.get('source', ''), env.get('key', ''),
@@ -2061,6 +2087,7 @@ def dispatch_event(env):
                   'declined it (include/exclude rules or ignoreSenders)'
                   % (event or '(none)', env.get('key', '') or '(none)'), file=sys.stderr)
         return
+    entry = r['entry']
     # The watch's own rules have now ruled on this event; the one brake left is
     # not policy but session coordination. A live peer that DECLARED what it is
     # working on is already receiving this delivery and holds the context for
@@ -2069,16 +2096,20 @@ def dispatch_event(env):
     # started a fresh session while the session that opened the PR was live —
     # and the duplicate pushed to its branch. Entries with no `include` are
     # deliberately NOT claims (#16), so new work in the same repo still spawns.
-    owner = owned_by_live_session(env)
-    if owner:
-        # Said out loud: a suppressed spawn is indistinguishable from a watch
-        # that quietly stopped working, and that ambiguity is its own bug
-        # (agent-box#170).
-        print('local-webhook: not spawning for %s on %s — session %s declared it'
-              % (event or '(none)', env.get('key', '') or '(none)', owner),
-              file=sys.stderr)
-        return
-    entry = r['entry']
+    #
+    # Skipped entirely for an ownership:"none" entry (#69): its whole point is
+    # to fire regardless of what a live peer claims, because it never takes
+    # any action agent-box#319's brake exists to prevent.
+    if entry['ownership'] != 'none':
+        owner = owned_by_live_session(env)
+        if owner:
+            # Said out loud: a suppressed spawn is indistinguishable from a
+            # watch that quietly stopped working, and that ambiguity is its
+            # own bug (agent-box#170).
+            print('local-webhook: not spawning for %s on %s — session %s declared it'
+                  % (event or '(none)', env.get('key', '') or '(none)', owner),
+                  file=sys.stderr)
+            return
     text, payload_meta = format_delivery(env, entry)
     DISPATCHER.add(env.get('key', '') or '(none)', text, {
         'source': env.get('source', ''),
@@ -2089,6 +2120,10 @@ def dispatch_event(env):
         # Which watch matched, in the watch's own words (agent-box#321). Flat and separate
         # from 'payload' so the two can never shadow each other.
         'spawnConfig': entry['spawnConfig'] if entry else {},
+        # Carried so a re-check at batch-start time (_still_unowned) can skip
+        # the live-peer probe too — the entry itself is gone by then, only
+        # this meta travels with the queued item.
+        'ownership': entry['ownership'] if entry else 'required',
         # Object identity (number, action, conclusion, ...) — whatever the
         # source's summarizer put in the same meta a channel notification
         # gets. Kept nested so it can ride to LOCAL_WEBHOOK_SPAWN_META as one
@@ -2319,8 +2354,8 @@ INSTRUCTIONS = (
     'triggered it), so if you want "merge on green" while your comments stay muted, say it in the rules '
     'instead of in ignore_senders. A standing watch must carry include/exclude rules: every event it '
     'matches costs a whole session, so it has to say which ones are worth one, and a rule-less watch is '
-    'refused. It never spawns for an event a live session has DECLARED it is working on (a new issue or '
-    'someone else\'s PR still spawns either way). '
+    'refused. A standing watch with ownership:"required" (the default) never spawns for an event a live '
+    'session has DECLARED it is working on (a new issue or someone else\'s PR still spawns either way). '
     'Subscriptions filter on payload CONTENT with include/exclude predicates (see '
     'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, '
     'exclude close/merge echoes without muting their sender, or claim the one PR you are working on. '
@@ -2331,6 +2366,9 @@ INSTRUCTIONS = (
     'A standing watch may also carry spawn_config, a small map of strings passed through to whatever '
     'starts the fresh session (LOCAL_WEBHOOK_SPAWN_CONFIG) — that is how two watches on one repo start '
     'different workers; it means nothing to this plugin and is not a place for secrets. '
+    'Pass ownership:"none" on a standing watch that only reads and comments — never pushes, merges, or '
+    'touches a worktree — to opt it OUT of the live-peer brake above: such a watch never collides with a '
+    'worker session, so a peer\'s own claim is not a reason to suppress its spawn. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -2518,6 +2556,21 @@ TOOLS = [
                         'never a credential. Refused on a deliver_to:"session" subscription, which spawns '
                         'nothing. Omit to keep on renew; pass {} to clear.',
                 },
+                'ownership': {
+                    'type': 'string',
+                    'enum': ['required', 'none'],
+                    'description':
+                        'Standing watches only (deliver_to:"subagent"): "required" (default) — the brake '
+                        'described above, a live peer\'s own claim suppresses this watch\'s spawn. "none" '
+                        'opts a watch OUT of that brake entirely, for one that only reads and comments — '
+                        'never pushes, merges, or touches a worktree — so it never collides with a worker '
+                        'session the way two pushes to one branch do (agent-box#319, the reason the brake '
+                        'exists). Such a watch spawns regardless of what a live peer has claimed; the '
+                        'spawned session still gets the peer snapshot in its prompt (agent-box#251), so it '
+                        'can hand over rather than duplicate if it turns out to be redundant after all. '
+                        'Refused on a deliver_to:"session" subscription, which spawns nothing so there is '
+                        'no brake to opt out of. Omit to keep the existing setting on renew.',
+                },
                 'include': {
                     'type': 'object',
                     'description':
@@ -2535,7 +2588,9 @@ TOOLS = [
                         '(0.23.0) — so express sender muting inside the predicate too, e.g. {"path": '
                         '"sender.login", "notIn": [...]}, rather than combining with ignore_senders. On a '
                         'session subscription an include is also a CLAIM: while this session lives, a '
-                        'standing watch will not spawn a second agent for an event it matches. Omit to '
+                        'standing watch with ownership:"required" (the default) will not spawn a second '
+                        'agent for an event it matches. A standing watch with ownership:"none" opts out '
+                        'of this brake. Omit to '
                         'keep on renew; pass {} to clear. Accepts the old name "when" as an alias.',
                 },
                 'exclude': {
@@ -2652,6 +2707,8 @@ def call_tool(params):
                 o['exclude'] = e['exclude']
             if e['spawnConfig']:
                 o['spawnConfig'] = e['spawnConfig']
+            if e.get('ownership') == 'none':
+                o['ownership'] = 'none'
             if e['subscribedAt']:
                 o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
             if e['lastActivityAt']:
@@ -2750,7 +2807,8 @@ def call_tool(params):
                 (' "%s"' % e['note'] if e['note'] else '') + \
                 (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
                 (' [%s rules]' % '+'.join(rules) if rules else '') + \
-                (' [spawn config: %s]' % cfg if cfg else '')
+                (' [spawn config: %s]' % cfg if cfg else '') + \
+                (' [ownership: none]' if e.get('ownership') == 'none' else '')
 
         def listing(ts):
             return ', '.join(show(e) for e in ts) or '(none)'
@@ -2809,6 +2867,18 @@ def call_tool(params):
                 err = spawn_config_error(raw_cfg)
                 if err:
                     return text('error: %s' % err)
+            # Same reasoning as spawn_config just above: refused rather than
+            # silently ignored on a session subscription, since dispatch_event
+            # is the only reader and a session subscription never reaches it.
+            raw_own = arguments.get('ownership', _MISSING)
+            if raw_own is not _MISSING and raw_own not in ('required', 'none'):
+                return text('error: ownership must be "required" or "none"')
+            if raw_own == 'none' and not dispatch:
+                return text(
+                    'error: ownership:"none" only applies to a standing watch — it opts OUT of the '
+                    'brake that a live peer\'s own claim otherwise applies to a spawn, and a '
+                    'deliver_to:"session" subscription never spawns anything. Pass '
+                    'deliver_to:"subagent", or drop it.')
             raw_note = arguments.get('note', _MISSING)
             # Predicates are validated NOW, not at delivery time: a typo that
             # only surfaced as a match-nothing predicate would read as a watch
@@ -2894,6 +2964,8 @@ def call_tool(params):
                     e['exclude'] = raw_exclude or None
                 if raw_cfg is not _MISSING:
                     e['spawnConfig'] = clean_spawn_config(raw_cfg)
+                if raw_own is not _MISSING:
+                    e['ownership'] = raw_own
                 topics = list(f['topics'])
                 topics[idx] = e
                 write_filter({**f, 'enabled': True, 'topics': topics}, path)
@@ -2925,6 +2997,7 @@ def call_tool(params):
                 'exclude': (raw_exclude or None) if raw_exclude is not _MISSING else default_exclude,
                 'note': '' if raw_note is _MISSING else str(raw_note).strip()[:300],
                 'spawnConfig': {} if raw_cfg is _MISSING else clean_spawn_config(raw_cfg),
+                'ownership': 'required' if raw_own is _MISSING else raw_own,
                 # A dispatch entry defaults to pinned (ttlHours 0): it is a
                 # standing watch, and a spawned session has no warm cache whose
                 # loss the session-filter TTL exists to bound.
@@ -3212,7 +3285,7 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
                                   [--deliver-to MODE] [--renew-on-event]
                                   [--ignore-sender LOGIN]...
                                   [--include JSON] [--exclude JSON]
-                                  [--spawn-config KEY=VALUE]...
+                                  [--spawn-config KEY=VALUE]... [--read-only]
        webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME]
        webhook.py ls
@@ -3248,9 +3321,10 @@ source or for everything: name a key or a prefix.
                        REQUIRES --include and/or --exclude: every event a watch
                        matches costs a whole session, so it must say which ones
                        are worth one (0.23.0 retired the built-in failures-only
-                       CI brake that used to decide that). It never spawns for
-                       an event a live session has DECLARED with its own
-                       --include; a new issue or someone else's PR spawns anyway
+                       CI brake that used to decide that). By default, it never
+                       spawns for an event a live session has DECLARED with its
+                       own --include; --read-only opts this watch out of that
+                       brake. A new issue or someone else's PR spawns anyway
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
@@ -3291,6 +3365,13 @@ source or for everything: name a key or a prefix.
                        max. Echoed by `ls` and readable from the spawned
                        process's environment: routing config, not secrets.
                        --no-spawn-config clears it on re-subscribe
+  --read-only          standing watches only: opt this watch OUT of the brake
+                       that a live peer's own claim otherwise applies to a
+                       spawn (#69) — for a watch that only reads and comments,
+                       never pushes/merges/touches a worktree, so it never
+                       collides with a worker session the way two pushes to
+                       one branch do. Spawns regardless of what a live peer
+                       has claimed. --no-read-only clears it on re-subscribe
   --codex-thread ID    deliver into this codex thread (a session UUID or an
                        exact session name) instead of the one this process's
                        environment names. Rarely needed: run from inside a
@@ -3547,6 +3628,10 @@ def run_cli(argv):
         elif a == '--no-spawn-config':
             saw_spawn_config = True
             spawn_config = {}
+        elif a == '--read-only':
+            args['ownership'] = 'none'
+        elif a == '--no-read-only':
+            args['ownership'] = 'required'
         elif a in ('--include', '--exclude', '--when', '--drop'):
             # Parse errors die here; SHAPE errors are call_tool's to report
             # (predicate_error), same as every other argument problem. --when
