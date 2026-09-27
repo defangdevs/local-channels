@@ -245,10 +245,13 @@ rule-less entry written before 0.23.0. That replaces the built-in
 failures-only CI brake this plugin used to apply on that path; the policy is
 now the watch's own, and on agent-box it is declared in
 `services.agent-box.webhook.watchPolicy`. What remains built in is session
-coordination, not policy: no event spawns while a live session's own `include`
-predicate claims it — a session driving a PR is already watching it, and a
-second agent on the same branch is not help. A rule-less session subscription
-claims nothing, so new work in the same repo still spawns.
+coordination, not policy: by default (`ownership: "required"`), no event
+spawns while a live session's own `include` predicate claims it — a session
+driving a PR is already watching it, and a second agent on the same branch is
+not help. A rule-less session subscription claims nothing, so new work in the
+same repo still spawns. A dispatch entry can opt out of this brake entirely
+with `ownership: "none"` (0.29.0), for a watch that only reads and comments —
+see [`local-webhook/README.md`](local-webhook/README.md#opting-a-read-only-watch-out-of-the-live-peer-brake-ownership-0290).
 
 Since 0.11.0 a subscription carries `include`/`exclude` **payload predicates**
 (`when`/`drop` are still accepted as the older names)

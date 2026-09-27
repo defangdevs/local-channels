@@ -2010,7 +2010,9 @@ class TestOwnershipOptOut(DispatchCase):
             'action': 'completed',
             'check_run': {'name': 'deploy', 'status': 'completed', 'conclusion': 'failure'},
         }))                                                    # same run, queued
-        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
+        self.fake_live_peer('peer1', [dict(
+            topic='github:o/*',
+            include={'path': 'check_run', 'notIn': [None]})])
         time.sleep(3.5)                                       # window opens; batch re-checked
         # ownership:"none" means the claim above must not suppress it: two
         # RUNs, not one.

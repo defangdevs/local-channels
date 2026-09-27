@@ -389,8 +389,10 @@ DISPATCH_COMMENT = (
     "refuses to create one. Until 0.22.x a rule-less entry inherited a built-in GitHub brake instead "
     "(spawn only for a CI-outcome event reporting a FAILURE); that policy now belongs to whoever "
     "configures the watch (#16), which is why the rules are mandatory rather than optional here. "
-    "The one brake left is not policy but session coordination: no event spawns while a LIVE session "
-    "peer's own filter claims it, since that session is already getting the delivery. Only entries "
+    "The one brake left is not policy but session coordination. For an entry with ownership:\"required\" "
+    "(the default), no event spawns while a LIVE session peer's own filter claims it, since that session "
+    "is already getting the delivery; an entry with ownership:\"none\" skips this brake and spawns "
+    "regardless of a live peer's claim. Only entries "
     "carrying an include predicate claim: a session that declared what it is working on is precise "
     "enough to trust, while a rule-less repo-wide entry would silence the watch for the whole repo "
     "(#16). So a new issue still spawns while a session holds one PR. See the session filter comment "
@@ -2352,8 +2354,8 @@ INSTRUCTIONS = (
     'triggered it), so if you want "merge on green" while your comments stay muted, say it in the rules '
     'instead of in ignore_senders. A standing watch must carry include/exclude rules: every event it '
     'matches costs a whole session, so it has to say which ones are worth one, and a rule-less watch is '
-    'refused. It never spawns for an event a live session has DECLARED it is working on (a new issue or '
-    'someone else\'s PR still spawns either way). '
+    'refused. A standing watch with ownership:"required" (the default) never spawns for an event a live '
+    'session has DECLARED it is working on (a new issue or someone else\'s PR still spawns either way). '
     'Subscriptions filter on payload CONTENT with include/exclude predicates (see '
     'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, '
     'exclude close/merge echoes without muting their sender, or claim the one PR you are working on. '
@@ -2586,7 +2588,9 @@ TOOLS = [
                         '(0.23.0) — so express sender muting inside the predicate too, e.g. {"path": '
                         '"sender.login", "notIn": [...]}, rather than combining with ignore_senders. On a '
                         'session subscription an include is also a CLAIM: while this session lives, a '
-                        'standing watch will not spawn a second agent for an event it matches. Omit to '
+                        'standing watch with ownership:"required" (the default) will not spawn a second '
+                        'agent for an event it matches. A standing watch with ownership:"none" opts out '
+                        'of this brake. Omit to '
                         'keep on renew; pass {} to clear. Accepts the old name "when" as an alias.',
                 },
                 'exclude': {
@@ -3317,9 +3321,10 @@ source or for everything: name a key or a prefix.
                        REQUIRES --include and/or --exclude: every event a watch
                        matches costs a whole session, so it must say which ones
                        are worth one (0.23.0 retired the built-in failures-only
-                       CI brake that used to decide that). It never spawns for
-                       an event a live session has DECLARED with its own
-                       --include; a new issue or someone else's PR spawns anyway
+                       CI brake that used to decide that). By default, it never
+                       spawns for an event a live session has DECLARED with its
+                       own --include; --read-only opts this watch out of that
+                       brake. A new issue or someone else's PR spawns anyway
   --renew-on-event     reset the expiry clock on EVERY delivery, not just warm
                        ones — for a stream you mean to follow indefinitely
   --ignore-sender L    drop events on this topic from sender L as echoes of your
