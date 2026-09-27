@@ -1914,6 +1914,109 @@ class TestDispatchFollowupOwnership(DispatchCase):
             self.assertIn('issue #9 opened', f.read())
 
 
+class TestOwnershipOptOut(DispatchCase):
+    """local-channels#69: a watch that only reads and comments — never
+    pushes, merges, or touches a worktree — never collides with a worker
+    session the way agent-box#319's two-pushes-to-one-branch case does, so it
+    can carry ownership:"none" to opt out of the live-peer brake entirely."""
+
+    def watch(self, **kw):
+        return self.call('webhook_subscribe', topic='o/r', deliver_to='subagent',
+                         include=ANY_EVENT, **kw)
+
+    def entry(self):
+        return self.read_json('filter.dispatch.json')['topics'][0]
+
+    def test_default_is_required_and_unaffected(self):
+        # 'required' is the default, so like an unset spawnConfig/ignoreSenders
+        # it is left out of the written file rather than spelled out.
+        self.watch()
+        self.assertNotIn('ownership', self.entry())
+        self.assertEqual(self.mod.read_filter(self.mod.DISPATCH_FILE)['topics'][0]['ownership'], 'required')
+
+    def test_a_watch_stores_and_echoes_its_setting(self):
+        out = self.watch(ownership='none')
+        self.assertIn('[ownership: none]', out)
+        self.assertEqual(self.entry()['ownership'], 'none')
+        self.assertIn('"ownership": "none"', self.call('webhook_subscriptions'))
+
+    def test_a_session_subscription_refuses_it(self):
+        out = self.call('webhook_subscribe', topic='o/r', ownership='none')
+        self.assertTrue(out.startswith('error: ownership:"none" only applies to a standing watch'), out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'filter.testsess.json')))
+
+    def test_required_is_allowed_on_a_session_subscription(self):
+        self.assertTrue(self.call('webhook_subscribe', topic='o/r',
+                                  ownership='required').startswith('subscribed to'))
+
+    def test_bad_value_is_refused(self):
+        out = self.watch(ownership='sometimes')
+        self.assertTrue(out.startswith('error: ownership must be'), out)
+
+    def test_renew_keeps_it_and_required_clears_it(self):
+        self.watch(ownership='none')
+        self.watch(note='still here')             # omitted -> kept
+        self.assertEqual(self.entry()['ownership'], 'none')
+        self.watch(ownership='required')           # explicit clear
+        self.assertNotIn('ownership', self.entry())
+
+    def test_a_hand_edited_bad_value_normalizes_to_required(self):
+        self.write_json('filter.dispatch.json', {'enabled': True, 'topics': [
+            {'topic': 'github:o/r', 'include': ANY_EVENT, 'ttlHours': 0,
+             'ownership': 'sometimes'}]})
+        f = self.mod.read_filter(self.mod.DISPATCH_FILE)
+        self.assertEqual(f['topics'][0]['ownership'], 'required')
+
+    def test_none_spawns_despite_a_live_peers_claim(self):
+        self.watch(ownership='none')
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
+        self.mod.dispatch_event(self.run_env('failure'))
+        self.spawned(True, 'workflow "CI"')
+
+    def test_required_still_suppressed_by_a_live_peers_claim(self):
+        # Unchanged default, pinned alongside the opt-out so a future change
+        # can't silently widen it.
+        self.watch(ownership='required')
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
+        self.mod.dispatch_event(self.run_env('failure'))
+        self.spawned(False)
+
+    def test_none_survives_a_followup_batch_reached_by_a_late_claim(self):
+        # Mirrors TestDispatchFollowupOwnership.test_one_failing_run_costs_one_
+        # session_not_two, but ownership:"none" means the re-check at
+        # batch-start time (_still_unowned) must not apply the brake either —
+        # the entry is gone by then, so it has to travel with the queued item.
+        log = os.path.join(self.state, 'spawns.log')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ echo RUN; cat; } >> %s' % log,
+                        LOCAL_WEBHOOK_SPAWN_WINDOW='2')
+        self.mod = mod
+        self.watch(ownership='none')
+
+        def spawns():
+            if not os.path.exists(log):
+                return 0
+            with open(log, encoding='utf-8') as f:
+                return f.read().count('RUN')
+
+        def wait_for(n, timeout=10):
+            deadline = time.time() + timeout
+            while time.time() < deadline and spawns() < n:
+                time.sleep(0.05)
+            self.assertEqual(spawns(), n)
+
+        mod.dispatch_event(self.run_env('failure'))          # spawn 1
+        wait_for(1)
+        mod.dispatch_event(self.env('check_run', {
+            'action': 'completed',
+            'check_run': {'name': 'deploy', 'status': 'completed', 'conclusion': 'failure'},
+        }))                                                    # same run, queued
+        self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
+        time.sleep(3.5)                                       # window opens; batch re-checked
+        # ownership:"none" means the claim above must not suppress it: two
+        # RUNs, not one.
+        wait_for(2)
+
+
 class TestDispatcher(StateDirCase):
     """Fork-bomb control: immediate first spawn, coalescing, cap, and the
     three-way exit contract (accepted / declined for now / broken)."""

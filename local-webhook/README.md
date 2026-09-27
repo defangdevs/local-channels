@@ -544,6 +544,43 @@ naming the spawn command's environment: a config free to set `PATH` or
 - Omit it on re-subscribe to keep the existing map; pass `{}` (CLI:
   `--no-spawn-config`) to clear it.
 
+#### Opting a read-only watch out of the live-peer brake (`ownership`, 0.29.0)
+
+The live-owner brake above (0.10.0) exists because a second agent on the same
+object collides with the one already working it — agent-box#319 is two
+sessions pushing to one branch. That reasoning assumes the watch would *act*:
+push, comment as an author, merge. A watch that only reads and comments as a
+reviewer never does any of that, so a worker session's own claim is not a
+reason to suppress it — but until 0.29.0 there was no way to say so
+([defangdevs/local-channels#69](https://github.com/defangdevs/local-channels/issues/69),
+split from
+[defangdevs/agent-box#750](https://github.com/defangdevs/agent-box/issues/750)):
+a standing PR-review watch simply never fired on a PR opened by this box's
+own worker sessions, because the worker's own branch claim made it "the
+owner".
+
+A dispatch entry may carry `ownership: "none"` (default: `"required"`, the
+brake as always). Such a watch spawns regardless of what a live peer has
+claimed — the spawned session still gets the peer snapshot in its prompt
+(agent-box#251), so it can hand over rather than duplicate if it turns out to
+be redundant after all.
+
+    python3 webhook.py subscribe 'github:defangdevs/*' --deliver-to subagent \
+        --include '{"path":"action","in":["submitted"]}' \
+        --read-only \
+        --note "standing watch: review new PRs, never push"
+
+- **Blanket, not scoped to event shape.** The opt-out applies to every event
+  this watch matches, not just the ones a worker wouldn't also react to — the
+  simpler of two designs #69 considered, and the one that matches what #750
+  actually needed. A future watch that both reviews *and* acts would need the
+  narrower form; none exists yet.
+- **Dispatch only**, like `spawnConfig`: `webhook_subscribe` refuses
+  `ownership: "none"` on a `deliver_to:"session"` subscription, which spawns
+  nothing and has no brake to opt out of.
+- Omit it on re-subscribe to keep the existing setting; pass `"required"`
+  (CLI: `--no-read-only`) to restore the brake.
+
 ### Naming a watch (0.28.0)
 
 `spawnConfig` lets two watches on one repo start different workers, but until
