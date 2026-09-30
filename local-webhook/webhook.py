@@ -22,6 +22,7 @@
 # filter.json → forward nothing), so a session only ever receives what it
 # actually subscribed to.
 import atexit
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -43,7 +44,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.29.0'
+VERSION = '0.30.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -188,8 +189,17 @@ def pretty(obj):
 #   secretFile      path to secret file (relative paths resolve in STATE_DIR)
 #   format          "github" | "generic"; default "github" iff the source is
 #                   named github, else "generic"
-#   signatureHeader default "x-hub-signature-256"; value is HMAC-SHA256 of the
-#                   raw body as hex, with or without a "sha256=" prefix
+#   verification    "hmac-hex" (default) | "token" | "standard-webhooks" — see
+#                   verify()/verify_token()/verify_standard_webhooks() below.
+#                   Picks signatureHeader's default too (see _DEFAULT_
+#                   SIGNATURE_HEADER), so an unmigrated source keeps verifying
+#                   the way it always did.
+#   signatureHeader default depends on verification (see above); value is the
+#                   signature in that mode's own shape
+#   idHeader        standard-webhooks only; default "webhook-id"
+#   timestampHeader standard-webhooks only; default "webhook-timestamp" — a
+#                   value further than STANDARD_WEBHOOKS_TOLERANCE_SECONDS
+#                   from now is refused as a possible replay
 #   eventHeader     default "x-github-event" (github) / "x-webhook-event"
 #   deliveryHeader  default "x-github-delivery" / "x-webhook-delivery"
 #   keyPath         dot-path into the JSON payload yielding the routing key
@@ -238,7 +248,8 @@ def source_secret(src):
 
 
 # The sender signs the raw request body with HMAC-SHA256; the header carries
-# the hex digest, optionally prefixed "sha256=" (GitHub style).
+# the hex digest, optionally prefixed "sha256=" (GitHub style). This is the
+# "hmac-hex" verification mode (the default — see read_sources' comment).
 def verify(secret, sig_header, body):
     raw = str(sig_header if sig_header is not None else '').strip()
     hexv = raw[7:] if raw.lower().startswith('sha256=') else raw
@@ -246,6 +257,92 @@ def verify(secret, sig_header, body):
         return False
     expected = hmac.new(secret.encode('utf-8'), body, hashlib.sha256).digest()
     return hmac.compare_digest(expected, bytes.fromhex(hexv))
+
+
+# "token" verification mode: no HMAC at all — the header carries the plain
+# secret (GitLab's legacy X-Gitlab-Token; GitLab's own docs now call it "not
+# recommended"). Weak — a leaked delivery leaks the secret outright — but it
+# is what that sender sends, and whether to accept it is the config's choice.
+def verify_token(secret, header_value):
+    return hmac.compare_digest(str(header_value if header_value is not None else ''), secret)
+
+
+# "standard-webhooks" verification mode: https://www.standardwebhooks.com/ —
+# GitLab's own "signing token" (19.0+, on by default) uses this shape, and so
+# does any other Standard-Webhooks sender. Two differences from "hmac-hex":
+# the signed content is "<id>.<timestamp>.<body>", not the body alone, and the
+# header carries a space-separated list of "<version>,<base64 sig>" entries
+# (more than one during key rotation) — only "v1" is understood here, and ANY
+# matching entry accepts. A timestamp far from now is refused as a possible
+# replay; the spec calls this out explicitly.
+STANDARD_WEBHOOKS_TOLERANCE_SECONDS = 5 * 60
+
+
+def _standard_webhooks_key(secret):
+    # A Standard Webhooks secret is usually a "whsec_"-prefixed base64 string;
+    # fall back to the raw bytes so a plain inline secret still works too.
+    if secret.startswith('whsec_'):
+        try:
+            return base64.b64decode(secret[len('whsec_'):])
+        except ValueError:
+            pass
+    return secret.encode('utf-8')
+
+
+def verify_standard_webhooks(secret, sig_header, id_header, timestamp_header, body,
+                              tolerance=STANDARD_WEBHOOKS_TOLERANCE_SECONDS, now=None):
+    raw = str(sig_header if sig_header is not None else '').strip()
+    msg_id = str(id_header if id_header is not None else '').strip()
+    ts_raw = str(timestamp_header if timestamp_header is not None else '').strip()
+    if not raw or not msg_id or not ts_raw:
+        return False
+    try:
+        ts = int(ts_raw)
+    except ValueError:
+        return False
+    if abs((time.time() if now is None else now) - ts) > tolerance:
+        return False
+    signed_content = ('%s.%s.' % (msg_id, ts_raw)).encode('utf-8') + body
+    expected = hmac.new(_standard_webhooks_key(secret), signed_content, hashlib.sha256).digest()
+    for entry in raw.split():
+        version, _, value = entry.partition(',')
+        if version != 'v1' or not value:
+            continue
+        try:
+            provided = base64.b64decode(value)
+        except ValueError:
+            continue
+        if hmac.compare_digest(expected, provided):
+            return True
+    return False
+
+
+VERIFICATION_MODES = ('hmac-hex', 'token', 'standard-webhooks')
+# Per-mode default signatureHeader, used when a source doesn't set its own.
+_DEFAULT_SIGNATURE_HEADER = {
+    'hmac-hex': 'x-hub-signature-256',
+    'token': 'x-gitlab-token',
+    'standard-webhooks': 'webhook-signature',
+}
+
+
+def source_verification(src):
+    return src.get('verification') if src.get('verification') in VERIFICATION_MODES else 'hmac-hex'
+
+
+def verify_delivery(src, secret, headers, body):
+    """Dispatches to the source's verification mode (default "hmac-hex")."""
+    mode = source_verification(src)
+    sig_header = src.get('signatureHeader') if isinstance(src.get('signatureHeader'), str) \
+        else _DEFAULT_SIGNATURE_HEADER[mode]
+    if mode == 'hmac-hex':
+        return verify(secret, headers.get(sig_header), body)
+    if mode == 'token':
+        return verify_token(secret, headers.get(sig_header))
+    id_header = src.get('idHeader') if isinstance(src.get('idHeader'), str) else 'webhook-id'
+    timestamp_header = src.get('timestampHeader') if isinstance(src.get('timestampHeader'), str) else 'webhook-timestamp'
+    return verify_standard_webhooks(secret, headers.get(sig_header), headers.get(id_header),
+                                     headers.get(timestamp_header), body)
 
 
 # ----------------------------------------------------------------- filter ---
@@ -2328,7 +2425,7 @@ def out(msg):
 
 INSTRUCTIONS = (
     'Webhook deliveries arrive as <channel source="local-webhook" ...> messages; meta.source names the '
-    'sender (e.g. github). They are one-way and already HMAC-verified. Read them and act (e.g. investigate '
+    'sender (e.g. github). They are one-way and already signature-verified. Read them and act (e.g. investigate '
     'a failing check, review a new PR, note a push); no reply is expected or possible on this channel. '
     'Routing is controlled by the tools webhook_subscribe / webhook_unsubscribe / webhook_subscriptions, '
     'which manage topic patterns of the form "source:key" — e.g. github:owner/repo or github:owner/*; a '
@@ -3105,8 +3202,7 @@ def deliver(handler, body):
         return done(404, 'unknown source')
 
     secret = source_secret(src)
-    sig_header = src.get('signatureHeader') if isinstance(src.get('signatureHeader'), str) else 'x-hub-signature-256'
-    if not secret or not verify(secret, handler.headers.get(sig_header), body):
+    if not secret or not verify_delivery(src, secret, handler.headers, body):
         return done(401, 'invalid signature')
 
     try:
@@ -3473,7 +3569,9 @@ def run_emit(rest, die):
     # exactly what an external sender for this source would send.
     fmt = src.get('format') if src.get('format') in ('generic', 'github') else \
         ('github' if source == 'github' else 'generic')
-    sig_header = src.get('signatureHeader') if isinstance(src.get('signatureHeader'), str) else 'x-hub-signature-256'
+    verification = source_verification(src)
+    sig_header = src.get('signatureHeader') if isinstance(src.get('signatureHeader'), str) \
+        else _DEFAULT_SIGNATURE_HEADER[verification]
     event_header = src.get('eventHeader') if isinstance(src.get('eventHeader'), str) else \
         ('x-github-event' if fmt == 'github' else 'x-webhook-event')
     delivery_header = src.get('deliveryHeader') if isinstance(src.get('deliveryHeader'), str) else \
@@ -3482,9 +3580,23 @@ def run_emit(rest, die):
     body = raw.encode('utf-8')  # sign the exact bytes that go on the wire
     headers = {
         'Content-Type': 'application/json',
-        sig_header: 'sha256=' + hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest(),
         delivery_header: 'emit-' + os.urandom(8).hex(),
     }
+    if verification == 'hmac-hex':
+        headers[sig_header] = 'sha256=' + hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest()
+    elif verification == 'token':
+        headers[sig_header] = secret
+    else:  # standard-webhooks
+        id_header = src.get('idHeader') if isinstance(src.get('idHeader'), str) else 'webhook-id'
+        timestamp_header = src.get('timestampHeader') if isinstance(src.get('timestampHeader'), str) else 'webhook-timestamp'
+        msg_id = 'emit-' + os.urandom(8).hex()
+        ts = str(int(time.time()))
+        signed_content = ('%s.%s.' % (msg_id, ts)).encode('utf-8') + body
+        sig = base64.b64encode(
+            hmac.new(_standard_webhooks_key(secret), signed_content, hashlib.sha256).digest()).decode('ascii')
+        headers[sig_header] = 'v1,' + sig
+        headers[id_header] = msg_id
+        headers[timestamp_header] = ts
     if event:
         headers[event_header] = event
 

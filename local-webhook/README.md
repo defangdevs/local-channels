@@ -90,13 +90,54 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 
 | key | default | meaning |
 |---|---|---|
-| `secret` / `secretFile` | — | HMAC-SHA256 secret (file paths resolve in the state dir) |
+| `secret` / `secretFile` | — | verification secret (file paths resolve in the state dir) |
 | `format` | `github` iff source is named github, else `generic` | payload summarizer |
-| `signatureHeader` | `x-hub-signature-256` | hex HMAC of raw body, optional `sha256=` prefix |
+| `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` — see [Verification modes](#verification-modes-0300) |
+| `signatureHeader` | depends on `verification` (`x-hub-signature-256` / `x-gitlab-token` / `webhook-signature`) | the signature, in that mode's own shape |
+| `idHeader` (0.30.0) | `webhook-id` | `standard-webhooks` only |
+| `timestampHeader` (0.30.0) | `webhook-timestamp` | `standard-webhooks` only; more than 5 minutes from now is refused as a possible replay |
 | `eventHeader` | `x-github-event` / `x-webhook-event` | falls back to payload `event`/`type` |
 | `deliveryHeader` | `x-github-delivery` / `x-webhook-delivery` | delivery id for meta |
 | `keyPath` | `repository.full_name` (github) / none | dot-path to the routing key |
 | `senderPath` | `sender.login` (github) / none | dot-path to the acting user, matched against `ignoreSenders` |
+
+#### Verification modes (0.30.0)
+
+`verify()` used to implement exactly one scheme (HMAC-SHA256 hex, GitHub's
+own). GitLab — and any other [Standard Webhooks](https://www.standardwebhooks.com/)
+sender — could not deliver here at all: neither of GitLab's two schemes is
+HMAC-hex. `verification` picks the scheme a source is checked against; the
+default keeps every existing source verifying exactly as before.
+
+- **`hmac-hex`** (default) — unchanged: HMAC-SHA256 of the raw body as hex,
+  with or without a `sha256=` prefix.
+- **`token`** — the header carries the plain secret (GitLab's legacy
+  `X-Gitlab-Token`; GitLab's own docs now call it "not recommended"). No HMAC
+  at all — a leaked delivery leaks the secret outright — but it is what that
+  sender sends, and accepting it is the config's choice, not this plugin's.
+- **`standard-webhooks`** — GitLab's "signing token" (19.0+, on by default),
+  and the shape any other Standard-Webhooks sender uses. The header carries a
+  space-separated list of `<version>,<base64 sig>` entries (more than one
+  during key rotation); only `v1` is understood, and any matching entry
+  accepts. The signed content is `<id>.<timestamp>.<body>`, not the body
+  alone, so `idHeader`/`timestampHeader` name where those two pieces come
+  from. A timestamp more than `STANDARD_WEBHOOKS_TOLERANCE_SECONDS` (5
+  minutes) from now is refused as a possible replay — Standard Webhooks' own
+  docs call this out explicitly. The secret may be a plain string or a
+  `whsec_`-prefixed base64 string, exactly as Standard Webhooks specifies.
+
+```json
+{ "sources": { "gitlab": {
+    "secretFile": "gitlab.secret", "format": "generic",
+    "verification": "standard-webhooks",
+    "keyPath": "project.path_with_namespace", "senderPath": "user.username",
+    "eventHeader": "x-gitlab-event"
+} } }
+```
+
+`webhook.py emit` signs in whichever mode the source declares, so a self-test
+delivery (see [Wiring box-local sources](#wiring-box-local-sources-emit-0120))
+exercises the real check either way.
 
 ### filter.json
 
@@ -757,10 +798,13 @@ stdin-only rule the dispatch path follows for spawn prompts.
 
 ## Wiring anything else
 
-Any sender that can POST JSON and sign the raw body with HMAC-SHA256 works.
-Add a source to `sources.json`, point the sender at `POST /<source>`, and put
-the hex digest in the signature header. For senders with fixed non-GitHub
-header names (e.g. `x-signature`), set `signatureHeader`.
+Any sender that can POST JSON and sign the raw body with HMAC-SHA256 works out
+of the box: add a source to `sources.json`, point the sender at
+`POST /<source>`, and put the hex digest in the signature header. For senders
+with fixed non-GitHub header names (e.g. `x-signature`), set `signatureHeader`.
+A sender that signs differently — GitLab's legacy plain-secret token, or its
+(and any Standard Webhooks sender's) `webhook-signature` scheme — needs
+`verification` set instead; see [Verification modes](#verification-modes-0300).
 
 ## Wiring box-local sources (`emit`, 0.12.0)
 

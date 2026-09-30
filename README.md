@@ -19,7 +19,7 @@ one implementation for both harnesses. See
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.29.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
+| [`local-webhook`](local-webhook/) | 0.30.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a per-source `verification` mode (`hmac-hex` | `token` | `standard-webhooks`, #30) so GitLab and other Standard-Webhooks senders can deliver too, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
 
 ## Version tags
 
@@ -101,11 +101,15 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
    (anything else → `405`); the URL path selects the source — `POST /github`,
    `POST /stripe`, and a bare `POST /` maps to `defaultSource` so hook URLs that
    predate multi-source support keep working. An unknown source is `404`.
-2. **Verification.** The source's secret is used to HMAC-SHA256 the *raw* body;
-   the hex digest is compared (constant-time) against the signature header,
-   with or without a `sha256=` prefix. Missing source, missing secret or bad
-   signature → `401`; unparseable body → `400`; accepted → `200 ok`. This is the
-   only trust boundary, and it fails **closed**.
+2. **Verification.** The source's secret is checked against the signature
+   header using its declared `verification` mode — `hmac-hex` (default:
+   HMAC-SHA256 of the *raw* body, hex, with or without a `sha256=` prefix),
+   `token` (the header carries the plain secret) or `standard-webhooks`
+   (a space-separated `v1,<base64>` list over `<id>.<timestamp>.<body>`, with a
+   replay-window check on the timestamp) — see local-webhook's README for
+   details. Missing source, missing secret or bad signature → `401`;
+   unparseable body → `400`; accepted → `200 ok`. This is the only trust
+   boundary, and it fails **closed**.
 3. **Normalization.** The payload is reduced to an envelope —
    `{source, format, event, key, sender, delivery, payload}` — using the
    source's `eventHeader`, `keyPath`, `senderPath` and `deliveryHeader`
@@ -375,8 +379,10 @@ sessions for fan-out and routing to work.
 - **`sources.json`** — who may deliver and how to verify and interpret them.
   Declares `defaultSource` and a `sources` map; each source needs one of
   `secret` / `secretFile` (relative paths resolve inside the state dir) and may
-  set `format` (`github` | `generic`), `signatureHeader`, `eventHeader`,
-  `deliveryHeader`, `keyPath` and `senderPath`. Re-read on every delivery.
+  set `format` (`github` | `generic`), `verification` (`hmac-hex` | `token` |
+  `standard-webhooks`, #30), `signatureHeader`, `idHeader`/`timestampHeader`
+  (`standard-webhooks` only), `eventHeader`, `deliveryHeader`, `keyPath` and
+  `senderPath`. Re-read on every delivery.
 
   ```json
   {
