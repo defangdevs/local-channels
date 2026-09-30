@@ -264,7 +264,11 @@ def verify(secret, sig_header, body):
 # recommended"). Weak — a leaked delivery leaks the secret outright — but it
 # is what that sender sends, and whether to accept it is the config's choice.
 def verify_token(secret, header_value):
-    return hmac.compare_digest(str(header_value if header_value is not None else ''), secret)
+    # compare_digest raises TypeError on a non-ASCII str; http.server decodes
+    # headers as latin-1, so a hostile header can carry arbitrary bytes.
+    # surrogateescape round-trips those back to bytes instead of raising.
+    provided = str(header_value if header_value is not None else '').encode('utf-8', 'surrogateescape')
+    return hmac.compare_digest(provided, secret.encode('utf-8'))
 
 
 # "standard-webhooks" verification mode: https://www.standardwebhooks.com/ —

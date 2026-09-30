@@ -129,6 +129,11 @@ class TestVerifyToken(StateDirCase):
         self.assertFalse(self.mod.verify_token('sekrit', None))
         self.assertFalse(self.mod.verify_token('sekrit', ''))
 
+    def test_non_ascii_header_rejects_instead_of_raising(self):
+        # http.server decodes headers as latin-1, so a hostile header can
+        # carry arbitrary high bytes; that must fail closed, not raise.
+        self.assertFalse(self.mod.verify_token('sekrit', 'ééé'))
+
 
 class TestVerifyStandardWebhooks(StateDirCase):
     """'standard-webhooks' mode: https://www.standardwebhooks.com/ — GitLab's
@@ -2737,6 +2742,21 @@ class TestEndToEnd(unittest.TestCase):
             time.sleep(0.05)
         return False
 
+    def read_peer_line(self, peer, timeout=15):
+        """Read one channel-message line from a session peer's stdout,
+        already parsed as JSON. Shared by every "a delivery reaches a peer"
+        test regardless of the source's format or verification mode."""
+        line = [None]
+
+        def read_line():
+            line[0] = peer.stdout.readline()
+        t = threading.Thread(target=read_line)
+        t.daemon = True
+        t.start()
+        t.join(timeout)
+        self.assertTrue(line[0], 'peer never emitted a channel message')
+        return json.loads(line[0].decode())
+
     def test_http_status_codes(self):
         self.start_daemon()
         self.assertEqual(self.post(self.ISSUE)[0], 200)
@@ -3180,16 +3200,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual((resp.status, resp.read().decode()), (200, 'ok'))
         conn.close()
 
-        line = [None]
-
-        def read_line():
-            line[0] = peer.stdout.readline()
-        t = threading.Thread(target=read_line)
-        t.daemon = True
-        t.start()
-        t.join(15)
-        self.assertTrue(line[0], 'peer never emitted a channel message')
-        msg = json.loads(line[0].decode())
+        msg = self.read_peer_line(peer)
         self.assertEqual(msg['params']['meta']['key'], 'acme/repo')
 
     def test_gitlab_style_token_source_rejects_wrong_token(self):
@@ -3239,16 +3250,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual((resp.status, resp.read().decode()), (200, 'ok'))
         conn.close()
 
-        line = [None]
-
-        def read_line():
-            line[0] = peer.stdout.readline()
-        t = threading.Thread(target=read_line)
-        t.daemon = True
-        t.start()
-        t.join(15)
-        self.assertTrue(line[0], 'peer never emitted a channel message')
-        msg = json.loads(line[0].decode())
+        msg = self.read_peer_line(peer)
         self.assertEqual(msg['params']['meta']['key'], 'acme/repo')
 
     def test_standard_webhooks_source_rejects_stale_timestamp(self):
