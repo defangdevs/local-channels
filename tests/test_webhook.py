@@ -118,6 +118,121 @@ class TestVerify(StateDirCase):
         self.assertFalse(self.mod.verify('sekrit', '', self.BODY))
 
 
+class TestVerifyToken(StateDirCase):
+    """'token' mode (GitLab's legacy X-Gitlab-Token): the header IS the secret."""
+
+    def test_accepts_matching_token(self):
+        self.assertTrue(self.mod.verify_token('sekrit', 'sekrit'))
+
+    def test_rejects(self):
+        self.assertFalse(self.mod.verify_token('sekrit', 'other'))
+        self.assertFalse(self.mod.verify_token('sekrit', None))
+        self.assertFalse(self.mod.verify_token('sekrit', ''))
+
+    def test_non_ascii_header_rejects_instead_of_raising(self):
+        # http.server decodes headers as latin-1, so a hostile header can
+        # carry arbitrary high bytes; that must fail closed, not raise.
+        self.assertFalse(self.mod.verify_token('sekrit', 'ééé'))
+
+
+class TestVerifyStandardWebhooks(StateDirCase):
+    """'standard-webhooks' mode: https://www.standardwebhooks.com/ — GitLab's
+    19.0+ 'signing token' and any other Standard-Webhooks sender's shape."""
+    SECRET = 'sekrit'
+    BODY = b'{"a":1}'
+    MSG_ID = 'msg_1'
+    TS = '1700000000'
+
+    def sig(self, secret=SECRET, msg_id=MSG_ID, ts=TS, body=BODY):
+        import base64 as _b64
+        import hashlib as _h
+        import hmac as _hm
+        signed = ('%s.%s.' % (msg_id, ts)).encode('utf-8') + body
+        return 'v1,' + _b64.b64encode(_hm.new(secret.encode('utf-8'), signed, _h.sha256).digest()).decode('ascii')
+
+    def test_accepts_valid(self):
+        self.assertTrue(self.mod.verify_standard_webhooks(
+            self.SECRET, self.sig(), self.MSG_ID, self.TS, self.BODY, now=int(self.TS)))
+
+    def test_accepts_any_matching_entry_in_a_rotation_list(self):
+        # Key rotation: more than one "v1,<sig>" entry, space-separated; any
+        # match accepts.
+        combined = 'v1,bm90YXNpZw== ' + self.sig()
+        self.assertTrue(self.mod.verify_standard_webhooks(
+            self.SECRET, combined, self.MSG_ID, self.TS, self.BODY, now=int(self.TS)))
+
+    def test_accepts_whsec_prefixed_base64_secret(self):
+        import base64 as _b64
+        import hashlib as _h
+        import hmac as _hm
+        key = b'raw-key-bytes'
+        secret = 'whsec_' + _b64.b64encode(key).decode('ascii')
+        signed = ('%s.%s.' % (self.MSG_ID, self.TS)).encode('utf-8') + self.BODY
+        sig = 'v1,' + _b64.b64encode(_hm.new(key, signed, _h.sha256).digest()).decode('ascii')
+        self.assertTrue(self.mod.verify_standard_webhooks(
+            secret, sig, self.MSG_ID, self.TS, self.BODY, now=int(self.TS)))
+
+    def test_rejects(self):
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, self.sig(), self.MSG_ID, self.TS, b'{"a":2}', now=int(self.TS)))  # body tampered
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            'other', self.sig(), self.MSG_ID, self.TS, self.BODY, now=int(self.TS)))       # wrong secret
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, 'v2,' + self.sig()[3:], self.MSG_ID, self.TS, self.BODY, now=int(self.TS)))  # unknown version
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, self.sig(), 'wrong-id', self.TS, self.BODY, now=int(self.TS)))    # wrong id
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, self.sig(), self.MSG_ID, self.TS, self.BODY, now=None))  # far from real now
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, None, self.MSG_ID, self.TS, self.BODY, now=int(self.TS)))
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, self.sig(), self.MSG_ID, 'not-a-number', self.BODY, now=int(self.TS)))
+
+    def test_rejects_stale_timestamp_outside_tolerance(self):
+        stale_ts = str(int(self.TS) - 600)  # 10 minutes before "now"
+        self.assertFalse(self.mod.verify_standard_webhooks(
+            self.SECRET, self.sig(ts=stale_ts), self.MSG_ID, stale_ts, self.BODY, now=int(self.TS)))
+
+
+class TestVerifyDelivery(StateDirCase):
+    """verify_delivery() dispatches on src['verification'], defaulting to
+    'hmac-hex' — the compatibility guarantee an unmigrated source relies on."""
+
+    def test_defaults_to_hmac_hex_with_github_style_header(self):
+        import hashlib as _h
+        import hmac as _hm
+        body = b'{"a":1}'
+        sig = 'sha256=' + _hm.new(b'sekrit', body, _h.sha256).hexdigest()
+        self.assertTrue(self.mod.verify_delivery({}, 'sekrit', {'x-hub-signature-256': sig}, body))
+        self.assertFalse(self.mod.verify_delivery({}, 'sekrit', {}, body))
+
+    def test_token_mode_uses_its_own_default_header(self):
+        self.assertTrue(self.mod.verify_delivery(
+            {'verification': 'token'}, 'sekrit', {'x-gitlab-token': 'sekrit'}, b'{}'))
+        self.assertFalse(self.mod.verify_delivery(
+            {'verification': 'token'}, 'sekrit', {'x-gitlab-token': 'wrong'}, b'{}'))
+
+    def test_standard_webhooks_mode_uses_its_own_default_headers(self):
+        import base64 as _b64
+        import hashlib as _h
+        import hmac as _hm
+        body = b'{"a":1}'
+        ts = str(int(self.mod.time.time()))
+        signed = ('id-1.%s.' % ts).encode('utf-8') + body
+        sig = 'v1,' + _b64.b64encode(_hm.new(b'sekrit', signed, _h.sha256).digest()).decode('ascii')
+        self.assertTrue(self.mod.verify_delivery(
+            {'verification': 'standard-webhooks'}, 'sekrit',
+            {'webhook-signature': sig, 'webhook-id': 'id-1', 'webhook-timestamp': ts}, body))
+
+    def test_unknown_verification_falls_back_to_hmac_hex(self):
+        import hashlib as _h
+        import hmac as _hm
+        body = b'{"a":1}'
+        sig = 'sha256=' + _hm.new(b'sekrit', body, _h.sha256).hexdigest()
+        self.assertTrue(self.mod.verify_delivery(
+            {'verification': 'not-a-real-mode'}, 'sekrit', {'x-hub-signature-256': sig}, body))
+
+
 class TestMatchTopic(StateDirCase):
     def test_patterns(self):
         m = self.mod.match_topic
@@ -2627,6 +2742,21 @@ class TestEndToEnd(unittest.TestCase):
             time.sleep(0.05)
         return False
 
+    def read_peer_line(self, peer, timeout=15):
+        """Read one channel-message line from a session peer's stdout,
+        already parsed as JSON. Shared by every "a delivery reaches a peer"
+        test regardless of the source's format or verification mode."""
+        line = [None]
+
+        def read_line():
+            line[0] = peer.stdout.readline()
+        t = threading.Thread(target=read_line)
+        t.daemon = True
+        t.start()
+        t.join(timeout)
+        self.assertTrue(line[0], 'peer never emitted a channel message')
+        return json.loads(line[0].decode())
+
     def test_http_status_codes(self):
         self.start_daemon()
         self.assertEqual(self.post(self.ISSUE)[0], 200)
@@ -3046,6 +3176,118 @@ class TestEndToEnd(unittest.TestCase):
         resp = conn.getresponse()
         self.assertEqual((resp.status, resp.read().decode()), (401, 'invalid signature'))
         conn.close()
+
+    def test_gitlab_style_token_source_reaches_a_peer(self):
+        """'verification: token' (GitLab's legacy X-Gitlab-Token): the header
+        IS the secret, no HMAC at all."""
+        self.add_source('gitlab', format='generic', verification='token',
+                        keyPath='project.path_with_namespace', senderPath='user.username')
+        r = self.cli('subscribe', 'gitlab:acme/repo', '--note', 'gitlab issues', session='peersess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        self.start_daemon()
+        peer = self.start_peer('peersess')
+
+        body = {'object_kind': 'issue', 'project': {'path_with_namespace': 'acme/repo'},
+                'user': {'username': 'someone'}}
+        raw = json.dumps(body).encode('utf-8')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/gitlab', raw, {
+            'content-type': 'application/json',
+            'x-gitlab-token': self.SECRET,
+        })
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, resp.read().decode()), (200, 'ok'))
+        conn.close()
+
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['params']['meta']['key'], 'acme/repo')
+
+    def test_gitlab_style_token_source_rejects_wrong_token(self):
+        self.add_source('gitlab', format='generic', verification='token',
+                        keyPath='project.path_with_namespace')
+        self.start_daemon()
+        raw = b'{"project":{"path_with_namespace":"acme/repo"}}'
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/gitlab', raw, {
+            'content-type': 'application/json',
+            'x-gitlab-token': 'not-the-secret',
+        })
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, resp.read().decode()), (401, 'invalid signature'))
+        conn.close()
+
+    def test_standard_webhooks_source_reaches_a_peer(self):
+        """'verification: standard-webhooks' (GitLab 19.0+'s signing token,
+        and the Standard Webhooks shape generally): id/timestamp/body signed,
+        base64 'v1,<sig>' in the signature header."""
+        import base64
+        import hashlib
+        import hmac as hmac_mod
+        self.add_source('gitlab', format='generic', verification='standard-webhooks',
+                        keyPath='project.path_with_namespace')
+        r = self.cli('subscribe', 'gitlab:acme/repo', '--note', 'gitlab issues', session='peersess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        self.start_daemon()
+        peer = self.start_peer('peersess')
+
+        body = {'object_kind': 'issue', 'project': {'path_with_namespace': 'acme/repo'}}
+        raw = json.dumps(body).encode('utf-8')
+        msg_id = 'msg_test123'
+        ts = str(int(time.time()))
+        signed_content = ('%s.%s.' % (msg_id, ts)).encode('utf-8') + raw
+        sig = 'v1,' + base64.b64encode(
+            hmac_mod.new(self.SECRET.encode(), signed_content, hashlib.sha256).digest()).decode('ascii')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/gitlab', raw, {
+            'content-type': 'application/json',
+            'webhook-signature': sig,
+            'webhook-id': msg_id,
+            'webhook-timestamp': ts,
+        })
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, resp.read().decode()), (200, 'ok'))
+        conn.close()
+
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['params']['meta']['key'], 'acme/repo')
+
+    def test_standard_webhooks_source_rejects_stale_timestamp(self):
+        """A replay past the tolerance window is refused, not merely logged."""
+        import base64
+        import hashlib
+        import hmac as hmac_mod
+        self.add_source('gitlab', format='generic', verification='standard-webhooks',
+                        keyPath='project.path_with_namespace')
+        self.start_daemon()
+        raw = b'{"project":{"path_with_namespace":"acme/repo"}}'
+        msg_id = 'msg_test123'
+        ts = str(int(time.time()) - 3600)  # an hour old
+        signed_content = ('%s.%s.' % (msg_id, ts)).encode('utf-8') + raw
+        sig = 'v1,' + base64.b64encode(
+            hmac_mod.new(self.SECRET.encode(), signed_content, hashlib.sha256).digest()).decode('ascii')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/gitlab', raw, {
+            'content-type': 'application/json',
+            'webhook-signature': sig,
+            'webhook-id': msg_id,
+            'webhook-timestamp': ts,
+        })
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, resp.read().decode()), (401, 'invalid signature'))
+        conn.close()
+
+    def test_emit_signs_per_source_verification_mode(self):
+        """emit's self-test path must sign in whatever mode the source
+        declares, or it can never usefully test a non-hmac-hex source."""
+        self.add_source('gitlab-token', format='generic', verification='token')
+        self.add_source('gitlab-sw', format='generic', verification='standard-webhooks')
+        self.start_daemon()
+        r = self.cli('emit', 'gitlab-token', '{"a":1}')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('emit', 'gitlab-sw', '{"a":1}')
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_emit_over_tcp_and_stdin(self):
         """The legacy/TCP shape: the daemon advertises its port, emit reads the
