@@ -34,6 +34,14 @@ class VersionTags(unittest.TestCase):
         tags.git('commit', '--allow-empty', '-m', version)
         return tags.git('rev-parse', 'HEAD')
 
+    def commit_whatsapp(self, version):
+        path = Path('local-whatsapp/.claude-plugin/plugin.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'version': version}))
+        tags.git('add', '.')
+        tags.git('commit', '-m', 'local-whatsapp ' + version)
+        return tags.git('rev-parse', 'HEAD')
+
     def test_first_mainline_commit_and_idempotence(self):
         first = self.commit('1.0.0')
         self.commit('1.0.0')
@@ -49,6 +57,17 @@ class VersionTags(unittest.TestCase):
         tags.tag_versions('HEAD')
         self.assertEqual(tags.git('rev-parse', 'v1.0.0'), original)
         self.assertEqual(tags.git('rev-parse', 'v1.1.0^{commit}'), merged)
+
+    def test_whatsapp_versions_get_separate_immutable_tags(self):
+        self.commit('1.0.0')
+        first = self.commit_whatsapp('0.1.0')
+        self.assertEqual(tags.whatsapp_version_commits('HEAD'), {'0.1.0': first})
+        tags.tag_versions('HEAD')
+        self.assertEqual(tags.git('rev-parse', 'local-whatsapp-v0.1.0^{commit}'), first)
+        tags.git('tag', '-d', 'local-whatsapp-v0.1.0')
+        tags.git('tag', 'local-whatsapp-v0.1.0', 'HEAD~1')
+        with self.assertRaisesRegex(ValueError, 'different commit'):
+            tags.tag_versions('HEAD')
 
     def test_conflict_refuses_before_creating_tags(self):
         self.commit('1.0.0')

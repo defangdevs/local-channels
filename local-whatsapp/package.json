@@ -1,0 +1,9 @@
+{
+  "name": "local-whatsapp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "dependencies": { "@whiskeysockets/baileys": "6.7.24", "pino": "9.6.0" },
+  "scripts": { "test": "node --test tests/*.test.mjs" }
+}
