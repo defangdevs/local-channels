@@ -13,6 +13,7 @@ process.umask(0o077);
 const dir = stateDir();
 const socketPath = join(dir, 'bridge.sock');
 const targetPath = join(dir, 'target.json');
+const codexThreadsPath = join(dir, 'codex-threads.json');
 const authPath = join(dir, 'auth');
 const command = process.argv[2];
 const logger = pino({ level: 'silent' });
@@ -26,12 +27,23 @@ function target() {
   if (!['claude', 'codex'].includes(value.harness) || !/^[A-Za-z0-9_-]{1,200}$/.test(value.session)) {
     throw new Error('invalid target.json');
   }
+  if (value.harness === 'codex' && value.name) {
+    const registered = codexThreads()[value.name];
+    if (registered) return { ...value, session: registered.thread };
+  }
   return value;
 }
 
-function setTarget(harness, session) {
+function codexThreads() {
+  if (!existsSync(codexThreadsPath)) return {};
+  const value = JSON.parse(readFileSync(codexThreadsPath, 'utf8'));
+  if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('invalid codex-threads.json');
+  return value;
+}
+
+function setTarget(harness, session, name) {
   const temporary = `${targetPath}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify({ harness, session }), { mode: 0o600 });
+  writeFileSync(temporary, JSON.stringify({ harness, session, ...(name ? { name } : {}) }), { mode: 0o600 });
   renameSync(temporary, targetPath);
 }
 
@@ -229,7 +241,7 @@ async function serve() {
             if (!selected) throw new Error('session not found; send @box /sessions');
             if (!['claude', 'codex'].includes(selected.harness)) throw new Error(`${selected.harness} sessions are not supported yet`);
             const session = selected.harness === 'claude' ? `${userInfo().username}-${name}` : name;
-            setTarget(selected.harness, session);
+            setTarget(selected.harness, session, name);
             queueReply(state, inbound.id, `Box target: ${name} (${selected.harness}, ${selected.status}). Messages will wait if it is unavailable.`);
             await dispatch();
           }
@@ -367,6 +379,24 @@ async function serve() {
 }
 
 async function main() {
+  if (command === 'register') {
+    if (process.argv[3] !== 'codex') throw new Error('usage: register codex');
+    const prefix = `${userInfo().username}-`;
+    const identity = process.env.LOCAL_WHATSAPP_SESSION || process.env.LOCAL_WEBHOOK_SESSION || '';
+    const name = identity.startsWith(prefix) ? identity.slice(prefix.length) : '';
+    const thread = process.env.CODEX_THREAD_ID || process.env.LOCAL_WEBHOOK_CODEX_THREAD || '';
+    if (!/^[A-Za-z0-9_-]{1,150}$/.test(name) || !/^[A-Za-z0-9_-]{1,200}$/.test(thread)) {
+      throw new Error('register must run inside a named agent-box Codex task with CODEX_THREAD_ID');
+    }
+    ensurePrivateDir(dir);
+    const registered = codexThreads();
+    registered[name] = { thread, registeredAt: new Date().toISOString() };
+    const temporary = `${codexThreadsPath}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify(registered), { mode: 0o600 });
+    renameSync(temporary, codexThreadsPath);
+    process.stdout.write(`Registered Codex task for ${name}\n`);
+    return;
+  }
   if (command === 'pair') return pair();
   if (command === 'serve') return serve();
   if (command === 'target') {
@@ -388,7 +418,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify(await request({ op: 'status' }), null, 2)}\n`);
     return;
   }
-  throw new Error('usage: bridge.mjs pair|serve|target claude|codex SESSION|reply ID TEXT|status');
+  throw new Error('usage: bridge.mjs pair|serve|target claude|codex SESSION|register codex|reply ID TEXT|status');
 }
 
 main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });

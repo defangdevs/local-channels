@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -136,11 +136,18 @@ test('self-chat can select a registered agent-box session without re-pairing', a
   chmodSync(join(bin, 'agent-box-session'), 0o700);
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
     FAKE_INBOUND_TEXT: '@box /target codex', LOCAL_WHATSAPP_SESSION_BIN: join(bin, 'agent-box-session') };
+  const registration = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'register', 'codex'], {
+    env: { ...env, LOCAL_WEBHOOK_SESSION: 'agent-codex', CODEX_THREAD_ID: 'thread-1234' }, encoding: 'utf8',
+  });
+  assert.equal(registration.status, 0, registration.stderr);
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     await waitUntil(() => existsSync(fixture.fakeOut), 'target reply');
     assert.deepEqual(JSON.parse(readFileSync(join(fixture.state, 'target.json'), 'utf8')),
-      { harness: 'codex', session: 'codex' });
+      { harness: 'codex', session: 'codex', name: 'codex' });
+    const status = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).target.session, 'thread-1234');
     const outbound = JSON.parse(readFileSync(fixture.fakeOut, 'utf8').trim());
     assert.match(outbound.payload.text, /Box target: codex \(codex, stopped\)/);
     assert.match(outbound.payload.text, /wait if it is unavailable/);

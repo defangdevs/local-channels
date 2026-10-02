@@ -40,6 +40,12 @@ Run `node bridge.mjs target claude USER-SESSION` or
 `<login>-<session-name>`). Start the Claude session with
 `--channels plugin:local-whatsapp@local-channels` in addition to its other
 channels. For Codex, `SESSION` is the exact name accepted by `codex queue`.
+For a remote-controlled Codex task, run `node bridge.mjs register codex` from
+inside that task once. It records the task's `CODEX_THREAD_ID` under its
+agent-box session name (`LOCAL_WEBHOOK_SESSION`, or
+`LOCAL_WHATSAPP_SESSION`). `@box /target NAME` then follows that registration;
+run it again when a new task takes over the same agent-box session. A normal
+Codex TUI can be addressed by its session name without registration.
 Run `node bridge.mjs serve` as a supervised user service, then
 `node bridge.mjs status` to check it. The bridge needs only outbound WhatsApp
 network access; it opens a private Unix socket under the state directory for
@@ -92,6 +98,7 @@ again.
 | `node bridge.mjs serve` | Run the persistent bridge |
 | `node bridge.mjs target claude USER-SESSION` | Route to a Claude peer |
 | `node bridge.mjs target codex SESSION` | Route to a Codex session |
+| `node bridge.mjs register codex` | Bind an agent-box Codex name to this task's thread ID |
 | `node bridge.mjs reply ID TEXT` | Queue a reply to the original WhatsApp chat |
 | `node bridge.mjs status` | Show connection, target, and pending count |
 
