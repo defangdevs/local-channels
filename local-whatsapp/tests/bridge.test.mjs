@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -137,7 +137,7 @@ test('self-chat can select a registered agent-box session without re-pairing', a
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
     FAKE_INBOUND_TEXT: '@box /target codex', LOCAL_WHATSAPP_SESSION_BIN: join(bin, 'agent-box-session') };
   const registration = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'register', 'codex'], {
-    env: { ...env, LOCAL_WEBHOOK_SESSION: 'agent-codex', CODEX_THREAD_ID: 'thread-1234' }, encoding: 'utf8',
+    env: { ...env, LOCAL_WEBHOOK_SESSION: `${userInfo().username}-codex`, CODEX_THREAD_ID: 'thread-1234' }, encoding: 'utf8',
   });
   assert.equal(registration.status, 0, registration.stderr);
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
