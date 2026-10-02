@@ -2,7 +2,7 @@
 import { createServer, createConnection } from 'node:net';
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
@@ -16,6 +16,9 @@ const targetPath = join(dir, 'target.json');
 const authPath = join(dir, 'auth');
 const command = process.argv[2];
 const logger = pino({ level: 'silent' });
+const sessionBin = process.env.LOCAL_WHATSAPP_SESSION_BIN || '/usr/local/bin/agent-box-session';
+const codexBin = process.env.LOCAL_WHATSAPP_CODEX_BIN || join(userInfo().homedir, '.nix-profile', 'bin', 'codex');
+if (!isAbsolute(sessionBin) || !isAbsolute(codexBin)) throw new Error('bridge helper paths must be absolute');
 
 function target() {
   if (!existsSync(targetPath)) return null;
@@ -34,7 +37,7 @@ function setTarget(harness, session) {
 
 async function sessions() {
   return new Promise((resolve, reject) => {
-    const child = spawn('agent-box-session', ['ls'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(sessionBin, ['ls'], { stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     let error = '';
     const timeout = setTimeout(() => child.kill(), 10000);
@@ -140,7 +143,7 @@ async function serve() {
   async function sendViaCodex(name, message) {
     const text = `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>.`;
     return new Promise((resolve) => {
-      const child = spawn('codex', ['queue', '--thread', name, '--message', text], { stdio: 'ignore' });
+      const child = spawn(codexBin, ['queue', '--thread', name, '--message', text], { stdio: 'ignore' });
       const timeout = setTimeout(() => child.kill(), 10000);
       child.on('error', () => { clearTimeout(timeout); resolve(false); });
       child.on('close', (code) => { clearTimeout(timeout); resolve(code === 0); });

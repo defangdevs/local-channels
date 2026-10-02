@@ -64,6 +64,10 @@ answers with a receipt. Send `@box /sessions` to list agent-box sessions and
 commands use `agent-box-session ls` on the bridge host. A selected session can
 restart without re-pairing the device. If it has been removed, select another
 session; unanswered messages will then be routed to that session.
+The bridge uses `/usr/local/bin/agent-box-session` and
+`~/.nix-profile/bin/codex` by default; set `LOCAL_WHATSAPP_SESSION_BIN` or
+`LOCAL_WHATSAPP_CODEX_BIN` to an absolute executable path if your installation
+differs.
 
 The bridge
 retains incoming messages until they receive a reply, and queues a reply while
