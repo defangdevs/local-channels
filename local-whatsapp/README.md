@@ -61,8 +61,13 @@ agent-box-session add whatsapp-bridge --harness shell \
 ```
 
 This shell session hosts the transport; it is not a WhatsApp command target.
-It uses one agent-box session slot. Restart it with
-`agent-box-session restart whatsapp-bridge` after updating the bridge files.
+It uses one agent-box session slot. If an earlier `bridge.mjs target` command
+selected the target, enable that session for WhatsApp and select it again with
+`node bridge.mjs target claude AGENT_BOX_SESSION` or
+`node bridge.mjs target codex AGENT_BOX_SESSION`. Restart the shell session
+with `agent-box-session restart whatsapp-bridge` after updating the bridge
+files. On agent-box versions with built-in WhatsApp supervision, the bridge
+does not need this shell session.
 
 Send `@box hello` in Message Yourself. Replies are text-only. The bridge
 answers with a receipt. Send `@box /sessions` to list WhatsApp-enabled
