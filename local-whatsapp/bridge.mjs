@@ -49,7 +49,7 @@ function setTarget(harness, session, name) {
 
 async function sessions() {
   return new Promise((resolve, reject) => {
-    const child = spawn(sessionBin, ['ls'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(sessionBin, ['whatsapp', 'ls'], { stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     let error = '';
     const timeout = setTimeout(() => child.kill(), 10000);
@@ -61,10 +61,16 @@ async function sessions() {
     child.on('error', (failure) => { clearTimeout(timeout); reject(failure); });
     child.on('close', (code) => {
       clearTimeout(timeout);
-      if (code !== 0) return reject(new Error(error.trim() || 'cannot list agent-box sessions'));
-      resolve(output.split('\n').slice(1).map((line) => line.trim().split(/\s+/))
-        .filter((fields) => fields.length >= 3 && /^[A-Za-z0-9_-]{1,150}$/.test(fields[0]))
-        .map(([name, harness, status]) => ({ name, harness, status })));
+      if (code !== 0) return reject(new Error(error.trim() || 'cannot list WhatsApp-enabled sessions'));
+      try {
+        const records = JSON.parse(output);
+        if (!Array.isArray(records) || records.some((item) =>
+          !/^[A-Za-z0-9_-]{1,150}$/.test(item.name) ||
+          !['claude', 'codex'].includes(item.harness) || typeof item.stopped !== 'boolean')) {
+          throw new Error('invalid session list');
+        }
+        resolve(records.map((item) => ({ ...item, status: item.stopped ? 'stopped' : 'enabled' })));
+      } catch (failure) { reject(failure); }
     });
   });
 }
@@ -172,6 +178,9 @@ async function serve() {
     try {
       const binding = target();
       if (!binding) return;
+      if (!Object.values(state.messages).some((message) => !message.reply && !message.control)) return;
+      const available = await sessions();
+      if (!available.some((item) => item.name === binding.name && item.harness === binding.harness)) return;
       for (const message of Object.values(state.messages)) {
         if (message.reply || message.control) continue;
         if (binding.harness === 'claude') {
@@ -237,13 +246,12 @@ async function serve() {
         try {
           const available = await sessions();
           if (inbound.text === '/sessions') {
-            const listing = available.map(({ name, harness, status }) => `${name} (${harness}, ${status})`).join(', ') || 'none';
+            const listing = available.map(({ name, harness, status }) => `${name} (${harness}, ${status})`).join(', ') || 'none enabled';
             queueReply(state, inbound.id, `Box sessions: ${listing.slice(0, 3900)}`);
           } else {
             const name = inbound.text.match(/^\/target ([A-Za-z0-9_-]{1,150})$/)?.[1];
             const selected = available.find((item) => item.name === name);
-            if (!selected) throw new Error('session not found; send @box /sessions');
-            if (!['claude', 'codex'].includes(selected.harness)) throw new Error(`${selected.harness} sessions are not supported yet`);
+            if (!selected) throw new Error('session not enabled for WhatsApp; send @box /sessions');
             const session = selected.harness === 'claude' ? `${userInfo().username}-${name}` : name;
             setTarget(selected.harness, session, name);
             queueReply(state, inbound.id, `Box target: ${name} (${selected.harness}, ${selected.status}). Messages will wait if it is unavailable.`);
@@ -404,11 +412,13 @@ async function main() {
   if (command === 'pair') return pair();
   if (command === 'serve') return serve();
   if (command === 'target') {
-    const [harness, session] = process.argv.slice(3);
-    if (!['claude', 'codex'].includes(harness) || !/^[A-Za-z0-9_-]{1,200}$/.test(session || '')) throw new Error('usage: target claude|codex SESSION');
+    const [harness, name] = process.argv.slice(3);
+    if (!['claude', 'codex'].includes(harness) || !/^[A-Za-z0-9_-]{1,150}$/.test(name || '')) throw new Error('usage: target claude|codex AGENT_BOX_SESSION');
+    const selected = (await sessions()).find((item) => item.name === name && item.harness === harness);
+    if (!selected) throw new Error('session not enabled for WhatsApp');
     ensurePrivateDir(dir);
-    setTarget(harness, session);
-    process.stdout.write(`Target: ${harness} session ${session}\n`);
+    setTarget(harness, harness === 'claude' ? `${userInfo().username}-${name}` : name, name);
+    process.stdout.write(`Target: ${harness} session ${name}\n`);
     return;
   }
   if (command === 'reply') {
@@ -422,7 +432,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify(await request({ op: 'status' }), null, 2)}\n`);
     return;
   }
-  throw new Error('usage: bridge.mjs pair|serve|target claude|codex SESSION|register codex|reply ID TEXT|status');
+  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|reply ID TEXT|status');
 }
 
 main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });
