@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, symlinkSync, truncateSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, symlinkSync, truncateSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -83,6 +83,8 @@ test('image validation rejects unknown IDs, unsafe inputs, oversized files, and 
     assert.throws(() => queueImageReply(state, dir, 'toString', source), /unknown message/);
     assert.throws(() => queueImageReply(state, dir, inbound.id, 'relative.png'), /absolute/);
     assert.throws(() => queueImageReply(state, dir, inbound.id, join(dir, 'messages.json')), /ENOENT/);
+    mkdirSync(join(dir, 'directory.png'));
+    assert.throws(() => queueImageReply(state, dir, inbound.id, join(dir, 'directory.png')), /regular file/);
     const outside = mkdtempSync(join(tmpdir(), 'whatsapp-outside-'));
     try {
       writeFileSync(join(outside, 'image.png'), png);
