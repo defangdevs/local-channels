@@ -1,6 +1,6 @@
 {
   "name": "local-whatsapp",
-  "description": "Personal WhatsApp linked-device channel with per-user credentials and session-independent delivery",
-  "version": "0.1.1",
+  "description": "Personal WhatsApp linked-device channel with one selected session and automatic profile-based delivery",
+  "version": "0.2.0",
   "keywords": ["channel", "mcp", "whatsapp"]
 }

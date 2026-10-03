@@ -36,7 +36,12 @@ function setup() {
   copyFileSync(source, join(dir, 'bridge.mjs'));
   copyFileSync(stateSource, join(dir, 'state.mjs'));
   writeFileSync(sessionBin, `#!/bin/sh
-printf '%s\\n' '[{"name":"claude","harness":"claude","stopped":false},{"name":"codex","harness":"codex","stopped":true}]'
+case "$2" in
+  candidates) printf '%s\\n' '[{"name":"claude","harness":"claude","stopped":false,"selected":true},{"name":"codex","harness":"codex","stopped":true,"selected":false}]' ;;
+  select) printf '%s\\n' '{"name":"'"$3"'","harness":"codex","stopped":true}' ;;
+  spawn) printf '%s\\n' '{"name":"claude","harness":"claude","stopped":false}' ;;
+  clear) printf '%s\\n' '{}' ;;
+esac
 `);
   chmodSync(sessionBin, 0o700);
   writeFileSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys', 'package.json'), JSON.stringify({ type: 'module', exports: './index.js' }));
@@ -160,7 +165,7 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
 
 test('disabled sessions receive no messages and cannot be selected', async () => {
   const fixture = setup();
-  writeFileSync(fixture.sessionBin, "#!/bin/sh\nprintf '%s\\n' '[]'\n");
+  writeFileSync(fixture.sessionBin, "#!/bin/sh\ncase \"$2\" in candidates) printf '%s\\n' '[]' ;; spawn) exit 1 ;; esac\n");
   writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state,
     LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, FAKE_OUT: fixture.fakeOut };
@@ -168,14 +173,41 @@ test('disabled sessions receive no messages and cannot be selected', async () =>
     env, stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
-    await waitUntil(() => existsSync(fixture.fakeOut), 'receipt');
+    await waitUntil(() => existsSync(join(fixture.state, 'messages.json')), 'saved message');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(Object.values(saved.messages)[0].deliveredTo, null);
     const selected = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'target', 'codex', 'codex'], {
       env, encoding: 'utf8',
     });
     assert.equal(selected.status, 1);
-    assert.match(selected.stderr, /not enabled for WhatsApp/);
+    assert.match(selected.stderr, /unknown agent-box session/);
+  } finally {
+    await stop(daemon);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('an unselected bridge target starts one session using the configured profile', async () => {
+  const fixture = setup();
+  const spawned = join(fixture.dir, 'spawned.txt');
+  writeFileSync(fixture.sessionBin, `#!/bin/sh
+case "$2" in
+  candidates) printf '%s\\n' '[]' ;;
+  spawn) printf '%s' "$3" > "$SPAWNED"; printf '%s\\n' '{"name":"from-profile","harness":"claude","stopped":false}' ;;
+  clear) printf '%s\\n' '{}' ;;
+esac
+`);
+  chmodSync(fixture.sessionBin, 0o700);
+  writeFileSync(join(fixture.state, 'config.json'), JSON.stringify({ profile: 'phone-agent' }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, SPAWNED: spawned };
+  const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(spawned), 'profile session spawn');
+    assert.equal(readFileSync(spawned, 'utf8'), 'phone-agent');
+    await waitUntil(() => existsSync(join(fixture.state, 'target.json')), 'spawned target');
+    assert.deepEqual(JSON.parse(readFileSync(join(fixture.state, 'target.json'), 'utf8')),
+      { harness: 'claude', session: `${userInfo().username}-from-profile`, name: 'from-profile' });
   } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });
