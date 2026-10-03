@@ -29,11 +29,16 @@ function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'local-whatsapp-bridge-'));
   const state = join(dir, 'state');
   const fakeOut = join(dir, 'out.jsonl');
+  const sessionBin = join(dir, 'agent-box-session');
   mkdirSync(state, { mode: 0o700 });
   mkdirSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys'), { recursive: true });
   mkdirSync(join(dir, 'node_modules', 'pino'));
   copyFileSync(source, join(dir, 'bridge.mjs'));
   copyFileSync(stateSource, join(dir, 'state.mjs'));
+  writeFileSync(sessionBin, `#!/bin/sh
+printf '%s\\n' '[{"name":"claude","harness":"claude","stopped":false},{"name":"codex","harness":"codex","stopped":true}]'
+`);
+  chmodSync(sessionBin, 0o700);
   writeFileSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys', 'package.json'), JSON.stringify({ type: 'module', exports: './index.js' }));
   writeFileSync(join(dir, 'node_modules', 'pino', 'package.json'), JSON.stringify({ type: 'module', exports: './index.js' }));
   writeFileSync(join(dir, 'node_modules', 'pino', 'index.js'), 'export default () => ({ level: "silent" });\n');
@@ -65,7 +70,7 @@ function setup() {
       } };
     }
   `);
-  return { dir, state, fakeOut };
+  return { dir, state, fakeOut, sessionBin };
 }
 
 test('pair exits successfully when the newly linked socket closes', async () => {
@@ -88,8 +93,9 @@ test('pair exits successfully when the newly linked socket closes', async () => 
 
 test('bridge persists an inbound message, delivers to Claude, and sends reply to its chat', async () => {
   const fixture = setup();
-  writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'claude', session: 'agent-claude' }));
-  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut };
+  writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'claude', session: 'agent-claude', name: 'claude' }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let peer;
   try {
@@ -136,9 +142,10 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
   mkdirSync(bin);
   writeFileSync(join(bin, 'codex'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$CODEX_ARGS_FILE"\n');
   chmodSync(join(bin, 'codex'), 0o700);
-  writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex' }));
+  writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
-    CODEX_ARGS_FILE: argsFile, LOCAL_WHATSAPP_CODEX_BIN: join(bin, 'codex') };
+    CODEX_ARGS_FILE: argsFile, LOCAL_WHATSAPP_CODEX_BIN: join(bin, 'codex'),
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     await waitUntil(() => existsSync(argsFile), 'Codex queue');
@@ -151,14 +158,36 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
   }
 });
 
+test('disabled sessions receive no messages and cannot be selected', async () => {
+  const fixture = setup();
+  writeFileSync(fixture.sessionBin, "#!/bin/sh\nprintf '%s\\n' '[]'\n");
+  writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, FAKE_OUT: fixture.fakeOut };
+  const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], {
+    env, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    await waitUntil(() => existsSync(fixture.fakeOut), 'receipt');
+    const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+    assert.equal(Object.values(saved.messages)[0].deliveredTo, null);
+    const selected = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'target', 'codex', 'codex'], {
+      env, encoding: 'utf8',
+    });
+    assert.equal(selected.status, 1);
+    assert.match(selected.stderr, /not enabled for WhatsApp/);
+  } finally {
+    await stop(daemon);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test('self-chat can select a registered agent-box session without re-pairing', async () => {
   const fixture = setup();
   const bin = join(fixture.dir, 'bin');
   mkdirSync(bin);
-  writeFileSync(join(bin, 'agent-box-session'), '#!/bin/sh\nprintf "NAME HARNESS STATE\\nclaude claude live\\ncodex codex stopped\\n"\n');
-  chmodSync(join(bin, 'agent-box-session'), 0o700);
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
-    FAKE_INBOUND_TEXT: '@box /target codex', LOCAL_WHATSAPP_SESSION_BIN: join(bin, 'agent-box-session') };
+    FAKE_INBOUND_TEXT: '@box /target codex', LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
   const registration = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'register', 'codex'], {
     env: { ...env, LOCAL_WEBHOOK_SESSION: `${userInfo().username}-codex`, CODEX_THREAD_ID: 'thread-1234' }, encoding: 'utf8',
   });
