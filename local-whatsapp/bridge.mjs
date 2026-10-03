@@ -13,6 +13,7 @@ process.umask(0o077);
 const dir = stateDir();
 const socketPath = join(dir, 'bridge.sock');
 const targetPath = join(dir, 'target.json');
+const configPath = join(dir, 'config.json');
 const codexThreadsPath = join(dir, 'codex-threads.json');
 const authPath = join(dir, 'auth');
 const command = process.argv[2];
@@ -34,6 +35,22 @@ function target() {
   return value;
 }
 
+function config() {
+  if (!existsSync(configPath)) return { profile: null };
+  const value = JSON.parse(readFileSync(configPath, 'utf8'));
+  if (!value || Array.isArray(value) ||
+      (value.profile !== null && !/^[A-Za-z0-9._-]{1,64}$/.test(value.profile))) {
+    throw new Error('invalid config.json');
+  }
+  return { profile: value.profile };
+}
+
+function setProfile(profile) {
+  const temporary = `${configPath}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ profile }), { mode: 0o600 });
+  renameSync(temporary, configPath);
+}
+
 function codexThreads() {
   if (!existsSync(codexThreadsPath)) return {};
   const value = JSON.parse(readFileSync(codexThreadsPath, 'utf8'));
@@ -49,7 +66,7 @@ function setTarget(harness, session, name) {
 
 async function sessions() {
   return new Promise((resolve, reject) => {
-    const child = spawn(sessionBin, ['whatsapp', 'ls'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(sessionBin, ['whatsapp', 'candidates'], { stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     let error = '';
     const timeout = setTimeout(() => child.kill(), 10000);
@@ -66,13 +83,64 @@ async function sessions() {
         const records = JSON.parse(output);
         if (!Array.isArray(records) || records.some((item) =>
           !/^[A-Za-z0-9_-]{1,150}$/.test(item.name) ||
-          !['claude', 'codex'].includes(item.harness) || typeof item.stopped !== 'boolean')) {
+          !['claude', 'codex'].includes(item.harness) || typeof item.stopped !== 'boolean' ||
+          typeof item.selected !== 'boolean')) {
           throw new Error('invalid session list');
         }
         resolve(records.map((item) => ({ ...item, status: item.stopped ? 'stopped' : 'enabled' })));
       } catch (failure) { reject(failure); }
     });
   });
+}
+
+async function sessionCommand(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(sessionBin, ['whatsapp', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let error = '';
+    const timeout = setTimeout(() => child.kill(), 10000);
+    child.stdout.on('data', (chunk) => { output += chunk.toString().slice(0, 20000); });
+    child.stderr.on('data', (chunk) => { error += chunk.toString().slice(0, 1000); });
+    child.on('error', (failure) => { clearTimeout(timeout); reject(failure); });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) return reject(new Error(error.trim() || 'WhatsApp session command failed'));
+      try { resolve(JSON.parse(output)); }
+      catch (failure) { reject(failure); }
+    });
+  });
+}
+
+async function clearTarget() {
+  await sessionCommand(['clear']);
+  if (existsSync(targetPath)) unlinkSync(targetPath);
+}
+
+async function selectTarget(name) {
+  const selected = await sessionCommand(['select', name]);
+  if (!selected || !['claude', 'codex'].includes(selected.harness) ||
+      selected.name !== name || typeof selected.stopped !== 'boolean') {
+    throw new Error('invalid selected session');
+  }
+  setTarget(selected.harness,
+    selected.harness === 'claude' ? `${userInfo().username}-${name}` : name,
+    name);
+  return selected;
+}
+
+async function ensureTarget(available) {
+  const binding = target();
+  if (binding && available.some((item) => item.name === binding.name &&
+      item.harness === binding.harness)) return binding;
+  const created = await sessionCommand(['spawn', config().profile || 'default']);
+  if (!created || !['claude', 'codex'].includes(created.harness) ||
+      !/^[A-Za-z0-9_-]{1,150}$/.test(created.name || '')) {
+    throw new Error('invalid spawned session');
+  }
+  setTarget(created.harness,
+    created.harness === 'claude' ? `${userInfo().username}-${created.name}` : created.name,
+    created.name);
+  return target();
 }
 
 function request(value) {
@@ -176,11 +244,9 @@ async function serve() {
     if (dispatching) return;
     dispatching = true;
     try {
-      const binding = target();
-      if (!binding) return;
       if (!Object.values(state.messages).some((message) => !message.reply && !message.control)) return;
       const available = await sessions();
-      if (!available.some((item) => item.name === binding.name && item.harness === binding.harness)) return;
+      const binding = await ensureTarget(available);
       for (const message of Object.values(state.messages)) {
         if (message.reply || message.control) continue;
         if (binding.harness === 'claude') {
@@ -246,16 +312,28 @@ async function serve() {
         try {
           const available = await sessions();
           if (inbound.text === '/sessions') {
-            const listing = available.map(({ name, harness, status }) => `${name} (${harness}, ${status})`).join(', ') || 'none enabled';
+            const listing = available.map(({ name, harness, status, selected }) =>
+              `${name} (${harness}, ${status}${selected ? ', selected' : ''})`).join(', ') || 'none available';
             queueReply(state, inbound.id, `Box sessions: ${listing.slice(0, 3900)}`);
           } else {
             const name = inbound.text.match(/^\/target ([A-Za-z0-9_-]{1,150})$/)?.[1];
-            const selected = available.find((item) => item.name === name);
-            if (!selected) throw new Error('session not enabled for WhatsApp; send @box /sessions');
-            const session = selected.harness === 'claude' ? `${userInfo().username}-${name}` : name;
-            setTarget(selected.harness, session, name);
-            queueReply(state, inbound.id, `Box target: ${name} (${selected.harness}, ${selected.status}). Messages will wait if it is unavailable.`);
-            await dispatch();
+            const profile = inbound.text.match(/^\/profile (default|[A-Za-z0-9._-]{1,64})$/)?.[1];
+            if (name === 'auto') {
+              await clearTarget();
+              queueReply(state, inbound.id, 'Box target: automatic. The next message starts a session using the selected profile.');
+            } else if (name) {
+              const selected = available.find((item) => item.name === name);
+              if (!selected) throw new Error('unknown session; send @box /sessions');
+              await selectTarget(name);
+              queueReply(state, inbound.id, `Box target: ${name} (${selected.harness}, ${selected.status}). Messages will wait if it is unavailable.`);
+              await dispatch();
+            } else if (profile) {
+              setProfile(profile === 'default' ? null : profile);
+              await clearTarget();
+              queueReply(state, inbound.id, `Box profile: ${profile}. The next message starts a session with this profile.`);
+            } else {
+              throw new Error('use /target NAME, /target auto, or /profile NAME|default');
+            }
           }
         } catch (error) { queueReply(state, inbound.id, `Box: ${error.message}`); }
         saveState(dir, state);
@@ -329,18 +407,23 @@ async function serve() {
         const inbound = parseInbound(message, credentials.creds, state.sentIds);
         if (!inbound) continue;
         try {
-          const control = inbound.text === '/sessions' || inbound.text.startsWith('/target');
+          const control = inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
+            inbound.text.startsWith('/profile');
           if (control) inbound.control = true;
           else inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
           if (addInbound(state, inbound)) {
             saveState(dir, state);
             if (control) await handleControls();
             else {
-              await dispatch();
+              let dispatchError = null;
+              try { await dispatch(); }
+              catch (error) { dispatchError = error; }
               const binding = target();
-              const destination = binding ? `${binding.harness} session ${binding.session}` : 'session selection';
+              const destination = binding ? `${binding.harness} session ${binding.session}` : 'a new session';
               const delivery = inbound.deliveredTo ? 'routed to' : 'waiting for';
-              inbound.ack = { text: `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
+              inbound.ack = { text: dispatchError
+                ? `Box: ${dispatchError.message}`
+                : `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
             }
             saveState(dir, state);
             await drainReplies();
@@ -415,9 +498,9 @@ async function main() {
     const [harness, name] = process.argv.slice(3);
     if (!['claude', 'codex'].includes(harness) || !/^[A-Za-z0-9_-]{1,150}$/.test(name || '')) throw new Error('usage: target claude|codex AGENT_BOX_SESSION');
     const selected = (await sessions()).find((item) => item.name === name && item.harness === harness);
-    if (!selected) throw new Error('session not enabled for WhatsApp');
+    if (!selected) throw new Error('unknown agent-box session');
     ensurePrivateDir(dir);
-    setTarget(harness, harness === 'claude' ? `${userInfo().username}-${name}` : name, name);
+    await selectTarget(name);
     process.stdout.write(`Target: ${harness} session ${name}\n`);
     return;
   }
@@ -429,7 +512,7 @@ async function main() {
     return;
   }
   if (command === 'status') {
-    process.stdout.write(`${JSON.stringify(await request({ op: 'status' }), null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ...await request({ op: 'status' }), profile: config().profile }, null, 2)}\n`);
     return;
   }
   throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|reply ID TEXT|status');

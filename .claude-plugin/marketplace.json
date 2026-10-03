@@ -13,7 +13,7 @@
     },
     {
       "name": "local-whatsapp",
-      "description": "Personal WhatsApp linked-device channel with per-user credentials and session-independent delivery",
+      "description": "Personal WhatsApp linked-device channel with one selected session and automatic profile-based delivery",
       "source": "./local-whatsapp",
       "keywords": ["channel", "mcp", "whatsapp"]
     }

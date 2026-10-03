@@ -34,12 +34,15 @@ it. `pair` exits after the linked device connects. The phone number can also
 be supplied on stdin. The number is needed only for pairing, not for later
 service starts.
 
-Enable WhatsApp for each intended Claude or Codex session in agent-box, then
-run `node bridge.mjs target claude AGENT_BOX_SESSION` or
-`node bridge.mjs target codex AGENT_BOX_SESSION` to select one. The bridge
-resolves the name to the harness-specific delivery address. Start an enabled
-Claude session with `--channels plugin:local-whatsapp@local-channels` in
-addition to its other channels. agent-box can supply this automatically.
+agent-box has one selected WhatsApp recipient at a time. Send
+`@box /sessions` to list Claude and Codex sessions, then send
+`@box /target NAME` to select one. `@box /target auto` clears the selection:
+the next message starts a session with the configured profile, or agent-box's
+default profile when none is configured. Send `@box /profile NAME` to select
+that profile and clear the target, or `@box /profile default` to use the box
+default. The bridge resolves a selected name to the harness-specific delivery
+address. agent-box starts a selected Claude session with
+`--channels plugin:local-whatsapp@local-channels` automatically.
 For a remote-controlled Codex task, run `node bridge.mjs register codex` from
 inside that task once. It records the task's `CODEX_THREAD_ID` under its
 agent-box session name (`LOCAL_WEBHOOK_SESSION`, or
@@ -61,21 +64,19 @@ agent-box-session add whatsapp-bridge --harness shell \
 ```
 
 This shell session hosts the transport; it is not a WhatsApp command target.
-It uses one agent-box session slot. If an earlier `bridge.mjs target` command
-selected the target, enable that session for WhatsApp and select it again with
-`node bridge.mjs target claude AGENT_BOX_SESSION` or
-`node bridge.mjs target codex AGENT_BOX_SESSION`. Restart the shell session
-with `agent-box-session restart whatsapp-bridge` after updating the bridge
-files. On agent-box versions with built-in WhatsApp supervision, the bridge
-does not need this shell session.
+It uses one agent-box session slot. Restart the shell session with
+`agent-box-session restart whatsapp-bridge` after updating the bridge files.
+On agent-box versions with built-in WhatsApp supervision, the bridge does not
+need this shell session.
 
 Send `@box hello` in Message Yourself. Replies are text-only. The bridge
-answers with a receipt. Send `@box /sessions` to list WhatsApp-enabled
-agent-box sessions and `@box /target NAME` to select one, even if it is
-currently stopped. These commands use `agent-box-session whatsapp ls` on the
-bridge host. A selected session can
-restart without re-pairing the device. If it has been removed, select another
-session; unanswered messages will then be routed to that session.
+answers with a receipt. Send `@box /sessions` to list available agent-box
+sessions and `@box /target NAME` to select one, even if it is currently
+stopped. `@box /target auto` makes the next message start a new session using
+the chosen profile; `@box /profile NAME` changes that profile. These commands
+use `agent-box-session whatsapp candidates`, `select`, `clear`, and `spawn`
+on the bridge host. A selected session can restart without re-pairing the
+device. If it has been removed, the next message starts a new session.
 The bridge uses `/usr/local/bin/agent-box-session` and
 `~/.nix-profile/bin/codex` by default; set `LOCAL_WHATSAPP_SESSION_BIN` or
 `LOCAL_WHATSAPP_CODEX_BIN` to an absolute executable path if your installation
@@ -102,8 +103,8 @@ again.
 | --- | --- |
 | `node bridge.mjs pair` | Link by phone-number code |
 | `node bridge.mjs serve` | Run the persistent bridge |
-| `node bridge.mjs target claude AGENT_BOX_SESSION` | Route to an enabled Claude session |
-| `node bridge.mjs target codex AGENT_BOX_SESSION` | Route to an enabled Codex session |
+| `node bridge.mjs target claude AGENT_BOX_SESSION` | Select a Claude session as the one recipient |
+| `node bridge.mjs target codex AGENT_BOX_SESSION` | Select a Codex session as the one recipient |
 | `node bridge.mjs register codex` | Bind an agent-box Codex name to this task's thread ID |
 | `node bridge.mjs reply ID TEXT` | Queue a reply to the original WhatsApp chat |
 | `node bridge.mjs status` | Show connection, target, and pending count |
