@@ -49,6 +49,7 @@ esac
   writeFileSync(join(dir, 'node_modules', 'pino', 'index.js'), 'export default () => ({ level: "silent" });\n');
   writeFileSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys', 'index.js'), `
     import { EventEmitter } from 'node:events';
+    import { userInfo } from 'node:os';
     import { appendFileSync } from 'node:fs';
     export const Browsers = { macOS: () => ['Chrome', 'macOS', '1'] };
     export const DisconnectReason = { loggedOut: 401 };
@@ -62,7 +63,7 @@ esac
         ev.emit('connection.update', { connection: 'open' });
         ev.emit('messages.upsert', { type: 'notify', messages: [{
           key: { id: process.env.FAKE_INBOUND_ID || 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' },
-          message: { conversation: process.env.FAKE_INBOUND_TEXT || '@box hello' },
+          message: { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
         }] });
       }, 100);
       return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
@@ -219,7 +220,7 @@ test('self-chat can select a registered agent-box session without re-pairing', a
   const bin = join(fixture.dir, 'bin');
   mkdirSync(bin);
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
-    FAKE_INBOUND_TEXT: '@box /target codex', LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
+    FAKE_INBOUND_TEXT: `@${userInfo().username} /target codex`, LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
   const registration = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'register', 'codex'], {
     env: { ...env, LOCAL_WEBHOOK_SESSION: `${userInfo().username}-codex`, CODEX_THREAD_ID: 'thread-1234' }, encoding: 'utf8',
   });

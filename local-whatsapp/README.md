@@ -3,7 +3,7 @@
 Optional personal WhatsApp linked-device bridge. The device link belongs to one
 per-user bridge process, not to a Claude or Codex session. The bridge accepts
 only commands in the linked account's Message Yourself chat beginning with
-`@box `; it never forwards other WhatsApp conversations. A message is routed to
+`@USER ` (the Linux user running the bridge, `agent` on agent-box); it never forwards other WhatsApp conversations. A message is routed to
 one configured session. Claude receives a channel notification and can answer
 with `whatsapp_reply`; Codex receives `codex queue` and can answer with the
 `reply` CLI. The agent-box user controls session selection.
@@ -35,18 +35,18 @@ be supplied on stdin. The number is needed only for pairing, not for later
 service starts.
 
 agent-box has one selected WhatsApp recipient at a time. Send
-`@box /sessions` to list Claude and Codex sessions, then send
-`@box /target NAME` to select one. `@box /target auto` clears the selection:
+`@agent /sessions` to list Claude and Codex sessions, then send
+`@agent /target NAME` to select one. `@agent /target auto` clears the selection:
 the next message starts a session with the configured profile, or agent-box's
-default profile when none is configured. Send `@box /profile NAME` to select
-that profile and clear the target, or `@box /profile default` to use the box
+default profile when none is configured. Send `@agent /profile NAME` to select
+that profile and clear the target, or `@agent /profile default` to use the box
 default. The bridge resolves a selected name to the harness-specific delivery
 address. agent-box starts a selected Claude session with
 `--channels plugin:local-whatsapp@local-channels` automatically.
 For a remote-controlled Codex task, run `node bridge.mjs register codex` from
 inside that task once. It records the task's `CODEX_THREAD_ID` under its
 agent-box session name (`LOCAL_WEBHOOK_SESSION`, or
-`LOCAL_WHATSAPP_SESSION`). `@box /target NAME` then follows that registration;
+`LOCAL_WHATSAPP_SESSION`). `@agent /target NAME` then follows that registration;
 run it again when a new task takes over the same agent-box session. A normal
 Codex TUI can be addressed by its session name without registration.
 Run `node bridge.mjs serve` as a supervised user service, then
@@ -69,11 +69,11 @@ It uses one agent-box session slot. Restart the shell session with
 On agent-box versions with built-in WhatsApp supervision, the bridge does not
 need this shell session.
 
-Send `@box hello` in Message Yourself. Replies are text-only. The bridge
-answers with a receipt. Send `@box /sessions` to list available agent-box
-sessions and `@box /target NAME` to select one, even if it is currently
-stopped. `@box /target auto` makes the next message start a new session using
-the chosen profile; `@box /profile NAME` changes that profile. These commands
+Send `@agent hello` in Message Yourself. Replies are text-only. The bridge
+answers with a receipt. Send `@agent /sessions` to list available agent-box
+sessions and `@agent /target NAME` to select one, even if it is currently
+stopped. `@agent /target auto` makes the next message start a new session using
+the chosen profile; `@agent /profile NAME` changes that profile. These commands
 use `agent-box-session whatsapp candidates`, `select`, `clear`, and `spawn`
 on the bridge host. A selected session can restart without re-pairing the
 device. If it has been removed, the next message starts a new session.

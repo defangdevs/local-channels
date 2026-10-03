@@ -323,7 +323,7 @@ async function serve() {
               queueReply(state, inbound.id, 'Box target: automatic. The next message starts a session using the selected profile.');
             } else if (name) {
               const selected = available.find((item) => item.name === name);
-              if (!selected) throw new Error('unknown session; send @box /sessions');
+              if (!selected) throw new Error(`unknown session; send @${userInfo().username} /sessions`);
               await selectTarget(name);
               queueReply(state, inbound.id, `Box target: ${name} (${selected.harness}, ${selected.status}). Messages will wait if it is unavailable.`);
               await dispatch();
@@ -404,7 +404,7 @@ async function serve() {
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
       for (const message of messages) {
-        const inbound = parseInbound(message, credentials.creds, state.sentIds);
+        const inbound = parseInbound(message, credentials.creds, state.sentIds, `@${userInfo().username}`);
         if (!inbound) continue;
         try {
           const control = inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
