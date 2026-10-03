@@ -69,7 +69,7 @@ It uses one agent-box session slot. Restart the shell session with
 On agent-box versions with built-in WhatsApp supervision, the bridge does not
 need this shell session.
 
-Send `@agent hello` in Message Yourself. Replies are text-only. The bridge
+Send `@agent hello` in Message Yourself. Replies can be text or native images. The bridge
 sends no automatic receipt by default. For diagnostic receipts, start the bridge
 with `LOCAL_WHATSAPP_DEBUG=1`; unset it and restart to disable them. Other values
 do not enable debug mode. On agent-box, set this variable in the settings secrets
@@ -110,8 +110,32 @@ again.
 | `node bridge.mjs target claude AGENT_BOX_SESSION` | Select a Claude session as the one recipient |
 | `node bridge.mjs target codex AGENT_BOX_SESSION` | Select a Codex session as the one recipient |
 | `node bridge.mjs register codex` | Bind an agent-box Codex name to this task's thread ID |
-| `node bridge.mjs reply ID TEXT` | Queue a reply to the original WhatsApp chat |
+| `node bridge.mjs reply ID TEXT` | Queue a text reply to the original WhatsApp chat |
+| `node bridge.mjs reply-image ID ABSOLUTE_PATH [CAPTION]` | Queue a native image reply in the original chat |
 | `node bridge.mjs status` | Show connection, target, and pending count |
 
 The bridge has no shell-session adapter. The message transport and the target
 selector are separate so one can be added without changing WhatsApp pairing.
+
+## Native image replies
+
+Codex can reply with `node bridge.mjs reply-image ID /absolute/path/picture.png "caption"`.
+Claude uses `whatsapp_reply_image` with `id`, an absolute `path`, and an optional
+`caption`. The file must be a regular local file with a PNG, JPEG, or WebP
+signature, at most 10 MiB, inside the user home or bridge state directory; symlink files and remote URLs are rejected. Captions
+are limited to 4000 characters. The format signature is checked; actual decoding
+and upload are performed by Baileys. Malformed image data can still fail there.
+
+The bridge copies the bytes into its private `media-outbox` before accepting the
+reply, so the source can be deleted or replaced afterward. At most 20 images
+can be queued at once. A failed upload remains queued for retry, including across
+bridge restarts. Once a send is saved as successful, the copy is deleted; startup
+also reclaims unreferenced copies left by interrupted writes. Images are sent to
+the incoming message's original chat, with the correct MIME type and optional
+caption. No public URL, new account, or re-pairing is required.
+
+A message ID accepts one reply, either text or an image. Repeating the same image
+bytes and caption is idempotent; trying to replace a reply is rejected. As with
+text replies, a crash after WhatsApp accepts a send but before the bridge records
+success can cause a duplicate. Inbound images and documents are a separate
+capability and are not forwarded by this release.

@@ -50,7 +50,7 @@ esac
   writeFileSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys', 'index.js'), `
     import { EventEmitter } from 'node:events';
     import { userInfo } from 'node:os';
-    import { appendFileSync } from 'node:fs';
+    import { appendFileSync, existsSync } from 'node:fs';
     export const Browsers = { macOS: () => ['Chrome', 'macOS', '1'] };
     export const DisconnectReason = { loggedOut: 401 };
     export async function useMultiFileAuthState() {
@@ -71,6 +71,10 @@ esac
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
           return 'TEST1234';
         }, async sendMessage(jid, payload) {
+        if (payload.image && process.env.FAKE_FAIL_IMAGE) {
+          appendFileSync(process.env.FAKE_FAIL_IMAGE, 'attempt\\n');
+          throw new Error('simulated media upload failure');
+        }
         appendFileSync(process.env.FAKE_OUT, JSON.stringify({ jid, payload }) + '\\n');
         return { key: { id: 'OUT1' } };
       } };
@@ -266,6 +270,43 @@ test('self-chat can select a registered agent-box session without re-pairing', a
     const outbound = JSON.parse(readFileSync(fixture.fakeOut, 'utf8').trim());
     assert.match(outbound.payload.text, /Box target: codex \(codex, stopped\)/);
     assert.match(outbound.payload.text, /wait if it is unavailable/);
+  } finally {
+    await stop(daemon);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('reply-image CLI queues a durable image, retries after restart, and cleans up after native send', async () => {
+  const fixture = setup();
+  const sourceImage = join(fixture.state, 'picture.png');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK6sAAAAASUVORK5CYII=', 'base64');
+  writeFileSync(sourceImage, png);
+  const attempts = join(fixture.dir, 'attempts');
+  const env = { ...process.env, LOCAL_WHATSAPP_DEBUG: '', LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+    FAKE_OUT: fixture.fakeOut, LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
+  let daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], {
+    env: { ...env, FAKE_FAIL_IMAGE: attempts }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const saved = () => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+  try {
+    await waitUntil(() => existsSync(join(fixture.state, 'messages.json')), 'inbound request');
+    const id = Object.keys(saved().messages)[0];
+    const result = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'reply-image', id, sourceImage, 'my picture'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    await waitUntil(() => existsSync(attempts), 'failed upload');
+    const image = saved().messages[id].reply.image;
+    assert.equal(saved().messages[id].reply.status, 'queued');
+    await stop(daemon);
+    rmSync(sourceImage);
+    daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitUntil(() => saved().messages[id].reply.status === 'sent', 'native image sent');
+    const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].jid, '14155551234@s.whatsapp.net');
+    assert.equal(outbound[0].payload.caption, 'my picture');
+    assert.equal(outbound[0].payload.mimetype, 'image/png');
+    assert.deepEqual(Buffer.from(outbound[0].payload.image.data), png);
+    await waitUntil(() => !existsSync(join(fixture.state, 'media-outbox', image)), 'media cleanup');
   } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import pino from 'pino';
-import { addInbound, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -222,6 +222,7 @@ async function serve() {
   const initialAuth = await useMultiFileAuthState(authPath);
   if (!initialAuth.state.creds.me) throw new Error('device not paired: run pair first');
   const state = loadState(dir);
+  cleanImageOutbox(dir, state);
   const peers = new Map();
   const runtimeId = randomUUID();
   let peerSerial = 0;
@@ -232,7 +233,7 @@ async function serve() {
   let handlingControls = false;
 
   async function sendViaCodex(name, message) {
-    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>.`;
+    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption].`;
     return new Promise((resolve) => {
       const child = spawn(codexBin, ['queue', '--thread', name, '--message', text], { stdio: 'ignore' });
       const timeout = setTimeout(() => child.kill(), 10000);
@@ -292,7 +293,8 @@ async function serve() {
         }
         if (entry.reply?.status !== 'queued') continue;
         try {
-          const sent = await whatsapp.sendMessage(entry.chat, { text: entry.reply.text });
+          const content = entry.reply.image ? imageReplyContent(dir, entry.reply) : { text: entry.reply.text };
+          const sent = await whatsapp.sendMessage(entry.chat, content);
           if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
           entry.reply.status = 'sent';
           entry.reply.sentAt = new Date().toISOString();
@@ -304,6 +306,7 @@ async function serve() {
             .sort((left, right) => left.reply.sentAt.localeCompare(right.reply.sentAt));
           for (const old of completed.slice(0, Math.max(0, completed.length - 1000))) delete state.messages[old.id];
           saveState(dir, state);
+          cleanImageOutbox(dir, state);
         } catch (error) { process.stderr.write(`reply send failed: ${error.message}\n`); break; }
       }
     } finally { draining = false; }
@@ -375,8 +378,10 @@ async function serve() {
             }
             peers.set(peer, { session: value.session, id: `${runtimeId}:${++peerSerial}` });
             dispatch().catch((error) => process.stderr.write(`${error.message}\n`));
-          } else if (value.op === 'reply') {
-            const entry = queueReply(state, value.id, value.text);
+          } else if (value.op === 'reply' || value.op === 'reply-image') {
+            const entry = value.op === 'reply-image'
+              ? queueImageReply(state, dir, value.id, value.path, value.caption)
+              : queueReply(state, value.id, value.text);
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, status: connected ? 'sending' : 'queued until WhatsApp reconnects', id: entry.id })}\n`);
             drainReplies().catch((error) => process.stderr.write(`reply drain failed: ${error.message}\n`));
@@ -511,6 +516,12 @@ async function main() {
     process.stdout.write(`Target: ${harness} session ${name}\n`);
     return;
   }
+  if (command === 'reply-image') {
+    const [id, path, ...caption] = process.argv.slice(3);
+    const result = await request({ op: 'reply-image', id, path, caption: caption.join(' ') });
+    process.stdout.write(`${result.status}\n`);
+    return;
+  }
   if (command === 'reply') {
     const id = process.argv[3];
     const text = process.argv.slice(4).join(' ');
@@ -522,7 +533,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ ...await request({ op: 'status' }), profile: config().profile }, null, 2)}\n`);
     return;
   }
-  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|reply ID TEXT|status');
+  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|reply ID TEXT|reply-image ID ABSOLUTE_PATH [CAPTION]|status');
 }
 
 main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });
