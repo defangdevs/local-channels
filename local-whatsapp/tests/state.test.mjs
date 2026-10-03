@@ -82,7 +82,14 @@ test('image validation rejects unknown IDs, unsafe inputs, oversized files, and 
     assert.throws(() => queueImageReply(state, dir, 'unknown', source), /unknown message/);
     assert.throws(() => queueImageReply(state, dir, 'toString', source), /unknown message/);
     assert.throws(() => queueImageReply(state, dir, inbound.id, 'relative.png'), /absolute/);
-    assert.throws(() => queueImageReply(state, dir, inbound.id, dir), /regular file/);
+    assert.throws(() => queueImageReply(state, dir, inbound.id, join(dir, 'messages.json')), /ENOENT/);
+    const outside = mkdtempSync(join(tmpdir(), 'whatsapp-outside-'));
+    try {
+      writeFileSync(join(outside, 'image.png'), png);
+      assert.throws(() => queueImageReply(state, dir, inbound.id, join(outside, 'image.png')), /inside the user home/);
+      symlinkSync(outside, join(dir, 'outside'));
+      assert.throws(() => queueImageReply(state, dir, inbound.id, join(dir, 'outside', 'image.png')), /inside the user home/);
+    } finally { rmSync(outside, { recursive: true, force: true }); }
     symlinkSync(source, join(dir, 'symlink.png'));
     assert.throws(() => queueImageReply(state, dir, inbound.id, join(dir, 'symlink.png')));
     assert.throws(() => queueImageReply(state, dir, inbound.id, source, 'a'.repeat(4001)), /caption/);
