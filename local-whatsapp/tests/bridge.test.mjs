@@ -132,6 +132,7 @@ test(`bridge delivers and replies with debug receipts ${JSON.stringify(debug)}`,
     assert.ok(outbound.every((item) => item.jid === '14155551234@s.whatsapp.net'));
     assert.ok(outbound.some((item) => item.payload.text === 'answer'));
     assert.equal(outbound.some((item) => item.payload.text.includes('Box: received')), debug === '1');
+    await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages[id].reply?.status === 'sent', 'persisted reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages[id].reply.status, 'sent');
     assert.equal(saved.messages[id].ack?.status, debug === '1' ? 'sent' : undefined);
@@ -160,6 +161,7 @@ test('default mode suppresses previously queued receipts while preserving replie
     await waitUntil(() => existsSync(fixture.fakeOut), 'queued reply');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
     assert.deepEqual(outbound.map((item) => item.payload.text), ['old answer']);
+    await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages.old.reply?.status === 'sent', 'persisted queued reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages.old.ack.status, 'suppressed');
     assert.equal(saved.messages.old.reply.status, 'sent');
