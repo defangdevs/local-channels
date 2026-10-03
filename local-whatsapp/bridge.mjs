@@ -102,6 +102,7 @@ async function pair() {
   if (!/^\d{7,15}$/.test(phone)) throw new Error('enter an international phone number on stdin');
   const { makeWASocket, useMultiFileAuthState, Browsers } = await baileys();
   let requested = false;
+  let linked = false;
   async function connectForPair() {
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     if (state.creds.me && !requested) throw new Error('this device is already paired');
@@ -117,11 +118,14 @@ async function pair() {
         } catch (error) { process.stderr.write(`pairing failed: ${error.message}\n`); process.exit(1); }
       }
       if (connection === 'open') {
+        if (linked) return;
+        linked = true;
         await saveCreds();
         process.stdout.write('WhatsApp device linked.\n');
         socket.end();
         setTimeout(() => process.exit(0), 500);
       } else if (connection === 'close' && lastDisconnect) {
+        if (linked) return;
         const code = lastDisconnect.error?.output?.statusCode;
         if (code === 515) {
           setTimeout(() => connectForPair().catch((error) => { process.stderr.write(`${error.message}\n`); process.exit(1); }), 1000);

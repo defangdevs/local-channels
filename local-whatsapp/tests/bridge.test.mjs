@@ -43,18 +43,23 @@ function setup() {
     export const Browsers = { macOS: () => ['Chrome', 'macOS', '1'] };
     export const DisconnectReason = { loggedOut: 401 };
     export async function useMultiFileAuthState() {
-      return { state: { creds: { me: { id: '14155551234:1@s.whatsapp.net' } } }, saveCreds: async () => {} };
+      return { state: { creds: { me: process.env.FAKE_PAIR ? null : { id: '14155551234:1@s.whatsapp.net' } } }, saveCreds: async () => {} };
     }
     export default function makeWASocket() {
       const ev = new EventEmitter();
       setTimeout(() => {
+        if (process.env.FAKE_PAIR) { ev.emit('connection.update', { qr: 'QR' }); return; }
         ev.emit('connection.update', { connection: 'open' });
         ev.emit('messages.upsert', { type: 'notify', messages: [{
           key: { id: process.env.FAKE_INBOUND_ID || 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' },
           message: { conversation: process.env.FAKE_INBOUND_TEXT || '@box hello' },
         }] });
       }, 100);
-      return { ev, end() {}, async sendMessage(jid, payload) {
+      return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
+        async requestPairingCode() {
+          setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
+          return 'TEST1234';
+        }, async sendMessage(jid, payload) {
         appendFileSync(process.env.FAKE_OUT, JSON.stringify({ jid, payload }) + '\\n');
         return { key: { id: 'OUT1' } };
       } };
@@ -62,6 +67,24 @@ function setup() {
   `);
   return { dir, state, fakeOut };
 }
+
+test('pair exits successfully when the newly linked socket closes', async () => {
+  const fixture = setup();
+  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
+    env: { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, LOCAL_WHATSAPP_PHONE: '14155551234', FAKE_PAIR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let errors = '';
+  pair.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  try {
+    const code = await new Promise((resolve) => pair.once('exit', resolve));
+    assert.equal(code, 0, errors);
+    assert.match(output, /TEST1234/);
+    assert.match(output, /device linked/);
+  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+});
 
 test('bridge persists an inbound message, delivers to Claude, and sends reply to its chat', async () => {
   const fixture = setup();
