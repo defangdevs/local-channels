@@ -103,8 +103,9 @@ function readImage(path, dir) {
   // Resolve parent directories before checking roots; a symlinked directory
   // must not turn an allowed local image into a read outside the user's files.
   const canonicalPath = join(realpathSync(dirname(path)), basename(path));
-  const roots = [process.env.HOME, dir].filter(Boolean).map((root) => realpathSync(root));
-  if (!roots.some((root) => canonicalPath.startsWith(root + sep))) {
+  const homeRoot = realpathSync(process.env.HOME);
+  const stateRoot = realpathSync(dir);
+  if (!canonicalPath.startsWith(homeRoot + sep) && !canonicalPath.startsWith(stateRoot + sep)) {
     throw new Error('image must be inside the user home or bridge state directory');
   }
   const fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
