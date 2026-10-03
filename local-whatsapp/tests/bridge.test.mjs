@@ -97,11 +97,12 @@ test('pair exits successfully when the newly linked socket closes', async () => 
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test('bridge persists an inbound message, delivers to Claude, and sends reply to its chat', async () => {
+for (const debug of ['', '0', 'true', '1']) {
+test(`bridge delivers and replies with debug receipts ${JSON.stringify(debug)}`, async () => {
   const fixture = setup();
   writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'claude', session: 'agent-claude', name: 'claude' }));
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
-    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, LOCAL_WHATSAPP_DEBUG: debug };
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let peer;
   try {
@@ -130,12 +131,41 @@ test('bridge persists an inbound message, delivers to Claude, and sends reply to
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(outbound.every((item) => item.jid === '14155551234@s.whatsapp.net'));
     assert.ok(outbound.some((item) => item.payload.text === 'answer'));
-    assert.ok(outbound.some((item) => item.payload.text.includes('Box: received')));
+    assert.equal(outbound.some((item) => item.payload.text.includes('Box: received')), debug === '1');
+    await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages[id].reply?.status === 'sent', 'persisted reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages[id].reply.status, 'sent');
-    assert.equal(saved.messages[id].ack.status, 'sent');
+    assert.equal(saved.messages[id].ack?.status, debug === '1' ? 'sent' : undefined);
   } finally {
     if (peer) await stop(peer);
+    await stop(daemon);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+}
+
+test('default mode suppresses previously queued receipts while preserving replies', async () => {
+  const fixture = setup();
+  writeFileSync(join(fixture.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'old request',
+      receivedAt: new Date().toISOString(), deliveredTo: null,
+      ack: { text: 'Box: received old', status: 'queued' },
+      reply: { text: 'old answer', status: 'queued' } },
+  }, sentIds: {} }));
+  const env = { ...process.env, LOCAL_WHATSAPP_DEBUG: '',
+    LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
+  const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(fixture.fakeOut), 'queued reply');
+    const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(outbound.map((item) => item.payload.text), ['old answer']);
+    await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages.old.reply?.status === 'sent', 'persisted queued reply');
+    const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+    assert.equal(saved.messages.old.ack.status, 'suppressed');
+    assert.equal(saved.messages.old.reply.status, 'sent');
+  } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });
   }

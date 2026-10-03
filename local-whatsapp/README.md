@@ -70,7 +70,11 @@ On agent-box versions with built-in WhatsApp supervision, the bridge does not
 need this shell session.
 
 Send `@agent hello` in Message Yourself. Replies are text-only. The bridge
-answers with a receipt. Send `@agent /sessions` to list available agent-box
+sends no automatic receipt by default. For diagnostic receipts, start the bridge
+with `LOCAL_WHATSAPP_DEBUG=1`; unset it and restart to disable them. Other values
+do not enable debug mode. On agent-box, set this variable in the settings secrets
+panel and restart the bridge. Agent replies and responses to explicit commands
+remain enabled, and delivery errors are logged to stderr. Send `@agent /sessions` to list available agent-box
 sessions and `@agent /target NAME` to select one, even if it is currently
 stopped. `@agent /target auto` makes the next message start a new session using
 the chosen profile; `@agent /profile NAME` changes that profile. These commands
