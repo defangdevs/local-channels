@@ -81,6 +81,13 @@ commit carrying each version (including the historical `gh-webhook` name).
 Existing tags must match that commit; never move or reuse a version tag.
 Run it without `--push` to create and verify tags locally.
 
+The optional `local-whatsapp` plugin has its own version in its manifest and
+`package.json`. Its immutable tags are `local-whatsapp-vX.Y.Z`, separate from
+`local-webhook`'s historical `vX.Y.Z` tags. The same tag script checks both.
+Run `npm ci --ignore-scripts && npm test` under `local-whatsapp/` after changing
+its behavior; CI runs it on Node 20 and 22. Keep its marketplace description
+and keywords identical to its plugin manifest.
+
 Consumers pin this repo by revision — agent-box carries the pin in its
 `modules/agent-box.nix` (a generated file there; edit its `.in` source) — so a
 bump usually needs a companion PR in that repo. Mention it in the PR body.
@@ -88,7 +95,8 @@ bump usually needs a companion PR in that repo. Mention it in the PR body.
 ## Commits and PRs
 
 - Branch `feat/<short-topic>`; never commit to `main`.
-- Commit subject: `local-webhook <version>: <what changed>`, imperative and
+- Commit subject: `<plugin> <version>: <what changed>` (for example,
+  `local-whatsapp 0.1.0: add linked-device bridge`), imperative and
   concrete. Body explains the **problem first, then the change**, in prose
   paragraphs and bullets, and ends with the verification evidence. Keep the
   `Co-authored-by:` / `Claude-Session:` trailers.

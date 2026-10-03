@@ -53,23 +53,46 @@ def version_commits(ref):
     return versions
 
 
+def whatsapp_version_commits(ref):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/~^{}@-]*', ref):
+        raise ValueError('Invalid release ref: ' + ref)
+    commit_ref = git('rev-parse', '--verify', '--end-of-options', ref + '^{commit}')
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit_ref):
+        raise ValueError('Invalid commit ID: ' + commit_ref)
+    path = 'local-whatsapp/.claude-plugin/plugin.json'
+    versions = {}
+    previous = None
+    for commit in git('rev-list', '--first-parent', '--reverse', commit_ref).splitlines():
+        if path not in git('ls-tree', '-r', '--name-only', commit).splitlines():
+            continue
+        version = json.loads(git('show', commit + ':' + path))['version']
+        if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+            raise ValueError('Invalid version: ' + version)
+        if version != previous:
+            if version in versions:
+                raise ValueError('Version reused: ' + version)
+            versions[version] = commit
+        previous = version
+    return versions
+
+
 def tag_versions(ref, push=False):
-    versions = version_commits(ref)
+    versions = {'v' + version: (commit, 'local-webhook ' + version)
+                for version, commit in version_commits(ref).items()}
+    versions.update({'local-whatsapp-v' + version: (commit, 'local-whatsapp ' + version)
+                     for version, commit in whatsapp_version_commits(ref).items()})
     existing = set(git('tag', '--list').splitlines())
     # Validate the entire set before writing anything. Published tags are immutable.
-    for version, commit in versions.items():
-        tag = 'v' + version
+    for tag, (commit, _) in versions.items():
         if tag in existing and git('rev-parse', tag + '^{commit}') != commit:
             raise ValueError('Tag points to a different commit: ' + tag)
-    for version, commit in versions.items():
-        tag = 'v' + version
+    for tag, (commit, message) in versions.items():
         if tag not in existing:
-            subprocess.check_call(['git', 'tag', '-a', tag, commit, '-m',
-                                   'local-webhook ' + version])
+            subprocess.check_call(['git', 'tag', '-a', tag, commit, '-m', message])
         print(tag + ' ' + commit)
     if push:
         subprocess.check_call(['git', 'push', '--atomic', 'origin', *(
-            'refs/tags/v' + version for version in versions
+            'refs/tags/' + tag for tag in versions
         )])
 
 

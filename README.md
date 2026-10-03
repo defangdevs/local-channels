@@ -20,6 +20,7 @@ one implementation for both harnesses. See
 | plugin | version | what it delivers |
 |---|---|---|
 | [`local-webhook`](local-webhook/) | 0.30.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a per-source `verification` mode (`hmac-hex` \| `token` \| `standard-webhooks`, #30) so GitLab and other Standard-Webhooks senders can deliver too, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
+| [`local-whatsapp`](local-whatsapp/) | 0.1.0 | Personal WhatsApp linked-device text bridge. One persistent per-user connection, Claude channel delivery, Codex queue delivery, and a reply tool/CLI. |
 
 ## Version tags
 
@@ -30,7 +31,9 @@ change. Versions 0.1.0 and 0.2.0 predate the rename from `gh-webhook`.
 The early 0.5.x manifests were stale; those tags follow the versions explicitly
 named in their release commit subjects.
 Tags are immutable and CI publishes missing tags after both Python test jobs
-pass on `main`. Documentation-only commits do not move an existing tag.
+and both Node test jobs pass on `main`. Documentation-only commits do not move
+an existing tag. `local-whatsapp` uses `local-whatsapp-vX.Y.Z` tags so its
+independent version sequence cannot collide with `local-webhook` tags.
 
 Use GitHub's [compare view](https://github.com/defangdevs/local-channels/compare/v0.27.1...v0.28.0)
 to see commits and changes between versions. Consumers can continue pinning
@@ -39,8 +42,9 @@ full commit hashes, with tags providing the version lookup.
 ## Requirements
 
 - Claude Code with plugin-marketplace support.
-- `python3` ≥ 3.9 — the stock interpreter RHEL 9 and Ubuntu server images
-  already ship. No pip packages, no build step, no node.
+- For `local-webhook`: `python3` >= 3.9, with no pip packages or Node runtime.
+- For `local-whatsapp`: Node.js >= 20, the pinned npm dependencies, and outbound
+  network access to WhatsApp. See its [setup guide](local-whatsapp/README.md).
 - For `local-webhook` only: a way for the sender to reach the box. In practice a
   TLS-terminating reverse proxy (Caddy) in front of the loopback port or unix
   socket the plugin listens on.
