@@ -278,7 +278,7 @@ test('self-chat can select a registered agent-box session without re-pairing', a
 
 test('reply-image CLI queues a durable image, retries after restart, and cleans up after native send', async () => {
   const fixture = setup();
-  const sourceImage = join(fixture.dir, 'picture.png');
+  const sourceImage = join(fixture.state, 'picture.png');
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK6sAAAAASUVORK5CYII=', 'base64');
   writeFileSync(sourceImage, png);
   const attempts = join(fixture.dir, 'attempts');

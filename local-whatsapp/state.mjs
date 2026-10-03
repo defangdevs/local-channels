@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 
 export const MAX_TEXT = 4000;
 export const MAX_PENDING = 200;
@@ -98,9 +98,16 @@ export function queueReply(state, id, text) {
 
 // Read a bounded regular file through one descriptor so validation and copying
 // use the same bytes, even if the caller replaces the source after queuing.
-function readImage(path) {
+function readImage(path, dir) {
   if (typeof path !== 'string' || !isAbsolute(path)) throw new Error('image path must be absolute');
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  // Resolve parent directories before checking roots; a symlinked directory
+  // must not turn an allowed local image into a read outside the user's files.
+  const canonicalPath = join(realpathSync(dirname(path)), basename(path));
+  const roots = [process.env.HOME, dir].filter(Boolean).map((root) => realpathSync(root));
+  if (!roots.some((root) => canonicalPath.startsWith(root + sep))) {
+    throw new Error('image must be inside the user home or bridge state directory');
+  }
+  const fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = fstatSync(fd);
     if (!info.isFile()) throw new Error('image must be a regular file');
@@ -143,7 +150,7 @@ export function queueImageReply(state, dir, id, path, caption = '') {
   if (!entry.reply && Object.values(state.messages).filter((message) => message.reply?.status === 'queued' && message.reply.image).length >= MAX_IMAGE_OUTBOX) {
     throw new Error('image outbox full (20 queued images maximum)');
   }
-  const { bytes, extension } = readImage(path);
+  const { bytes, extension } = readImage(path, dir);
   // Include the message ID: each reply owns its own file and cleanup cannot
   // remove an identical picture still queued for a different request.
   const image = `${createHash('sha256').update(id).update('\0').update(bytes).digest('hex')}.${extension}`;
@@ -165,7 +172,7 @@ export function queueImageReply(state, dir, id, path, caption = '') {
 
 export function imageReplyContent(dir, reply) {
   const path = imageReplyPath(dir, reply.image);
-  const { bytes, extension } = readImage(path);
+  const { bytes, extension } = readImage(path, dir);
   const mimetype = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' }[extension];
   return { image: bytes, caption: reply.caption, mimetype };
 }

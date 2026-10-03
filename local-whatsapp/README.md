@@ -122,7 +122,7 @@ selector are separate so one can be added without changing WhatsApp pairing.
 Codex can reply with `node bridge.mjs reply-image ID /absolute/path/picture.png "caption"`.
 Claude uses `whatsapp_reply_image` with `id`, an absolute `path`, and an optional
 `caption`. The file must be a regular local file with a PNG, JPEG, or WebP
-signature, at most 10 MiB; symlink files and remote URLs are rejected. Captions
+signature, at most 10 MiB, inside the user home or bridge state directory; symlink files and remote URLs are rejected. Captions
 are limited to 4000 characters. The format signature is checked; actual decoding
 and upload are performed by Baileys. Malformed image data can still fail there.
 
