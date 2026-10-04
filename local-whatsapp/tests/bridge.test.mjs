@@ -192,6 +192,7 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
     const args = readFileSync(argsFile, 'utf8');
     assert.match(args, /queue\n--thread\ncodex\n--message\n/);
     assert.match(args, /WhatsApp Message Yourself/);
+    assert.match(args, /reply right away with a one-line acknowledgement/);
   } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });

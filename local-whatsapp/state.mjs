@@ -7,6 +7,10 @@ export const MAX_PENDING = 200;
 export const MAX_OUTBOX = 200;
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_IMAGE_OUTBOX = 20;
+// The sender sees only WhatsApp. A turn that runs for many minutes while the
+// agent says nothing is indistinguishable from a dead session, and the bridge
+// cannot steer a running turn, so the nudge has to ride along with the message.
+export const REPLY_GUIDANCE = 'The sender only sees WhatsApp, not this session: reply right away with a one-line acknowledgement, even if it only says you have started; on work that runs more than a few minutes, send a short progress update every few minutes and a final reply when done.';
 
 export function stateDir() {
   return process.env.LOCAL_WHATSAPP_STATE_DIR ||
