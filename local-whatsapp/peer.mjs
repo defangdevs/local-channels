@@ -31,7 +31,7 @@ function connectPeer() {
           jsonrpc: '2.0',
           method: 'notifications/claude/channel',
           params: {
-            content: `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply with whatsapp_reply using this message id.`,
+            content: `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply with whatsapp_reply or whatsapp_reply_image using this message id.`,
             meta: { source: 'local-whatsapp', messageId: message.id, receivedAt: message.receivedAt },
           },
         });
@@ -46,12 +46,12 @@ function connectPeer() {
   });
 }
 
-function requestReply(id, text) {
+function requestReply(value) {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     let buffer = '';
     socket.setTimeout(10000);
-    socket.on('connect', () => socket.write(`${JSON.stringify({ op: 'reply', id, text })}\n`));
+    socket.on('connect', () => socket.write(`${JSON.stringify(value)}\n`));
     socket.on('data', (chunk) => {
       buffer += chunk.toString();
       if (!buffer.includes('\n')) return;
@@ -83,8 +83,8 @@ reader.on('line', async (line) => {
       result = {
         protocolVersion: message.params?.protocolVersion || '2025-06-18',
         capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-        serverInfo: { name: 'local-whatsapp', version: '0.1.0' },
-        instructions: 'A linked WhatsApp self-chat can send messages to this session. Use whatsapp_reply with the message id to answer in WhatsApp. The host controls which session this peer registers as.',
+        serverInfo: { name: 'local-whatsapp', version: '0.3.0' },
+        instructions: 'A linked WhatsApp self-chat can send messages to this session. Use whatsapp_reply for text or whatsapp_reply_image with an absolute local image path and optional caption to answer in WhatsApp, using the message id. The host controls which session this peer registers as.',
       };
     } else if (message.method === 'tools/list') {
       result = { tools: [{
@@ -93,10 +93,19 @@ reader.on('line', async (line) => {
         inputSchema: { type: 'object', properties: {
           id: { type: 'string' }, text: { type: 'string' },
         }, required: ['id', 'text'], additionalProperties: false },
+      }, {
+        name: 'whatsapp_reply_image',
+        description: 'Reply with a native image in the original chat for an incoming WhatsApp message. PNG, JPEG or WebP, at most 10 MiB. The host copies the file for reliable retries.',
+        inputSchema: { type: 'object', properties: {
+          id: { type: 'string' }, path: { type: 'string', description: 'Absolute local image path' }, caption: { type: 'string', maxLength: 4000 },
+        }, required: ['id', 'path'], additionalProperties: false },
       }] };
-    } else if (message.method === 'tools/call' && message.params?.name === 'whatsapp_reply') {
+    } else if (message.method === 'tools/call' && ['whatsapp_reply', 'whatsapp_reply_image'].includes(message.params?.name)) {
       const args = message.params.arguments || {};
-      const reply = await requestReply(args.id, args.text);
+      const value = message.params.name === 'whatsapp_reply_image'
+        ? { op: 'reply-image', id: args.id, path: args.path, caption: args.caption ?? '' }
+        : { op: 'reply', id: args.id, text: args.text };
+      const reply = await requestReply(value);
       result = { content: [{ type: 'text', text: reply.status }] };
     } else {
       output({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'method not found' } });

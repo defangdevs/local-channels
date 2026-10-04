@@ -24,7 +24,7 @@ test('Claude peer registers, receives a channel message, and replies by id', asy
           socket.write(`${JSON.stringify({ op: 'message', message: {
             id: 'abc123', text: 'hello', receivedAt: '2026-10-02T00:00:00Z',
           } })}\n`);
-        } else if (value.op === 'reply') {
+        } else if (value.op === 'reply' || value.op === 'reply-image') {
           socket.write(`${JSON.stringify({ ok: true, status: 'queued' })}\n`);
         }
       }
@@ -67,6 +67,17 @@ test('Claude peer registers, receives a channel message, and replies by id', asy
     await waitUntil(() => output.some((item) => item.id === 2));
     assert.deepEqual(requests.find((item) => item.op === 'reply'), { op: 'reply', id: 'abc123', text: 'done' });
     assert.equal(output.find((item) => item.id === 2).result.content[0].text, 'queued');
+    peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' })}\n`);
+    await waitUntil(() => output.some((item) => item.id === 3));
+    assert.ok(output.find((item) => item.id === 3).result.tools.some((tool) => tool.name === 'whatsapp_reply_image'));
+    peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: {
+      name: 'whatsapp_reply_image', arguments: { id: 'abc123', path: '/home/agent/picture.png', caption: 'picture' },
+    } })}\n`);
+    await waitUntil(() => output.some((item) => item.id === 4));
+    assert.deepEqual(requests.find((item) => item.op === 'reply-image'), {
+      op: 'reply-image', id: 'abc123', path: '/home/agent/picture.png', caption: 'picture',
+    });
+    assert.equal(output.find((item) => item.id === 4).result.content[0].text, 'queued');
   } finally {
     peer.kill();
     await once(peer, 'exit');

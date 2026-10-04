@@ -20,7 +20,7 @@ one implementation for both harnesses. See
 | plugin | version | what it delivers |
 |---|---|---|
 | [`local-webhook`](local-webhook/) | 0.30.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a per-source `verification` mode (`hmac-hex` \| `token` \| `standard-webhooks`, #30) so GitLab and other Standard-Webhooks senders can deliver too, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run |
-| [`local-whatsapp`](local-whatsapp/) | 0.2.1 | Personal WhatsApp linked-device text bridge. One selected recipient at a time, automatic profile-based session creation, Claude channel delivery, Codex queue delivery, and a reply tool/CLI. |
+| [`local-whatsapp`](local-whatsapp/) | 0.3.0 | Personal WhatsApp linked-device text bridge. One selected recipient at a time, automatic profile-based session creation, Claude channel delivery, Codex queue delivery, and a reply tool/CLI. |
 
 ## Version tags
 
