@@ -18,6 +18,7 @@ const codexThreadsPath = join(dir, 'codex-threads.json');
 const authPath = join(dir, 'auth');
 const command = process.argv[2];
 const logger = pino({ level: 'silent' });
+const debugReceipts = process.env.LOCAL_WHATSAPP_DEBUG === '1';
 const sessionBin = process.env.LOCAL_WHATSAPP_SESSION_BIN || '/usr/local/bin/agent-box-session';
 const codexBin = process.env.LOCAL_WHATSAPP_CODEX_BIN || join(userInfo().homedir, '.nix-profile', 'bin', 'codex');
 if (!isAbsolute(sessionBin) || !isAbsolute(codexBin)) throw new Error('bridge helper paths must be absolute');
@@ -276,7 +277,12 @@ async function serve() {
     draining = true;
     try {
       for (const entry of Object.values(state.messages)) {
-        if (entry.ack?.status === 'queued') {
+        if (entry.ack?.status === 'queued' && !debugReceipts) {
+          // Do not replay old diagnostic receipts after debug mode is disabled.
+          entry.ack.status = 'suppressed';
+          saveState(dir, state);
+        }
+        if (entry.ack?.status === 'queued' && debugReceipts) {
           try {
             const sent = await whatsapp.sendMessage(entry.chat, { text: entry.ack.text });
             if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
@@ -375,7 +381,7 @@ async function serve() {
             peer.write(`${JSON.stringify({ ok: true, status: connected ? 'sending' : 'queued until WhatsApp reconnects', id: entry.id })}\n`);
             drainReplies().catch((error) => process.stderr.write(`reply drain failed: ${error.message}\n`));
           } else if (value.op === 'status') {
-            peer.write(`${JSON.stringify({ ok: true, connected, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply).length })}\n`);
+            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply).length })}\n`);
           } else {
             peer.write(`${JSON.stringify({ ok: false, error: 'unknown operation' })}\n`);
           }
@@ -410,7 +416,7 @@ async function serve() {
           const control = inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
             inbound.text.startsWith('/profile');
           if (control) inbound.control = true;
-          else inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
+          else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
           if (addInbound(state, inbound)) {
             saveState(dir, state);
             if (control) await handleControls();
@@ -421,7 +427,8 @@ async function serve() {
               const binding = target();
               const destination = binding ? `${binding.harness} session ${binding.session}` : 'a new session';
               const delivery = inbound.deliveredTo ? 'routed to' : 'waiting for';
-              inbound.ack = { text: dispatchError
+              if (dispatchError) process.stderr.write(`dispatch failed: ${dispatchError.message}\n`);
+              if (debugReceipts) inbound.ack = { text: dispatchError
                 ? `Box: ${dispatchError.message}`
                 : `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
             }
