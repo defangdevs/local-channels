@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import pino from 'pino';
-import { addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -233,7 +233,7 @@ async function serve() {
   let handlingControls = false;
 
   async function sendViaCodex(name, message) {
-    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption].`;
+    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption]. ${REPLY_GUIDANCE}`;
     return new Promise((resolve) => {
       const child = spawn(codexBin, ['queue', '--thread', name, '--message', text], { stdio: 'ignore' });
       const timeout = setTimeout(() => child.kill(), 10000);

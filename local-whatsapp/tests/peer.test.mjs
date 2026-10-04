@@ -61,6 +61,8 @@ test('Claude peer registers, receives a channel message, and replies by id', asy
     assert.equal(output.find((item) => item.id === 1).result.capabilities.experimental['claude/channel'] instanceof Object, true);
     assert.equal(requests[0].session, 'agent-claude');
     assert.match(output.find((item) => item.method === 'notifications/claude/channel').params.content, /abc123.*hello/);
+    assert.match(output.find((item) => item.method === 'notifications/claude/channel').params.content, /reply right away with a one-line acknowledgement/);
+    assert.match(output.find((item) => item.id === 1).result.instructions, /progress update every few minutes/);
     peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
       name: 'whatsapp_reply', arguments: { id: 'abc123', text: 'done' },
     } })}\n`);

@@ -1,7 +1,7 @@
 import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
-import { publicMessage, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, publicMessage, stateDir } from './state.mjs';
 
 const socketPath = join(stateDir(), 'bridge.sock');
 const session = process.env.LOCAL_WHATSAPP_SESSION || process.env.LOCAL_WEBHOOK_SESSION;
@@ -31,7 +31,7 @@ function connectPeer() {
           jsonrpc: '2.0',
           method: 'notifications/claude/channel',
           params: {
-            content: `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply with whatsapp_reply or whatsapp_reply_image using this message id.`,
+            content: `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply with whatsapp_reply or whatsapp_reply_image using this message id. ${REPLY_GUIDANCE}`,
             meta: { source: 'local-whatsapp', messageId: message.id, receivedAt: message.receivedAt },
           },
         });
@@ -83,8 +83,8 @@ reader.on('line', async (line) => {
       result = {
         protocolVersion: message.params?.protocolVersion || '2025-06-18',
         capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-        serverInfo: { name: 'local-whatsapp', version: '0.3.0' },
-        instructions: 'A linked WhatsApp self-chat can send messages to this session. Use whatsapp_reply for text or whatsapp_reply_image with an absolute local image path and optional caption to answer in WhatsApp, using the message id. The host controls which session this peer registers as.',
+        serverInfo: { name: 'local-whatsapp', version: '0.3.1' },
+        instructions: 'A linked WhatsApp self-chat can send messages to this session. Use whatsapp_reply for text or whatsapp_reply_image with an absolute local image path and optional caption to answer in WhatsApp, using the message id. ' + REPLY_GUIDANCE + ' The host controls which session this peer registers as.',
       };
     } else if (message.method === 'tools/list') {
       result = { tools: [{
