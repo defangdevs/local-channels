@@ -83,7 +83,7 @@ reader.on('line', async (line) => {
       result = {
         protocolVersion: message.params?.protocolVersion || '2025-06-18',
         capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-        serverInfo: { name: 'local-whatsapp', version: '0.3.2' },
+        serverInfo: { name: 'local-whatsapp', version: '0.3.3' },
         instructions: 'A linked WhatsApp self-chat can send messages to this session. Use whatsapp_reply for text or whatsapp_reply_image with an absolute local image path and optional caption to answer in WhatsApp, using the message id. ' + REPLY_GUIDANCE + ' The host controls which session this peer registers as.',
       };
     } else if (message.method === 'tools/list') {

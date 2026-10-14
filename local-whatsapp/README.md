@@ -78,8 +78,9 @@ remain enabled, and delivery errors are logged to stderr. Send `@agent /sessions
 sessions and `@agent /target NAME` to select one, even if it is currently
 stopped. Before delivering the next message, the bridge asks agent-box to
 reactivate that stopped session through its normal capacity policy. A refusal
-leaves the message pending on the same target instead of starting a replacement
-conversation. `@agent /target auto` makes the next message start a new session using
+or a selected session that no longer exists leaves the message pending on the
+same target instead of starting a replacement conversation. `@agent /target
+auto` makes the next message start a new session using
 the chosen profile; `@agent /profile NAME` changes that profile. These commands
 use `agent-box-session whatsapp candidates`, `select`, `activate`, `clear`, and `spawn`
 on the bridge host. A selected session can restart without re-pairing the

@@ -143,6 +143,7 @@ async function ensureTarget(available) {
     }
     return binding;
   }
+  if (binding) throw new Error(`selected session ${binding.name} is unavailable`);
   const created = await sessionCommand(['spawn', config().profile || 'default']);
   if (!created || !['claude', 'codex'].includes(created.harness) ||
       !/^[A-Za-z0-9_-]{1,150}$/.test(created.name || '')) {

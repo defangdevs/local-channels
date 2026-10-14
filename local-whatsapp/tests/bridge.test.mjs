@@ -236,19 +236,28 @@ esac
   }
 });
 
-test('disabled sessions receive no messages and cannot be selected', async () => {
+test('a missing selected session stays bound and receives no messages', async () => {
   const fixture = setup();
-  writeFileSync(fixture.sessionBin, "#!/bin/sh\ncase \"$2\" in candidates) printf '%s\\n' '[]' ;; spawn) exit 1 ;; esac\n");
+  const spawned = join(fixture.dir, 'spawned.txt');
+  writeFileSync(fixture.sessionBin, "#!/bin/sh\ncase \"$2\" in candidates) printf '%s\\n' '[]' ;; spawn) touch \"$SPAWNED\"; exit 1 ;; esac\n");
   writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state,
-    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, FAKE_OUT: fixture.fakeOut };
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, FAKE_OUT: fixture.fakeOut,
+    SPAWNED: spawned };
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], {
     env, stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let errors = '';
+  daemon.stderr.on('data', (chunk) => { errors += chunk.toString(); });
   try {
     await waitUntil(() => existsSync(join(fixture.state, 'messages.json')), 'saved message');
+    await waitUntil(() => errors.includes('selected session codex is unavailable'),
+      'missing target refusal');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(Object.values(saved.messages)[0].deliveredTo, null);
+    assert.equal(existsSync(spawned), false);
+    assert.deepEqual(JSON.parse(readFileSync(join(fixture.state, 'target.json'), 'utf8')),
+      { harness: 'codex', session: 'codex', name: 'codex' });
     const selected = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'target', 'codex', 'codex'], {
       env, encoding: 'utf8',
     });
