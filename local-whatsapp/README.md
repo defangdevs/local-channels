@@ -76,9 +76,12 @@ do not enable debug mode. On agent-box, set this variable in the settings secret
 panel and restart the bridge. Agent replies and responses to explicit commands
 remain enabled, and delivery errors are logged to stderr. Send `@agent /sessions` to list available agent-box
 sessions and `@agent /target NAME` to select one, even if it is currently
-stopped. `@agent /target auto` makes the next message start a new session using
+stopped. Before delivering the next message, the bridge asks agent-box to
+reactivate that stopped session through its normal capacity policy. A refusal
+leaves the message pending on the same target instead of starting a replacement
+conversation. `@agent /target auto` makes the next message start a new session using
 the chosen profile; `@agent /profile NAME` changes that profile. These commands
-use `agent-box-session whatsapp candidates`, `select`, `clear`, and `spawn`
+use `agent-box-session whatsapp candidates`, `select`, `activate`, `clear`, and `spawn`
 on the bridge host. A selected session can restart without re-pairing the
 device. If it has been removed, the next message starts a new session.
 The bridge uses `/usr/local/bin/agent-box-session` and

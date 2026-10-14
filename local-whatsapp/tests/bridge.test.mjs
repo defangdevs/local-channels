@@ -39,6 +39,7 @@ function setup() {
 case "$2" in
   candidates) printf '%s\\n' '[{"name":"claude","harness":"claude","stopped":false,"selected":true},{"name":"codex","harness":"codex","stopped":true,"selected":false}]' ;;
   select) printf '%s\\n' '{"name":"'"$3"'","harness":"codex","stopped":true}' ;;
+  activate) [ -z "$ACTIVATED" ] || printf '%s' "$3" > "$ACTIVATED"; printf '%s\\n' '{"name":"'"$3"'","harness":"codex","activated":true}' ;;
   spawn) printf '%s\\n' '{"name":"claude","harness":"claude","stopped":false}' ;;
   clear) printf '%s\\n' '{}' ;;
 esac
@@ -179,20 +180,53 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
   const fixture = setup();
   const bin = join(fixture.dir, 'bin');
   const argsFile = join(fixture.dir, 'codex-args.txt');
+  const activated = join(fixture.dir, 'activated.txt');
   mkdirSync(bin);
   writeFileSync(join(bin, 'codex'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$CODEX_ARGS_FILE"\n');
   chmodSync(join(bin, 'codex'), 0o700);
   writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
     CODEX_ARGS_FILE: argsFile, LOCAL_WHATSAPP_CODEX_BIN: join(bin, 'codex'),
-    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, ACTIVATED: activated };
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     await waitUntil(() => existsSync(argsFile), 'Codex queue');
+    assert.equal(readFileSync(activated, 'utf8'), 'codex');
     const args = readFileSync(argsFile, 'utf8');
     assert.match(args, /queue\n--thread\ncodex\n--message\n/);
     assert.match(args, /WhatsApp Message Yourself/);
     assert.match(args, /reply right away with a one-line acknowledgement/);
+  } finally {
+    await stop(daemon);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('failed cold activation keeps the inbound message pending', async () => {
+  const fixture = setup();
+  writeFileSync(fixture.sessionBin, `#!/bin/sh
+case "$2" in
+  candidates) printf '%s\\n' '[{"name":"codex","harness":"codex","stopped":true,"selected":true}]' ;;
+  activate) echo 'Session limit reached' >&2; exit 75 ;;
+esac
+`);
+  chmodSync(fixture.sessionBin, 0o700);
+  writeFileSync(join(fixture.state, 'target.json'),
+    JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, FAKE_OUT: fixture.fakeOut };
+  const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], {
+    env, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let errors = '';
+  daemon.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  try {
+    await waitUntil(() => existsSync(join(fixture.state, 'messages.json')), 'saved message');
+    await waitUntil(() => errors.includes('Session limit reached'), 'activation refusal');
+    const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+    assert.equal(Object.values(saved.messages)[0].deliveredTo, null);
+    assert.deepEqual(JSON.parse(readFileSync(join(fixture.state, 'target.json'), 'utf8')),
+      { harness: 'codex', session: 'codex', name: 'codex' });
   } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });

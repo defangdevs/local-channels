@@ -131,8 +131,18 @@ async function selectTarget(name) {
 
 async function ensureTarget(available) {
   const binding = target();
-  if (binding && available.some((item) => item.name === binding.name &&
-      item.harness === binding.harness)) return binding;
+  const selected = binding && available.find((item) => item.name === binding.name &&
+    item.harness === binding.harness);
+  if (selected) {
+    if (selected.stopped) {
+      const activated = await sessionCommand(['activate', selected.name]);
+      if (!activated || activated.name !== selected.name ||
+          activated.harness !== selected.harness || typeof activated.activated !== 'boolean') {
+        throw new Error('invalid activated session');
+      }
+    }
+    return binding;
+  }
   const created = await sessionCommand(['spawn', config().profile || 'default']);
   if (!created || !['claude', 'codex'].includes(created.harness) ||
       !/^[A-Za-z0-9_-]{1,150}$/.test(created.name || '')) {
