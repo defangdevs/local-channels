@@ -39,7 +39,7 @@ function setup() {
 case "$2" in
   candidates) printf '%s\\n' '[{"name":"claude","harness":"claude","stopped":false,"selected":true},{"name":"codex","harness":"codex","stopped":true,"selected":false}]' ;;
   select) printf '%s\\n' '{"name":"'"$3"'","harness":"codex","stopped":true}' ;;
-  activate) [ -z "$ACTIVATED" ] || printf '%s' "$3" > "$ACTIVATED"; printf '%s\\n' '{"name":"'"$3"'","harness":"codex","activated":true}' ;;
+  activate) [ -z "$ACTIVATED" ] || printf '%s' "$3" > "$ACTIVATED"; printf '{"name":"%s","harness":"codex","activated":%s}\\n' "$3" "\${ACTIVATION_RESULT:-true}" ;;
   spawn) printf '%s\\n' '{"name":"claude","harness":"claude","stopped":false}' ;;
   clear) printf '%s\\n' '{}' ;;
 esac
@@ -176,7 +176,8 @@ test('default mode suppresses previously queued receipts while preserving replie
   }
 });
 
-test('bridge routes to Codex queue without a Claude peer', async () => {
+for (const activationResult of ['true', 'false']) {
+test(`bridge routes to Codex after activation returns ${activationResult}`, async () => {
   const fixture = setup();
   const bin = join(fixture.dir, 'bin');
   const argsFile = join(fixture.dir, 'codex-args.txt');
@@ -187,7 +188,8 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
   writeFileSync(join(fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
   const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
     CODEX_ARGS_FILE: argsFile, LOCAL_WHATSAPP_CODEX_BIN: join(bin, 'codex'),
-    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, ACTIVATED: activated };
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, ACTIVATED: activated,
+    ACTIVATION_RESULT: activationResult };
   const daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     await waitUntil(() => existsSync(argsFile), 'Codex queue');
@@ -201,6 +203,7 @@ test('bridge routes to Codex queue without a Claude peer', async () => {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
+}
 
 test('failed cold activation keeps the inbound message pending', async () => {
   const fixture = setup();
