@@ -50,12 +50,17 @@ esac
   writeFileSync(join(dir, 'node_modules', 'pino', 'index.js'), 'export default () => ({ level: "silent" });\n');
   writeFileSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys', 'index.js'), `
     import { EventEmitter } from 'node:events';
+    import { Readable } from 'node:stream';
     import { userInfo } from 'node:os';
     import { appendFileSync, existsSync } from 'node:fs';
     export const Browsers = { macOS: () => ['Chrome', 'macOS', '1'] };
     export const DisconnectReason = { loggedOut: 401 };
     export async function useMultiFileAuthState() {
       return { state: { creds: { me: process.env.FAKE_PAIR ? null : { id: '14155551234:1@s.whatsapp.net' } } }, saveCreds: async () => {} };
+    }
+    export async function downloadMediaMessage() {
+      if (process.env.FAKE_DOWNLOAD_ERROR) throw new Error('media expired');
+      return Readable.from([Buffer.from('downloaded attachment')]);
     }
     export default function makeWASocket() {
       const ev = new EventEmitter();
@@ -64,7 +69,7 @@ esac
         ev.emit('connection.update', { connection: 'open' });
         ev.emit('messages.upsert', { type: 'notify', messages: [{
           key: { id: process.env.FAKE_INBOUND_ID || 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' },
-          message: { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
+          message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: '@' + userInfo().username + ' inspect this', mimetype: 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
         }] });
       }, 100);
       return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
@@ -359,3 +364,52 @@ test('reply-image CLI queues a durable image, retries after restart, and cleans 
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
+
+for (const kind of ['imageMessage', 'documentMessage']) {
+for (const harness of ['codex', 'claude']) {
+test(`incoming ${kind} downloads and reaches ${harness} with a private local path`, async () => {
+  const f = setup();
+  const argsFile = join(f.dir, 'args');
+  const codexBin = join(f.dir, 'codex');
+  writeFileSync(codexBin, '#!/bin/sh\nprintf "%s\\n" "$@" > "$CODEX_ARGS_FILE"\n');
+  chmodSync(codexBin, 0o700);
+  writeFileSync(join(f.state, 'target.json'), JSON.stringify({ harness, session: harness, name: harness }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, LOCAL_WHATSAPP_CODEX_BIN: codexBin,
+    CODEX_ARGS_FILE: argsFile, FAKE_MEDIA: kind, LOCAL_WHATSAPP_SESSION: harness };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+  daemon.stderr.on('data', (chunk) => process.stderr.write(chunk));
+  let peer;
+  let content = '';
+  try {
+    if (harness === 'claude') {
+      peer = spawn(process.execPath, [peerSource], { env });
+      peer.stdout.on('data', (chunk) => { content += chunk; });
+      peer.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+      await waitUntil(() => content.includes('Attachment'), 'Claude attachment notice');
+    } else {
+      await waitUntil(() => existsSync(argsFile), 'Codex attachment notice');
+      content = readFileSync(argsFile, 'utf8');
+    }
+    assert.match(content, /Attachment/);
+    assert.match(content, /untrusted/);
+    const saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    const [entry] = Object.values(saved.messages);
+    assert.equal(entry.attachment.size, 21);
+    assert.ok(entry.attachment.path.startsWith(join(f.state, 'media-inbox') + '/'));
+    assert.equal(readFileSync(entry.attachment.path, 'utf8'), 'downloaded attachment');
+    assert.ok(content.includes('media-inbox'));
+    // Acknowledgement and final answer must both reach WhatsApp.
+    for (const text of ['Working on it', 'Finished']) {
+      const reply = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', entry.id, text], { env, encoding: 'utf8' });
+      assert.equal(reply.status, 0, reply.stderr);
+      await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes(text), 'sequential reply');
+    }
+  } finally {
+    if (peer) await stop(peer);
+    await stop(daemon);
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+}
+}

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import pino from 'pino';
-import { REPLY_GUIDANCE, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -229,11 +229,12 @@ async function pair() {
 async function serve() {
   ensurePrivateDir(dir);
   ensurePrivateDir(authPath);
-  const { makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } = await baileys();
+  const { makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason, downloadMediaMessage } = await baileys();
   const initialAuth = await useMultiFileAuthState(authPath);
   if (!initialAuth.state.creds.me) throw new Error('device not paired: run pair first');
   const state = loadState(dir);
   cleanImageOutbox(dir, state);
+  cleanMediaInbox(dir, state, true);
   const peers = new Map();
   const runtimeId = randomUUID();
   let peerSerial = 0;
@@ -242,9 +243,10 @@ async function serve() {
   let draining = false;
   let dispatching = false;
   let handlingControls = false;
+  let inboundQueue = Promise.resolve();
 
   async function sendViaCodex(name, message) {
-    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption]. ${REPLY_GUIDANCE}`;
+    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}${attachmentNotice(message)}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption]. ${REPLY_GUIDANCE}`;
     return new Promise((resolve) => {
       const child = spawn(codexBin, ['queue', '--thread', name, '--message', text], { stdio: 'ignore' });
       const timeout = setTimeout(() => child.kill(), 10000);
@@ -318,6 +320,7 @@ async function serve() {
           for (const old of completed.slice(0, Math.max(0, completed.length - 1000))) delete state.messages[old.id];
           saveState(dir, state);
           cleanImageOutbox(dir, state);
+          cleanMediaInbox(dir, state);
         } catch (error) { process.stderr.write(`reply send failed: ${error.message}\n`); break; }
       }
     } finally { draining = false; }
@@ -423,36 +426,42 @@ async function serve() {
     const socket = makeWASocket({ auth: credentials, browser: Browsers.macOS('Chrome'), printQRInTerminal: false, syncFullHistory: false, logger });
     whatsapp = socket;
     socket.ev.on('creds.update', saveCreds);
-    socket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const message of messages) {
-        const inbound = parseInbound(message, credentials.creds, state.sentIds, `@${userInfo().username}`);
-        if (!inbound) continue;
-        try {
-          const control = inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
-            inbound.text.startsWith('/profile');
-          if (control) inbound.control = true;
-          else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
-          if (addInbound(state, inbound)) {
-            saveState(dir, state);
-            if (control) await handleControls();
-            else {
-              let dispatchError = null;
-              try { await dispatch(); }
-              catch (error) { dispatchError = error; }
-              const binding = target();
-              const destination = binding ? `${binding.harness} session ${binding.session}` : 'a new session';
-              const delivery = inbound.deliveredTo ? 'routed to' : 'waiting for';
-              if (dispatchError) process.stderr.write(`dispatch failed: ${dispatchError.message}\n`);
-              if (debugReceipts) inbound.ack = { text: dispatchError
-                ? `Box: ${dispatchError.message}`
-                : `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
+    socket.ev.on('messages.upsert', ({ messages, type }) => {
+      inboundQueue = inboundQueue.then(async () => {
+        if (type !== 'notify') return;
+        for (const message of messages) {
+          const inbound = parseInbound(message, credentials.creds, state.sentIds, `@${userInfo().username}`);
+          if (!inbound || Object.hasOwn(state.messages, inbound.id)) continue;
+          try {
+            if (Object.values(state.messages).filter((m) => !m.reply).length >= 200) throw new Error('inbox full');
+            if (inbound.attachment) {
+              await receiveAttachment(dir, inbound, () => downloadMediaMessage(message, 'stream', { options: { timeout: 60000 } }, { logger, reuploadRequest: socket.updateMediaMessage }));
             }
-            saveState(dir, state);
-            await drainReplies();
-          }
-        } catch (error) { process.stderr.write(`inbound failed: ${error.message}\n`); }
-      }
+            const control = !inbound.attachment && (inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
+              inbound.text.startsWith('/profile'));
+            if (control) inbound.control = true;
+            else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
+            if (addInbound(state, inbound)) {
+              saveState(dir, state);
+              if (control) await handleControls();
+              else {
+                let dispatchError = null;
+                try { await dispatch(); }
+                catch (error) { dispatchError = error; }
+                const binding = target();
+                const destination = binding ? `${binding.harness} session ${binding.session}` : 'a new session';
+                const delivery = inbound.deliveredTo ? 'routed to' : 'waiting for';
+                if (dispatchError) process.stderr.write(`dispatch failed: ${dispatchError.message}\n`);
+                if (debugReceipts) inbound.ack = { text: dispatchError
+                  ? `Box: ${dispatchError.message}`
+                  : `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
+              }
+              saveState(dir, state);
+              await drainReplies();
+            }
+          } catch (error) { process.stderr.write(`inbound failed: ${error.message}\n`); }
+        }
+      }).catch((error) => process.stderr.write(`inbound batch failed: ${error.message}\n`));
     });
     socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
       if (whatsapp !== socket) return;

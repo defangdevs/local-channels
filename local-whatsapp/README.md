@@ -141,5 +141,26 @@ caption. No public URL, new account, or re-pairing is required.
 A message ID accepts one reply, either text or an image. Repeating the same image
 bytes and caption is idempotent; trying to replace a reply is rejected. As with
 text replies, a crash after WhatsApp accepts a send but before the bridge records
-success can cause a duplicate. Inbound images and documents are a separate
-capability and are not forwarded by this release.
+success can cause a duplicate. Inbound images and documents are supported as described below.
+
+## Receiving images and files
+
+Send an image or document to Message Yourself with a caption beginning with
+`@agent ` (replace `agent` with the bridge Linux username). A caption of just
+`@agent` also works. Captionless attachments and attachments from other chats
+are ignored. View-once media is not imported.
+
+The bridge downloads at most 20 MiB per attachment, streams it into its private
+`media-inbox` directory, and includes the absolute path and metadata in the
+Codex message or Claude channel notification. Agents can inspect images using
+their local image viewer and read documents with their file tools. Filenames
+and contents are untrusted data; the bridge never executes or extracts files.
+A download failure is delivered as an attachment error, so the agent can ask
+for a resend. Files stay private on this box and are not put in downloads.
+
+The media inbox is capped at 200 MiB. Files are kept while their message is
+retained; files for pruned messages and interrupted downloads are cleaned on
+startup and after replies. Copy files elsewhere if they need to be preserved.
+If storage fills, remove older attachments or copy them elsewhere before resending.
+Text acknowledgements, progress updates, and final replies can be sent
+sequentially for one message; repeating an already sent text is a no-op.
