@@ -44,7 +44,7 @@ class Rig(unittest.TestCase):
         self.tr = slack.Tracker(
             self.store, {'C1': self.cfg}, BOT, lambda a, p: self.events.append((a, p)),
             now=lambda: self.t[0], react=lambda c, ts, e: self.reacts.append((c, ts, e)),
-            lookup=lambda c, ts: self.extra.get(ts))
+            lookup=lambda c, ts: self.extra.get(ts), users=lambda uid: {'guest': False, 'external': False})
 
     def actions(self):
         return [a for a, _ in self.events]
@@ -222,6 +222,7 @@ class TestTracker(Rig):
         self.assertEqual(self.actions()[-1], 'feedback')
 
     def test_channel_shared_flags_external(self):
+        self.cfg['allow_external'] = True
         self.tr.handle({'team_id': 'T1', 'event_id': 'cs', 'event': {'type': 'channel_shared', 'channel': 'C1'}})
         self.tr.handle(msg('1.1'))
         self.assertTrue(self.events[0][1]['external'])
@@ -318,14 +319,14 @@ class TestText(unittest.TestCase):
     def test_mentions_become_tokens(self):
         self.assertEqual(self.c('ping @alex in #dev'), 'ping <@U9> in <#C9>')
 
-    def test_unknown_mention_is_an_error(self):
-        with self.assertRaises(slack.Refused):
-            self.c('hi @nobody')
+    def test_unknown_names_stay_literal_text(self):
+        self.assertEqual(self.c('hi @nobody, see #general'), 'hi @nobody, see #general')
+        self.assertEqual(self.c('PR #42, colour #fff, thanks @alice.'), 'PR #42, colour #fff, thanks @alice.')
+        self.assertEqual(self.c('ping @alex.'), 'ping <@U9>.')
 
     def test_smuggled_token_is_refused_or_escaped(self):
         self.assertEqual(self.c('quoted &lt;!channel&gt;'), 'quoted &amp;lt;!channel&amp;gt;')
-        with self.assertRaises(slack.Refused):
-            self.c('<!channel> hello')
+        self.assertEqual(self.c('<!channel> hello'), '&lt;!channel&gt; hello')   # inert text
         with self.assertRaises(slack.Refused):
             self.c('@channel hello')
         # a raw token the agent wrote is escaped, never live
@@ -401,6 +402,9 @@ class TestConfigAndBuckets(unittest.TestCase):
         self.assertGreater(b.limited, 0)
 
 
+TS = '1700000000.000100'
+
+
 class TestWriter(unittest.TestCase):
     def setUp(self):
         self.calls = []
@@ -408,29 +412,32 @@ class TestWriter(unittest.TestCase):
         class W:
             def call(s, method, params=None, **kw):
                 self.calls.append((method, params))
-                return {'ok': True, 'ts': '9.9', 'members': [], 'channels': []}
+                return {'ok': True, 'ts': '1700000009.000900', 'members': [], 'channels': []}
         self.store = slack.Store(':memory:')
         self.cfg = slack._merge(slack.DEFAULT_CHANNEL, {'write': {'allowed': True}})
         self.w = slack.Writer(W(), self.store, {'C1': self.cfg},
                               slack._merge(slack.DEFAULT_DEFAULTS, {}), BOT, session='s1')
 
+    def ask(self, ts=TS):
+        self.store.x("INSERT INTO threads VALUES ('k','T1','C1',?,'',0,0,0,1,'settled',NULL,1,'','0','',0,0,1)", ts)
+
     def test_on_request_blocks_reply_until_asked(self):
         with self.assertRaises(slack.Refused):
-            self.w.reply('C1', '1.1', 'hello')
-        self.store.x("INSERT INTO threads VALUES ('k','T1','C1','1.1','',0,0,0,1,'settled',NULL,1,'','0','',0,0,1)")
-        self.w.reply('C1', '1.1', 'hello')
+            self.w.reply('C1', TS, 'hello')
+        self.ask()
+        self.w.reply('C1', TS, 'hello')
         m, p = self.calls[-1]
         self.assertEqual((m, p['thread_ts'], p['unfurl_links'], p['unfurl_media']),
-                         ('chat.postMessage', '1.1', False, False))
+                         ('chat.postMessage', TS, False, False))
         self.assertTrue(p['text'].endswith(slack.DEFAULT_DEFAULTS['disclosure']))
         self.assertNotIn('parse', p)
 
     def test_unconfigured_or_readonly_channel_refused(self):
         with self.assertRaises(slack.Refused):
-            self.w.react('C9', '1.1', 'eyes')
+            self.w.react('C9', TS, 'eyes')
         self.cfg['write']['allowed'] = False
         with self.assertRaises(slack.Refused):
-            self.w.react('C1', '1.1', 'eyes')
+            self.w.react('C1', TS, 'eyes')
 
     def test_top_level_needs_flag_and_is_rate_limited(self):
         with self.assertRaises(slack.Refused):
@@ -441,22 +448,278 @@ class TestWriter(unittest.TestCase):
         with self.assertRaises(slack.Refused):
             self.w.post('C1', 'hi')
 
-    def test_status_creates_then_edits_one_message(self):
-        self.w.status('C1', '1.1', 'working')
-        self.w.status('C1', '1.1', 'finished', 'done')
-        self.assertEqual([m for m, _ in self.calls], ['chat.postMessage', 'chat.update'])
-        self.assertTrue(self.calls[-1][1]['text'].startswith('✅'))
-
-    def test_secret_in_outgoing_text_refused_and_never_sent(self):
-        self.store.x("INSERT INTO threads VALUES ('k','T1','C1','1.1','',0,0,0,1,'settled',NULL,1,'','0','',0,0,1)")
-        with self.assertRaises(slack.Refused):
-            self.w.reply('C1', '1.1', 'token xoxb-1234567890-abcdefghij')
+    def test_empty_or_bad_ts_cannot_become_a_top_level_post(self):
+        self.cfg['write']['mode'] = 'always'
+        for bad in ('', 'x', None, '1.1'):
+            with self.assertRaises(slack.Refused):
+                self.w.reply('C1', bad, 'hi')
+            with self.assertRaises(slack.Refused):
+                self.w.status('C1', bad, 'hi')
         self.assertEqual(self.calls, [])
 
-    def test_audit_row_written(self):
-        self.store.x("INSERT INTO threads VALUES ('k','T1','C1','1.1','',0,0,0,1,'settled',NULL,1,'','0','',0,0,1)")
-        self.w.reply('C1', '1.1', 'hello')
-        self.assertEqual(self.store.q('SELECT kind, session FROM audit')[0]['kind'], 'reply')
+    def test_reply_to_a_reply_is_posted_to_the_parent(self):
+        self.ask()
+        self.store.x('INSERT INTO msgs VALUES (?,?,?,?,?,?,?)', 'T1', 'C1', '1700000005.000500', TS, 'U2', 0, 0)
+        self.w.reply('C1', '1700000005.000500', 'hello')
+        self.assertEqual(self.calls[-1][1]['thread_ts'], TS)
+
+    def test_status_is_gated_like_a_reply(self):
+        with self.assertRaises(slack.Refused):      # on_request, nobody asked
+            self.w.status('C1', TS, 'working')
+        self.assertEqual(self.calls, [])
+        self.ask()
+        for i in range(20):
+            self.w.audit('reply', 'C1', TS, '1.%d' % i, 'x')
+        with self.assertRaises(slack.Refused):      # per-session cap
+            self.w.status('C1', TS, 'working')
+
+    def test_status_creates_then_edits_one_message_and_moves_the_reaction(self):
+        self.ask()
+        self.w.status('C1', TS, 'working')
+        self.w.status('C1', TS, 'finished', 'done')
+        methods = [m for m, _ in self.calls]
+        self.assertEqual([m for m in methods if m.startswith('chat.')], ['chat.postMessage', 'chat.update'])
+        self.assertNotIn('✅', [p for m, p in self.calls if m == 'chat.update'][0]['text'])
+        adds = [p['name'] for m, p in self.calls if m == 'reactions.add']
+        removes = [p['name'] for m, p in self.calls if m == 'reactions.remove']
+        self.assertEqual(adds, ['hourglass_flowing_sand', 'white_check_mark'])
+        self.assertIn('eyes', removes)   # the daemon's ack is replaced
+
+    def test_status_edits_do_not_eat_the_session_cap(self):
+        self.ask()
+        self.w.status('C1', TS, 'working')
+        for _ in range(30):
+            self.w.status('C1', TS, 'still working')
+
+    def test_secret_in_outgoing_text_refused_and_never_sent(self):
+        self.ask()
+        with self.assertRaises(slack.Refused):
+            self.w.reply('C1', TS, 'token xoxb-1234567890-abcdefghij')
+        self.assertEqual(self.calls, [])
+
+    def test_audit_row_written_with_the_session(self):
+        self.ask()
+        self.w.reply('C1', TS, 'hello')
+        row = self.store.q('SELECT kind, session FROM audit')[0]
+        self.assertEqual((row['kind'], row['session']), ('reply', 's1'))
+
+    def test_react_is_audited_and_rate_limited(self):
+        self.w.react('C1', TS, 'eyes')
+        self.assertEqual(self.store.q("SELECT COUNT(*) c FROM audit WHERE kind='react'")[0]['c'], 1)
+        for _ in range(25):
+            try:
+                self.w.react('C1', TS, 'eyes')
+            except slack.Refused:
+                break
+        else:
+            self.fail('never rate limited')
+
+    def test_session_name_comes_from_agent_box_session_id(self):
+        old = {k: os.environ.pop(k, None) for k in ('AGENT_BOX_SESSION', 'AGENT_BOX_SESSION_ID')}
+        os.environ['AGENT_BOX_SESSION_ID'] = 'sid-1'
+        try:
+            w = slack.Writer(self.w.web, self.store, {}, {}, BOT)
+            self.assertEqual(w.session, 'sid-1')
+        finally:
+            os.environ.pop('AGENT_BOX_SESSION_ID', None)
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_own_posts_are_indexed_for_feedback(self):
+        self.ask()
+        self.w.reply('C1', TS, 'hello')
+        r = self.store.q("SELECT user, thread_ts FROM msgs WHERE ts='1700000009.000900'")[0]
+        self.assertEqual((r['user'], r['thread_ts']), ('UBOT', TS))
+
+    def test_ambiguous_and_deactivated_names_are_not_resolved(self):
+        members = [{'id': 'U1', 'name': 'sam'}, {'id': 'U2', 'name': 'sam'},
+                   {'id': 'U3', 'name': 'gone', 'deleted': True}, {'id': 'U4', 'name': 'kim'}]
+        self.w.web.call = lambda m, p=None, **kw: {'ok': True, 'members': members}
+        self.assertIsNone(self.w.resolver('@', 'sam'))
+        self.assertIsNone(self.w.resolver('@', 'gone'))
+        self.assertEqual(self.w.resolver('@', 'kim'), 'U4')
+
+
+class TestReviewRegressions(Rig):
+    """Each of these reproduced by running the code in the PR #86 review."""
+
+    DEF = slack._merge(slack.DEFAULT_DEFAULTS, {'links': {'allowed_hosts': ['slack.com', 'github.com']}})
+
+    def c(self, text, write=None):
+        cfg = slack._merge(slack.DEFAULT_CHANNEL, {'write': write or {}})
+        return slack.compose(text, lambda *_: None, cfg, self.DEF)
+
+    def test_broadcast_cannot_slip_past_a_backtick_or_unicode_boundary(self):
+        for text in ('``@channel urgent', '`a`@here', '@here', 'x @everyone y'):
+            with self.assertRaises(slack.Refused, msg=text):
+                self.c(text)
+        self.assertNotIn('<!', self.c('@channelé now'))
+        self.assertEqual(self.c('@here hi', {'broadcast': True}), '<!here> hi')
+
+    def test_link_allowlist_survives_backslash_and_userinfo(self):
+        for url in ('https://evil.com\\@slack.com/x', 'https://evil.com\\.slack.com/x',
+                    'https://user@slack.com/x', 'https://slack.com:99999999/x',
+                    'https://\u0455lack.com/x', 'https://[::1]/x'):
+            with self.assertRaises(slack.Refused, msg=url):
+                self.c('see ' + url)
+
+    def test_schemeless_links_are_checked(self):
+        for text in ('see evil.com/?d=secret', 'see www.evil.org', 'mail mailto:a@evil.com'):
+            with self.assertRaises(slack.Refused, msg=text):
+                self.c(text)
+        self.assertEqual(self.c('see github.com/o/r and README.md'), 'see github.com/o/r and README.md')
+
+    def test_kebab_case_is_not_a_secret(self):
+        self.assertEqual(self.c('branch sk-feature-improve-the-login-flow-now'), 'branch sk-feature-improve-the-login-flow-now')
+        with self.assertRaises(slack.Refused):
+            self.c('key sk-' + 'a1' * 20)
+        with self.assertRaises(slack.Refused):       # zero-width characters do not hide a token
+            self.c('key AKIA\u200bABCDEFGHIJKLMNOP')
+
+    def test_controllers_fail_closed_without_a_users_lookup(self):
+        tr = slack.Tracker(self.store, {'C1': self.cfg}, BOT, lambda a, p: self.events.append((a, p)),
+                           now=lambda: self.t[0])
+        tr.handle(msg('1.1'))
+        tr.handle(reaction('1.1', 'white_check_mark'))
+        self.assertEqual(self.actions(), ['message.posted'])
+
+    def test_users_lookup_fails_closed_on_error_and_reads_flags(self):
+        class W:
+            def call(s, m, p=None, **kw):
+                if p['user'] == 'UERR':
+                    raise slack.SlackError('boom')
+                return {'user': {'is_restricted': p['user'] == 'UG', 'is_stranger': p['user'] == 'UX'}}
+        look = slack.make_users_lookup(W())
+        self.assertEqual(look('UERR'), {'guest': True, 'external': True})
+        self.assertEqual(look('UG'), {'guest': True, 'external': False})
+        self.assertEqual(look('UX'), {'guest': False, 'external': True})
+        self.assertEqual(look('UM'), {'guest': False, 'external': False})
+
+    def test_reads_are_form_encoded_and_writes_are_json(self):
+        sent = []
+
+        class R:
+            def read(s):
+                return b'{"ok": true}'
+
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                pass
+        old = slack.urllib.request.urlopen
+        slack.urllib.request.urlopen = lambda req, timeout=0: sent.append(req) or R()
+        try:
+            w = slack.Web('xoxb-test')
+            w.call('conversations.replies', {'channel': 'C1', 'ts': '1.1', 'limit': 1})
+            w.call('chat.postMessage', {'channel': 'C1', 'text': 'x'}, write=True)
+        finally:
+            slack.urllib.request.urlopen = old
+        self.assertEqual(sent[0].get_header('Content-type'), 'application/x-www-form-urlencoded')
+        self.assertIn(b'channel=C1', sent[0].data)
+        self.assertTrue(sent[1].get_header('Content-type').startswith('application/json'))
+
+    def test_a_failure_while_handling_does_not_burn_the_event_id(self):
+        boom = [True]
+
+        def emit(a, p):
+            if boom[0]:
+                raise RuntimeError('db')
+            self.events.append((a, p))
+        self.tr.emit = emit
+        with self.assertRaises(RuntimeError):
+            self.tr.handle(msg('1.1', eid='E1'))
+        boom[0] = False
+        self.tr.handle(msg('1.1', eid='E1'))      # Slack's redelivery is processed, not dropped
+        self.assertEqual(self.actions(), ['message.posted'])
+
+    def test_feedback_resolves_and_never_reopens_the_thread(self):
+        self.tr.handle(msg('1.1'))
+        self.advance(601)
+        self.tr.tick()                                   # settled
+        self.tr.handle(msg('1.5', user='UBOT', thread_ts='1.1'))   # our own reply, indexed not counted
+        self.assertEqual(self.actions().count('thread.settled'), 1)
+        self.tr.handle(reaction('1.5', '+1'))
+        self.tr.handle(reaction('1.5', 'tada'))
+        self.assertEqual(self.actions()[-1], 'feedback')
+        self.assertNotIn('thread.reopened', self.actions())
+        self.assertNotIn('reaction.added', self.actions())
+
+    def test_merged_message_still_emits_and_a_mention_in_it_settles(self):
+        self.cfg['merge_window_minutes'] = 10
+        self.tr.handle(msg('1.1'))
+        self.advance(60)
+        self.tr.handle(msg('2.1', 'also <@UBOT> please'))
+        self.assertEqual(self.actions(), ['message.posted', 'message.posted', 'thread.settled'])
+        self.assertEqual(self.events[-1][1]['reason'], 'mention')
+
+    def test_activity_during_a_hold_moves_the_version(self):
+        self.tr.handle(msg('1.1'))
+        self.tr.handle(reaction('1.1', 'raised_hand'))
+        v = self.store.q('SELECT version FROM threads')[0]['version']
+        self.tr.handle(msg('1.2', thread_ts='1.1'))
+        self.assertEqual(self.store.q('SELECT version FROM threads')[0]['version'], v + 1)
+
+    def test_other_apps_bots_without_the_subtype_are_not_human_activity(self):
+        self.tr.handle(msg('1.1', user=None, bot_id='BOTHER'))
+        self.assertEqual(self.events, [])
+
+    def test_external_channels_need_an_opt_in_and_survive_restart(self):
+        self.tr.prime('C1', {'is_ext_shared': True, 'is_member': True})
+        self.tr.handle(msg('1.1'))
+        self.assertEqual(self.events, [])
+        self.cfg['allow_external'] = True
+        self.tr.handle(msg('1.2'))
+        self.assertTrue(self.events[0][1]['external'])
+
+    def test_a_dead_bus_leaves_the_outbox_rows(self):
+        self.store.outbox_put('thread.settled', {'team': 'T', 'channel': 'C', 'n': 1})
+        self.store.outbox_put('thread.settled', {'team': 'T', 'channel': 'C', 'n': 2})
+        self.assertEqual(slack.drain_outbox(self.store, lambda a, p: False), 0)
+        self.assertEqual(self.store.q('SELECT COUNT(*) c FROM outbox')[0]['c'], 2)
+        got = []
+        self.assertEqual(slack.drain_outbox(self.store, lambda a, p: got.append(p['n']) or True), 2)
+        self.assertEqual(got, [1, 2])        # in order, then gone
+        self.assertIsNone(self.store.outbox_next())
+
+
+class TestBusRouting(unittest.TestCase):
+    """An emitted payload must be routable by a `slack:T/C` subscription once
+    the source has keyPath `route` -- the thing that made nothing reach a
+    session in the first cut."""
+
+    def test_emitted_payload_matches_a_channel_subscription(self):
+        wspec = importlib.util.spec_from_file_location('webhook_for_slack', os.path.join(REPO, 'local-webhook', 'webhook.py'))
+        d = tempfile.mkdtemp()
+        os.environ['LOCAL_WEBHOOK_STATE_DIR'] = d
+        try:
+            webhook = importlib.util.module_from_spec(wspec)
+            wspec.loader.exec_module(webhook)
+        finally:
+            del os.environ['LOCAL_WEBHOOK_STATE_DIR']
+        captured = []
+        old = slack.subprocess.run
+        slack.subprocess.run = lambda cmd, input=None, **kw: captured.append((cmd, input)) or type('R', (), {'returncode': 0})()
+        os.environ['LOCAL_SLACK_EMIT'] = 'webhook.py emit'
+        try:
+            self.assertTrue(slack.make_emitter()('thread.settled', {'team': 'T0123', 'channel': 'C0456', 'thread': '1.1'}))
+        finally:
+            slack.subprocess.run = old
+            del os.environ['LOCAL_SLACK_EMIT']
+        cmd, body = captured[0]
+        self.assertEqual(cmd, ['webhook.py', 'emit', 'slack', '-', '--event', 'thread.settled'])   # payload on stdin, not argv
+        payload = json.loads(body)
+        key = webhook.get_path(payload, 'route')           # the README's keyPath
+        self.assertEqual(key, 'T0123/C0456')
+        self.assertTrue(webhook.match_topic('slack', key, 'slack:T0123/C0456'))
+        self.assertFalse(webhook.match_topic('slack', key, 'slack:T0123/C9999'))
+
+    def test_default_emit_command_is_one_that_exists(self):
+        os.environ.pop('LOCAL_SLACK_EMIT', None)
+        cmd = slack.emit_command()
+        self.assertEqual(cmd[1:], [os.path.normpath(os.path.join(REPO, 'local-webhook', 'webhook.py')), 'emit'])
+        self.assertTrue(os.path.isfile(cmd[1]))
 
 
 class TestCliSmoke(unittest.TestCase):
@@ -467,6 +730,38 @@ class TestCliSmoke(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(slack.main(['--help']), 0)
         self.assertIn('slack.py daemon', buf.getvalue())
+
+    def test_channel_edit_refuses_a_corrupt_file_and_keeps_hand_tuning(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'c.json')
+            open(p, 'w').write('{"C1": {"controllers": ["U1"], "write": {"allowed": true, "mode": "always"}}, "C2": {}')
+            with self.assertRaises(slack.Refused):
+                slack.channel_add('C3', [], None, p)
+            self.assertIn('"C2"', open(p).read())            # untouched
+            open(p, 'w').write('{"C1": {"controllers": ["U1"], "write": {"allowed": true, "mode": "always"}}, "C2": {}}')
+            slack.channel_add('C1', ['--quiet', '5'], None, p)
+            raw = json.load(open(p))
+            self.assertEqual(raw['C1']['controllers'], ['U1'])
+            self.assertEqual(raw['C1']['write']['mode'], 'always')
+            self.assertEqual(raw['C1']['quiet_minutes'], 5)
+            self.assertIn('C2', raw)
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_channel_add_checks_membership_and_connect(self):
+        class W:
+            def __init__(s, info):
+                s.info = info
+
+            def call(s, m, p=None, **kw):
+                return {'channel': s.info}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'c.json')
+            with self.assertRaises(slack.Refused):
+                slack.channel_add('C1', [], W({'is_member': False}), p)
+            with self.assertRaises(slack.Refused):
+                slack.channel_add('C1', [], W({'is_member': True, 'is_ext_shared': True}), p)
+            slack.channel_add('C1', ['--allow-external'], W({'is_member': True, 'is_ext_shared': True}), p)
+            self.assertTrue(json.load(open(p))['C1']['allow_external'])
 
     def test_channel_add_rm(self):
         with tempfile.TemporaryDirectory() as d:

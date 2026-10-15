@@ -77,7 +77,8 @@ SECRET_PATTERNS = [
     re.compile(r'gh[pousr]_[A-Za-z0-9]{30,}'),
     re.compile(r'github_pat_[A-Za-z0-9_]{40,}'),
     re.compile(r'AKIA[0-9A-Z]{16}'),
-    re.compile(r'sk-[A-Za-z0-9_-]{20,}'),
+    # Needs a digit: a kebab-case branch name is not a key (`sk-` + 32 letters).
+    re.compile(r'sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}'),
     re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
     re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
 ]
@@ -88,10 +89,18 @@ class Refused(Exception):
     rule but never echoes the matched secret."""
 
 
+_ZERO_WIDTH_RE = re.compile('[\u200b-\u200f\u2060\ufeff]')
+
+
 def scan_secrets(text, extra=()):
     # Look at the text as written AND with percent-escapes decoded, so a token
     # smuggled into a URL query is found (PromptArmor-style exfiltration).
-    seen = {text, urllib.parse.unquote(text)}
+    # Zero-width characters split a token for the scanner and not for a reader,
+    # so scan the text with them removed too.
+    seen = set()
+    for t in (text, urllib.parse.unquote(text)):
+        seen.add(t)
+        seen.add(_ZERO_WIDTH_RE.sub('', t))
     for pat in list(SECRET_PATTERNS) + [re.compile(p) for p in extra]:
         for t in seen:
             if pat.search(t):
@@ -100,11 +109,24 @@ def scan_secrets(text, extra=()):
 
 _URL_RE = re.compile(r'https?://[^\s<>|)\]]+', re.I)
 _IMAGE_MD_RE = re.compile(r'!\[[^\]]*\]\([^)]*\)')
+# A name is dot/dash/underscore-joined alphanumerics, so `thanks @alice.` names
+# alice and not `alice.`; the lookahead keeps `@channelé` from resolving as
+# `@channel` (the ASCII class and Unicode \w would otherwise disagree).
 # `;` in the lookbehind: after escaping, a raw `<@U1>` the agent wrote reads
 # `&lt;@U1&gt;`, and that `@U1` must stay inert text, not be resolved.
-_MENTION_RE = re.compile(r'(?<![\w`<;])([@#])([A-Za-z0-9._-]+)')
+_MENTION_RE = re.compile(r'(?<![\w`<;])([@#])([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)(?![\w@])')
 _CODE_RE = re.compile(r'```.*?```|`[^`\n]*`', re.S)
-_BROADCAST_RE = re.compile(r'<!(channel|here|everyone)\b[^>]*>|(?<![\w`])@(channel|here|everyone)\b', re.I)
+BROADCASTS = ('channel', 'here', 'everyone')
+# Text Slack may turn into a link without a scheme: www.x, a bare domain on a
+# common TLD, and non-http schemes. All of them get the same host check as an
+# explicit URL, because whether Slack linkifies them is not ours to decide.
+_TLDS = ('com|net|org|io|dev|app|ai|co|us|uk|de|fr|eu|ru|cn|jp|in|br|au|ca|ch|nl|se|no|es|it|pl|info|biz|xyz|sh|me|tv|cc|to|ly|gg|cloud|tech|online|site|link|zip|mov')
+_BARE_HOST_RE = re.compile(r'(?<![\w@./:-])(?:www\.|(?=[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:%s)\b))'
+                           r'[a-z0-9-]+(?:\.[a-z0-9-]+)*(?:\.(?:%s))?(?::\d+)?(?:/[^\s<>|)\]]*)?' % (_TLDS, _TLDS), re.I)
+_SCHEME_RE = re.compile(r'\b(?:mailto|ftp|ftps|file|javascript|data|tel|sms|slack):[^\s<>|)\]]+', re.I)
+# RFC 3986 characters only: a backslash, a space or a control character is
+# read one way by urlsplit and another by a browser (`evil.com\@slack.com`).
+_URL_CHARS_RE = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
 
 
 def _host_allowed(host, allowed):
@@ -113,15 +135,25 @@ def _host_allowed(host, allowed):
 
 
 def check_link(url, allowed_hosts):
-    p = urllib.parse.urlsplit(url)
-    host = (p.hostname or '').lower()
+    if not _URL_CHARS_RE.fullmatch(url):
+        raise Refused('link has characters outside RFC 3986 (such as a backslash)')
+    try:
+        p = urllib.parse.urlsplit(url if '//' in url else '//' + url)
+        host = (p.hostname or '').lower()
+        p.port  # noqa: B018 — raises ValueError on a bad port
+    except ValueError:
+        raise Refused('link does not parse')
+    if '@' in p.netloc:
+        raise Refused('link with userinfo (user@host) is refused')
+    if not re.fullmatch(r'[a-z0-9.-]+', host):
+        raise Refused('link host "%s" is not plain ASCII' % host)
     if not _host_allowed(host, allowed_hosts):
         raise Refused('link host "%s" is not in links.allowed_hosts' % host)
     # A link can still carry data out in its tail; cap it and scan it decoded.
-    for part in (p.query, p.fragment):
+    for part in (p.path, p.query, p.fragment):
         dec = urllib.parse.unquote(part)
         if len(dec) > 256:
-            raise Refused('link query/fragment over 256 characters')
+            raise Refused('link path/query/fragment over 256 characters')
         scan_secrets(dec)
 
 
@@ -134,8 +166,6 @@ def compose(text, resolver, cfg, defaults):
     write = cfg.get('write', {})
     if _IMAGE_MD_RE.search(text):
         raise Refused('image Markdown is refused; use upload')
-    if _BROADCAST_RE.search(text) and not write.get('broadcast'):
-        raise Refused('@channel / @here / @everyone need write.broadcast')
     scan_secrets(text, defaults.get('secret_patterns', ()))
 
     allowed_hosts = list(defaults.get('links', {}).get('allowed_hosts', []))
@@ -168,6 +198,13 @@ def compose(text, resolver, cfg, defaults):
             p2 = m.end()
         pieces.append(('t', seg[p2:]))
         for kind, chunk in pieces:
+            if kind != 't':
+                continue
+            for m in _SCHEME_RE.finditer(chunk):
+                raise Refused('links other than http(s) are refused: %s:' % m.group(0).split(':')[0])
+            for m in _BARE_HOST_RE.finditer(chunk):
+                check_link(m.group(0), allowed_hosts)
+        for kind, chunk in pieces:
             if kind == 'u':
                 host = urllib.parse.urlsplit(chunk).hostname
                 tok = '<%s|%s>' % (chunk, host)
@@ -178,14 +215,22 @@ def compose(text, resolver, cfg, defaults):
 
             def mention(m):
                 sigil, name = m.group(1), m.group(2)
-                if sigil == '@' and name.lower() in ('channel', 'here', 'everyone'):
-                    # Only reachable with write.broadcast (refused above otherwise).
+                if sigil == '@' and name.lower() in BROADCASTS:
+                    # The one place a broadcast token is made, so the flag is
+                    # checked where the token is, whatever the text around it.
+                    if not write.get('broadcast'):
+                        raise Refused('@channel / @here / @everyone need write.broadcast')
                     tok = '<!%s>' % name.lower()
                     inserted.append(tok)
                     return tok
+                if sigil == '#' and name.isdigit():
+                    return sigil + name   # `PR #42` is text, not a channel
                 rid = resolver(sigil, name)
                 if not rid:
-                    raise Refused('unknown %s%s' % (sigil, name))
+                    # Not a known person or channel: leave it as the literal
+                    # text it is. Only what would become a live token is
+                    # refused or resolved.
+                    return sigil + name
                 if rid.startswith('S'):  # user group
                     if not write.get('groups'):
                         raise Refused('@group mentions need write.groups')
@@ -267,15 +312,39 @@ def load_config(path=None):
     return channels, defaults
 
 
-def save_config(channels, defaults, path=None):
+def read_raw(path=None):
+    """The file as written, for EDITING. load_config fails closed (a bad file
+    means no channels), which is right for the daemon and wrong for `channel
+    add`: saving over that view would wipe every other channel. So an edit
+    refuses to touch a file that exists and does not parse."""
+    path = path or config_path()
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise Refused('%s does not parse (%s); fix it by hand before editing' % (path, e))
+    if not isinstance(raw, dict):
+        raise Refused('%s is not a JSON object; fix it by hand before editing' % path)
+    return raw
+
+
+def write_raw(doc, path=None):
     path = path or config_path()
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    doc = dict(channels)
-    doc['_defaults'] = defaults
     tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
+    # 0600: the file names channels and the people allowed to be DMed.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
         json.dump(doc, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
+
+
+def save_config(channels, defaults, path=None):
+    doc = dict(channels)
+    doc['_defaults'] = defaults
+    write_raw(doc, path)
 
 
 def labels_overlap(labels):
@@ -300,6 +369,8 @@ CREATE TABLE IF NOT EXISTS threads(thread_key TEXT PRIMARY KEY, team TEXT, chann
                                    state TEXT, held_by TEXT, settled_version INTEGER,
                                    extra_ts TEXT, external INTEGER, participants TEXT,
                                    replies INTEGER, ended_at REAL, asked INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL,
+                                   action TEXT, payload TEXT);
 CREATE TABLE IF NOT EXISTS status (thread_key TEXT PRIMARY KEY, ts TEXT);
 CREATE TABLE IF NOT EXISTS audit  (at REAL, channel TEXT, thread TEXT, ts TEXT,
                                    session TEXT, kind TEXT, text TEXT);
@@ -325,19 +396,36 @@ class Store:
         with self.lock:
             return self.db.execute(sql, args).rowcount
 
-    def first_time(self, event_id, now):
-        """True the first time an event_id is seen (24 h memory)."""
+    def seen(self, event_id):
         if not event_id:
-            return True
-        with self.lock:
-            try:
-                self.db.execute('INSERT INTO seen VALUES (?,?)', (event_id, now))
-                return True
-            except sqlite3.IntegrityError:
-                return False
+            return False
+        return bool(self.q('SELECT 1 FROM seen WHERE event_id=?', event_id))
+
+    def mark_seen(self, event_id, now):
+        """Recorded AFTER an event is processed: marking first would let a
+        failure inside handle() lose the event for good, because Slack's
+        redelivery would then be dropped as a duplicate."""
+        if event_id:
+            self.x('INSERT OR IGNORE INTO seen VALUES (?,?)', event_id, now)
+
+    # The outbox makes "persisted" mean "will reach the bus": the tracker
+    # writes the event in the same pass that changes the thread, a worker
+    # delivers it and deletes the row only on success. That also keeps the
+    # emit subprocess out of the 3-second Socket Mode acknowledgement window.
+    def outbox_put(self, action, payload):
+        self.x('INSERT INTO outbox (at, action, payload) VALUES (?,?,?)',
+               time.time(), action, json.dumps(payload))
+
+    def outbox_next(self):
+        r = self.q('SELECT * FROM outbox ORDER BY id LIMIT 1')
+        return r[0] if r else None
+
+    def outbox_done(self, row_id):
+        self.x('DELETE FROM outbox WHERE id=?', row_id)
 
     def prune(self, now, retention_days=30, audit_days=90):
         self.x('DELETE FROM seen WHERE at < ?', now - 86400)
+        self.x('DELETE FROM outbox WHERE at < ?', now - 7 * 86400)  # a bus down a week is not coming back
         cut = now - retention_days * 86400
         gone = self.q("SELECT team, channel, thread_ts FROM threads "
                       "WHERE state IN ('settled','dropped') AND ended_at < ?", cut)
@@ -362,7 +450,7 @@ class Store:
                '%/' + channel + '/%', channel + '/%')
 
     def purge_all(self):
-        for t in ('seen', 'msgs', 'threads', 'status', 'audit'):
+        for t in ('seen', 'msgs', 'threads', 'status', 'audit', 'outbox'):
             self.x('DELETE FROM %s' % t)
 
 
@@ -386,7 +474,10 @@ class Tracker:
         self.emit, self.now = emit, now
         self.retention_days = retention_days
         self.lookup = lookup or (lambda channel, ts: None)
-        self.users = users or (lambda uid: {'guest': False, 'external': False})
+        # Fails CLOSED: with no way to ask Slack who a user is, nobody counts as a
+        # full member, so nobody can ready, hold or drop a thread.
+        self.users = users or (lambda uid: {'guest': True, 'external': True})
+        self.lock = threading.RLock()
         self.react = react or (lambda channel, ts, emoji: None)
         self.classify = classify or (lambda cfg, key: None)
         self.external = {}   # channel -> bool, flipped by channel_shared events
@@ -429,22 +520,33 @@ class Tracker:
     # -- entry point --------------------------------------------------------
     def handle(self, envelope):
         """`envelope` is a Socket Mode events_api payload (or an HTTP event
-        callback body): {'team_id','event_id','event':{...}}."""
-        now = self.now()
-        if not self.store.first_time(envelope.get('event_id'), now):
-            return
-        team = envelope.get('team_id') or (envelope.get('event') or {}).get('team') or ''
-        ev = envelope.get('event') or {}
-        etype = ev.get('type')
-        if etype == 'message':
-            self._message(team, ev, now)
-        elif etype in ('reaction_added', 'reaction_removed'):
-            self._reaction(team, ev, etype, now)
-        elif etype in ('channel_shared', 'channel_unshared'):
-            self.external[ev.get('channel')] = (etype == 'channel_shared')
-        elif etype == 'member_left_channel':
-            if self._is_bot_self(user=ev.get('user')):
-                self.member[ev.get('channel')] = False
+        callback body): {'team_id','event_id','event':{...}}. One lock covers
+        this and tick(): both read-modify-write `threads`, and an unlocked
+        reply could be stranded in a thread the ticker just settled."""
+        with self.lock:
+            now = self.now()
+            eid = envelope.get('event_id')
+            if self.store.seen(eid):
+                return
+            team = envelope.get('team_id') or (envelope.get('event') or {}).get('team') or ''
+            ev = envelope.get('event') or {}
+            etype = ev.get('type')
+            if etype == 'message':
+                self._message(team, ev, now)
+            elif etype in ('reaction_added', 'reaction_removed'):
+                self._reaction(team, ev, etype, now)
+            elif etype in ('channel_shared', 'channel_unshared'):
+                self.external[ev.get('channel')] = (etype == 'channel_shared')
+            elif etype == 'member_left_channel':
+                if self._is_bot_self(user=ev.get('user')):
+                    self.member[ev.get('channel')] = False
+            self.store.mark_seen(eid, now)
+
+    def prime(self, channel, info):
+        """Seed per-channel facts from conversations.info, so `external` and
+        membership survive a restart (events only ever flip them)."""
+        self.external[channel] = bool(info.get('is_ext_shared'))
+        self.member[channel] = bool(info.get('is_member', True))
 
     # -- messages -----------------------------------------------------------
     def _message(self, team, ev, now):
@@ -452,16 +554,23 @@ class Tracker:
         cfg = self.channels.get(channel)
         if cfg is None or self.member.get(channel) is False:
             return  # the config is the allowlist
+        if self.external.get(channel) and not cfg['allow_external']:
+            return  # a Slack Connect channel nobody opted in to
         sub = ev.get('subtype')
         if sub in ('message_changed', 'message_deleted'):
             return self._edit_or_delete(team, ev, sub, cfg, now)
-        if sub == 'bot_message':
-            if not cfg['track_bots'] or self._is_bot_self(bot_id=ev.get('bot_id')):
-                return
-        elif sub not in (None, 'file_share', 'me_message', 'thread_broadcast'):
+        if sub not in (None, 'file_share', 'me_message', 'thread_broadcast', 'bot_message'):
             return  # joins, topic changes and the rest of the system subtypes
         if self._is_bot_self(ev.get('user'), ev.get('bot_id')):
-            return  # our own echo is never activity
+            # Our own echo is never activity, but it IS indexed: a 👍/👎 on it
+            # has to resolve to its thread to become `feedback`.
+            self.store.x('INSERT OR REPLACE INTO msgs VALUES (?,?,?,?,?,?,?)', team, channel,
+                         ev.get('ts'), ev.get('thread_ts') or ev.get('ts'),
+                         self.bot.get('user_id'), 1, now)
+            return
+        if (ev.get('bot_id') or sub == 'bot_message') and not cfg['track_bots']:
+            # Other apps often post with a bot_id and no bot_message subtype.
+            return
         user = ev.get('user') or ev.get('bot_id') or ''
         if user in cfg['ignore_users']:
             return
@@ -473,6 +582,7 @@ class Tracker:
         mentioned = ('<@%s>' % self.bot.get('user_id')) in (ev.get('text') or '')
         key = self._key(team, channel, thread_ts)
         row = self._row(key)
+        merged = False
         if row is None:
             if not is_top:
                 # A reply in a thread we never started: only a mention can
@@ -484,9 +594,12 @@ class Tracker:
                     return
             elif cfg['track'].startswith('reaction:'):
                 return  # started by the reaction, not the message
-            row = self._start(team, channel, thread_ts, ev, cfg, now, user)
-            if row is None:
-                return  # attached to a merge window instead
+            row, merged = self._start(team, channel, thread_ts, ev, cfg, now, user)
+            if merged:
+                # Attached to an open record by the merge window: it is still a
+                # message on that record, and a mention in it still counts.
+                key = row['thread_key']
+                row = self._row(key)
         else:
             self._bump(row, cfg, now, user, reply=not is_top)
             row = self._row(key)
@@ -513,19 +626,29 @@ class Tracker:
                 extra = ','.join([x for x in (r['extra_ts'] or '').split(',') if x] + [ev.get('ts')])
                 self.store.x('UPDATE threads SET extra_ts=? WHERE thread_key=?', extra, r['thread_key'])
                 self._bump(r, cfg, now, user, reply=False)
-                return None
+                return r, True
         key = self._key(team, channel, thread_ts)
         quiet, maxw = cfg['quiet_minutes'] * 60, cfg['max_wait_hours'] * 3600
         ext = 1 if (self.external.get(channel)) else 0
         self.store.x('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)',
                      key, team, channel, thread_ts, sanitize_title(ev.get('text')), now, now,
                      min(now + quiet, now + maxw), 1, 'open', None, 0, '', ext, user, 0, None)
-        return self._row(key)
+        return self._row(key), False
 
     def _bump(self, row, cfg, now, user, reply):
         """Activity: bump version, push settle_at out (capped by max_wait)."""
         state = row['state']
-        if state in ('dropped', 'held'):
+        if state == 'dropped':
+            return
+        if state == 'held':
+            # A hold stops the clock, not the count: activity still moves the
+            # version, so the record does not re-settle at an unchanged one.
+            parts = [x for x in (row['participants'] or '').split(',') if x]
+            if user and user not in parts:
+                parts.append(user)
+            self.store.x('UPDATE threads SET version=version+1, last_activity_at=?, participants=?, '
+                         'replies=replies+? WHERE thread_key=?', now, ','.join(parts),
+                         1 if reply else 0, row['thread_key'])
             return
         quiet, maxw = cfg['quiet_minutes'] * 60, cfg['max_wait_hours'] * 3600
         if state == 'settled':
@@ -595,6 +718,8 @@ class Tracker:
         cfg = self.channels.get(channel)
         if cfg is None or item.get('type') != 'message':
             return
+        if self.external.get(channel) and not cfg['allow_external']:
+            return
         user = ev.get('user') or ''
         emoji = ev.get('reaction') or ''
         if self._is_bot_self(user=user):
@@ -611,7 +736,7 @@ class Tracker:
         if row is None:
             if cfg['track'] == 'reaction:' + emoji and etype == 'reaction_added':
                 fake = {'text': '', 'ts': thread_ts}
-                row = self._start(team, channel, thread_ts, fake, cfg, now, user)
+                row, _ = self._start(team, channel, thread_ts, fake, cfg, now, user)
                 if row:
                     self.emit('message.posted', self._payload(row, 'message.posted', user=user))
             return
@@ -635,9 +760,12 @@ class Tracker:
             return
         # 👍/👎 on one of the bot's own messages is feedback, not activity.
         m = self.store.q('SELECT user FROM msgs WHERE team=? AND channel=? AND ts=?', team, channel, ts)
-        if m and m[0]['user'] == self.bot.get('user_id') and emoji in ('+1', '-1', 'thumbsup', 'thumbsdown'):
-            self.emit('feedback', self._payload(row, 'feedback', ts=ts, user=user,
-                                                extra={'rating': emoji, 'reason': 'feedback'}))
+        if m and m[0]['user'] == self.bot.get('user_id'):
+            # A reaction on the bot's own message is feedback or nothing; it is
+            # never thread activity, or rating a reply would re-settle the thread.
+            if emoji in ('+1', '-1', 'thumbsup', 'thumbsdown') and etype == 'reaction_added':
+                self.emit('feedback', self._payload(row, 'feedback', ts=ts, user=user,
+                                                    extra={'rating': emoji, 'reason': 'feedback'}))
             return
         if etype == 'reaction_added':
             self._bump(row, cfg, now, user, reply=False)
@@ -683,6 +811,10 @@ class Tracker:
         """The 30 s ticker: settle `open` records whose settle_at has passed,
         but only if version is unchanged since read (compare-and-swap in
         _finish). Restart-safe: everything is recomputed from the table."""
+        with self.lock:
+            return self._tick()
+
+    def _tick(self):
         now = self.now()
         n = 0
         for row in self.store.q("SELECT * FROM threads WHERE state='open' AND settle_at <= ?", now):
@@ -732,16 +864,25 @@ class Web:
         self.t3, self.t2 = Bucket(45), Bucket(18)
         self.retry_after = 0.0
 
-    def call(self, method, params=None, write=False, token=None, tier=3, json_body=True):
+    def call(self, method, params=None, write=False, token=None, tier=3):
         if time.time() < self.retry_after:
             raise SlackError('rate_limited: retry in %ds' % (self.retry_after - time.time()))
         if not (self.t3 if tier == 3 else self.t2).take(write):
             raise SlackError('rate_limited: local %s budget exhausted' % ('write' if write else 'read'))
-        data = json.dumps(params or {}).encode()
-        req = urllib.request.Request(
-            'https://%s/api/%s' % (API_HOST, method), data=data, method='POST',
-            headers={'Authorization': 'Bearer ' + (token or self.bot),
-                     'Content-Type': 'application/json; charset=utf-8'})
+        # Slack documents JSON request bodies only for write methods; the read
+        # methods (conversations.replies, users.list, ...) take form encoding and
+        # may silently ignore a JSON body, so reads are form-encoded.
+        headers = {'Authorization': 'Bearer ' + (token or self.bot)}
+        if write:
+            data = json.dumps(params or {}).encode()
+            headers['Content-Type'] = 'application/json; charset=utf-8'
+        else:
+            data = urllib.parse.urlencode(
+                {k: (('true' if v else 'false') if isinstance(v, bool) else v)
+                 for k, v in (params or {}).items()}).encode()
+            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+        req = urllib.request.Request('https://%s/api/%s' % (API_HOST, method), data=data,
+                                     method='POST', headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 out = json.loads(r.read().decode())
@@ -841,27 +982,93 @@ class WS:
 # 7. daemon
 # --------------------------------------------------------------------------
 
-def make_emitter(source='slack'):
-    """Put an event on the bus through `webhook.py emit`, which signs it with
-    the source's own secret and delivers through the ingress, so it gets
-    subscriptions AND standing-watch dispatch like any other delivery. The
-    command is overridable (LOCAL_SLACK_EMIT) for agent-box's wrapper."""
-    cmd = os.environ.get('LOCAL_SLACK_EMIT', 'agent-box-webhook emit').split()
+def find_webhook_py():
+    """The local-webhook CLI that has `emit`. agent-box's `agent-box-webhook`
+    wrapper does not, so default to the plugin's own webhook.py: next to this
+    plugin in a checkout, else in the Claude plugin cache."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, '..', 'local-webhook', 'webhook.py')]
+    cache = os.path.expanduser('~/.claude/plugins/cache')
+    for root, _dirs, files in os.walk(cache) if os.path.isdir(cache) else []:
+        if os.path.basename(root) != '.git' and 'webhook.py' in files and 'local-webhook' in root:
+            cands.append(os.path.join(root, 'webhook.py'))
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.normpath(c)
+    return None
 
+
+def emit_command():
+    env = os.environ.get('LOCAL_SLACK_EMIT')
+    if env:
+        return env.split()
+    wp = find_webhook_py()
+    return [sys.executable or 'python3', wp, 'emit'] if wp else None
+
+
+def make_emitter(source='slack'):
+    """Deliver one event to the bus through `webhook.py emit`, which signs it
+    with the source's own secret and posts it to the ingress, so it gets
+    subscriptions AND standing-watch dispatch like any other delivery. Returns
+    True on success: the outbox keeps a row until this does. The payload goes
+    on stdin, not argv, where another local user could read it in /proc."""
     def emit(action, payload):
-        topic_payload = dict(payload)
-        # The bus keys routing on the payload; `topic` is team/channel.
-        topic_payload['topic'] = 'slack:%s/%s' % (payload['team'], payload['channel'])
-        # A missing command or a hung ingress must not stop the daemon or the
-        # ticker thread; log it and carry on.
+        cmd = emit_command()
+        if not cmd:
+            print('local-slack: no emit command (set LOCAL_SLACK_EMIT, or install local-webhook)',
+                  file=sys.stderr)
+            return False
+        body = dict(payload)
+        # What the bus routes on. The source's keyPath must be `route` (see the
+        # README): match_topic compares `slack:<route>` with `T/C`, so a field
+        # holding `slack:T/C` would match nothing.
+        body['route'] = '%s/%s' % (payload['team'], payload['channel'])
         try:
-            r = subprocess.run(cmd + [source, json.dumps(topic_payload), '--event', action],
+            r = subprocess.run(cmd + [source, '-', '--event', action], input=json.dumps(body).encode(),
                                check=False, timeout=15, stdout=subprocess.DEVNULL)
-            if r.returncode:
-                print('local-slack: emit %s exited %d' % (action, r.returncode), file=sys.stderr)
         except (OSError, subprocess.SubprocessError) as e:
             print('local-slack: emit %s failed: %s' % (action, e), file=sys.stderr)
+            return False
+        if r.returncode:
+            print('local-slack: emit %s exited %d' % (action, r.returncode), file=sys.stderr)
+            return False
+        return True
     return emit
+
+
+def drain_outbox(store, emitter, limit=1000):
+    """Deliver queued events oldest first; stop at the first failure so order
+    is kept. Returns how many went out."""
+    n = 0
+    while n < limit:
+        row = store.outbox_next()
+        if row is None or not emitter(row['action'], json.loads(row['payload'])):
+            break
+        store.outbox_done(row['id'])
+        n += 1
+    return n
+
+
+def make_users_lookup(web, ttl=3600):
+    """users.info as {'guest','external'}, cached. Fails CLOSED: on any error
+    the user counts as both, so a control reaction from someone Slack could not
+    vouch for is ignored."""
+    cache = {}
+
+    def users(uid):
+        hit = cache.get(uid)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+        try:
+            u = web.call('users.info', {'user': uid})['user']
+            out = {'guest': bool(u.get('is_restricted') or u.get('is_ultra_restricted')
+                                 or u.get('is_bot') or u.get('deleted')),
+                   'external': bool(u.get('is_stranger'))}
+        except (SlackError, KeyError):
+            return {'guest': True, 'external': True}   # not cached: ask again next time
+        cache[uid] = (time.time(), out)
+        return out
+    return users
 
 
 def run_daemon():
@@ -882,9 +1089,46 @@ def run_daemon():
         except SlackError:
             return None
 
-    tracker = Tracker(store, channels, bot, make_emitter(), lookup=lookup,
-                      react=lambda c, ts, e: web.call('reactions.add', {'channel': c, 'timestamp': ts, 'name': e}, write=True),
-                      retention_days=defaults['retention_days'])
+    def react(channel, ts, emoji):
+        # Best effort and off the receive thread: the ack reaction must not
+        # hold the Socket Mode acknowledgement.
+        def go():
+            try:
+                web.call('reactions.add', {'channel': channel, 'timestamp': ts, 'name': emoji}, write=True)
+            except SlackError:
+                pass
+        threading.Thread(target=go, daemon=True).start()
+
+    tracker = Tracker(store, channels, bot, store.outbox_put, lookup=lookup, react=react,
+                      users=make_users_lookup(web), retention_days=defaults['retention_days'])
+
+    def prime_channels():
+        for cid in list(tracker.channels):
+            if cid not in tracker.external:
+                try:
+                    tracker.prime(cid, web.call('conversations.info', {'channel': cid})['channel'])
+                except (SlackError, KeyError):
+                    pass   # unknown stays unknown; a channel_shared event still flips it
+    prime_channels()
+
+    emitter = make_emitter()
+    wake = threading.Event()
+
+    def outbox_worker():
+        delay = 1
+        while True:
+            try:
+                if drain_outbox(store, emitter):
+                    delay = 1
+                elif store.outbox_next() is not None:
+                    delay = min(delay * 2, 60)   # the bus is down: back off, keep the rows
+                else:
+                    delay = 1
+            except Exception as e:
+                print('local-slack: outbox failed: %s' % e, file=sys.stderr)
+            wake.wait(delay if store.outbox_next() is not None else 5)
+            wake.clear()
+    threading.Thread(target=outbox_worker, daemon=True).start()
 
     def ticker():
         while True:
@@ -894,18 +1138,19 @@ def run_daemon():
             try:
                 tracker.channels, d = load_config()   # hot-reload the allowlist
                 tracker.retention_days = d['retention_days']
+                prime_channels()
                 tracker.tick()
+                wake.set()
             except Exception as e:
                 print('local-slack: tick failed: %s' % e, file=sys.stderr)
     threading.Thread(target=ticker, daemon=True).start()
 
     backoff = 1
     while True:
-        ws = None
+        ws, t0 = None, time.time()
         try:
             url = web.call('apps.connections.open', token=app_token)['url']
             ws = WS(url)
-            backoff = 1
             while True:
                 raw = ws.recv()
                 if raw is None:
@@ -914,19 +1159,29 @@ def run_daemon():
                 if env.get('type') == 'disconnect':
                     break
                 if env.get('type') == 'events_api':
-                    # Persist (dedup row + record) BEFORE acknowledging, so a
-                    # crash between the two is covered by Slack's redelivery.
-                    tracker.handle(env['payload'])
+                    # Persist (the thread rows and the outbox) BEFORE
+                    # acknowledging, so a crash between the two is covered by
+                    # Slack's redelivery. A failure here leaves the envelope
+                    # unacknowledged AND unmarked as seen, so the redelivery is
+                    # processed rather than dropped as a duplicate.
+                    try:
+                        tracker.handle(env['payload'])
+                    except Exception as e:
+                        print('local-slack: handling an event failed: %s' % e, file=sys.stderr)
+                        continue
                     ws.send(json.dumps({'envelope_id': env['envelope_id']}))
-        except (SlackError, OSError, ValueError) as e:
+                    wake.set()
+        except Exception as e:
             print('local-slack: %s; reconnecting in %ds' % (e, backoff), file=sys.stderr)
         finally:
             # Every exit from the inner loop (disconnect, EOF, error) leaves the
             # old socket behind otherwise; close it before dialling again.
             if ws is not None:
                 ws.close()
+        # Only a connection that lasted counts as healthy: a server that
+        # disconnects at once (link_disabled) must not be redialled every second.
+        backoff = 1 if time.time() - t0 > 30 else min(backoff * 2, 60)
         time.sleep(backoff)
-        backoff = min(backoff * 2, 60)
 
 
 # --------------------------------------------------------------------------
@@ -952,40 +1207,62 @@ Tokens come from SLACK_BOT_TOKEN / SLACK_APP_TOKEN. Writes go through the
 guardrails in compose() and the per-channel write settings.''' % VERSION
 
 
+_TS_RE = re.compile(r'\d{9,}\.\d{1,9}')
+STATUS_MARKS = {'working': 'hourglass_flowing_sand', 'done': 'white_check_mark', 'failed': 'x'}
+
+
 class Writer:
     """Every outgoing message passes here: allowlist, mode, compose, disclosure,
     send, audit. The agent never gets to bypass any step."""
 
     def __init__(self, web, store, channels, defaults, bot, session=None):
         self.web, self.store, self.channels = web, store, channels
-        self.defaults, self.bot, self.session = defaults, bot, session or os.environ.get('AGENT_BOX_SESSION', '')
+        self.defaults, self.bot = defaults, bot
+        # agent-box exports AGENT_BOX_SESSION_ID; with neither set every session
+        # shares one empty name and the per-session cap becomes box-wide.
+        self.session = session or os.environ.get('AGENT_BOX_SESSION_ID') or os.environ.get('AGENT_BOX_SESSION', '')
         self._names = {}
 
     def resolver(self, sigil, name):
         key = sigil + name
         if key in self._names:
             return self._names[key]
-        rid = None
+        found = set()
         try:
             if sigil == '@':
                 cur = None
                 while True:
                     r = self.web.call('users.list', {'limit': 200, **({'cursor': cur} if cur else {})})
                     for m in r.get('members', []):
+                        if m.get('deleted'):
+                            continue   # a deactivated user is not who anyone means
                         if name in (m.get('name'), (m.get('profile') or {}).get('display_name')):
-                            rid = m['id']
+                            found.add(m['id'])
                     cur = (r.get('response_metadata') or {}).get('next_cursor')
-                    if rid or not cur:
+                    if not cur:
                         break
             elif sigil == '#':
                 r = self.web.call('conversations.list', {'limit': 1000, 'types': 'public_channel,private_channel'})
                 for c in r.get('channels', []):
                     if c.get('name') == name and c['id'] in self.channels:
-                        rid = c['id']
+                        found.add(c['id'])
         except SlackError:
-            rid = None
+            found = set()
+        # Two people called `sam` is not a mention of either: leave it as text.
+        rid = found.pop() if len(found) == 1 else None
         self._names[key] = rid
         return rid
+
+    def _ts(self, ts):
+        if not isinstance(ts, str) or not _TS_RE.fullmatch(ts):
+            raise Refused('bad message ts %r' % (ts,))
+        return ts
+
+    def _parent(self, channel, ts):
+        """A reply's ts normalised to its thread's parent, so the on_request
+        lookup and thread_ts both see the thread, not the reply."""
+        r = self.store.q('SELECT thread_ts FROM msgs WHERE channel=? AND ts=?', channel, ts)
+        return r[0]['thread_ts'] if r else ts
 
     def _check(self, channel, thread_ts, top_level):
         cfg = self.channels.get(channel)
@@ -1006,7 +1283,8 @@ class Writer:
 
     def _rate(self, channel, top_level):
         now = time.time()
-        n = self.store.q('SELECT COUNT(*) c FROM audit WHERE session=? AND at>?', self.session, now - 600)[0]['c']
+        n = self.store.q("SELECT COUNT(*) c FROM audit WHERE session=? AND at>? AND kind != 'status_edit'",
+                         self.session, now - 600)[0]['c']
         if n >= 20:
             raise Refused('at most 20 writes per session per 10 minutes')
         if top_level:
@@ -1015,11 +1293,21 @@ class Writer:
             if c >= 5:
                 raise Refused('at most 5 top-level posts per channel per hour')
 
-    def _send(self, kind, channel, thread_ts, text, top_level=False, disclose=True):
+    def _index(self, channel, ts, thread_ts):
+        """Index our own post, so a 👍/👎 on it resolves to its thread."""
+        if ts:
+            self.store.x('INSERT OR REPLACE INTO msgs VALUES (?,?,?,?,?,?,?)', self.team or '', channel,
+                         ts, thread_ts or ts, self.bot.get('user_id'), 1, time.time())
+
+    team = ''
+
+    def _send(self, kind, channel, thread_ts, text, top_level=False):
+        if thread_ts is not None:
+            thread_ts = self._parent(channel, self._ts(thread_ts))
         cfg = self._check(channel, thread_ts, top_level)
         self._rate(channel, top_level)
         body = compose(text, self.resolver, cfg, self.defaults)
-        if disclose and self.defaults.get('disclosure'):
+        if self.defaults.get('disclosure'):
             body += '\n\n' + self.defaults['disclosure']
         if len(body) > 4000:
             raise Refused('message over 4,000 characters; upload a file instead')
@@ -1027,6 +1315,7 @@ class Writer:
         if thread_ts:
             params['thread_ts'] = thread_ts
         r = self.web.call('chat.postMessage', params, write=True)
+        self._index(channel, r.get('ts'), thread_ts)
         self.audit(kind, channel, thread_ts, r.get('ts'), body)
         return r
 
@@ -1035,42 +1324,72 @@ class Writer:
                      self.session, kind, text)
 
     def reply(self, channel, ts, text):
-        return self._send('reply', channel, ts, text)
+        # _send treats thread_ts=None as a top-level post, so a reply must prove
+        # it has a ts here rather than rely on it.
+        return self._send('reply', channel, self._ts(ts), text)
 
     def post(self, channel, text):
         return self._send('post', channel, None, text, top_level=True)
 
+    def _mark(self, channel, ts, emoji, remove=()):
+        """Move the thread's progress reaction: drop the earlier ones, add this."""
+        for old in remove:
+            try:
+                self.web.call('reactions.remove', {'channel': channel, 'timestamp': ts, 'name': old}, write=True)
+            except SlackError:
+                pass   # not there is fine
+        try:
+            self.web.call('reactions.add', {'channel': channel, 'timestamp': ts, 'name': emoji}, write=True)
+        except SlackError as e:
+            if str(e) != 'already_reacted':
+                raise
+
     def status(self, channel, ts, text, mark=None):
-        """One status message per thread: create it, then edit it. Emoji marks
-        are appended by the tool, not chosen by the agent."""
-        cfg = self.channels.get(channel)
-        if cfg is None or not cfg['write']['allowed']:
-            raise Refused('writing is not allowed in %s' % channel)
-        body = compose(text, self.resolver, cfg, self.defaults)
-        body = {'done': '✅ ', 'failed': '❌ '}.get(mark, '⏳ ') + body
-        key = [r for r in self.store.q("SELECT thread_key FROM threads WHERE channel=? AND thread_ts=?", channel, ts)]
-        k = key[0]['thread_key'] if key else '%s/%s' % (channel, ts)
+        """One status message per thread, created then edited. It passes the
+        same gates as a reply (on_request, rate, length) -- a status is a write
+        into the thread -- and only its EDITS are exempt from the per-session
+        count. Progress shows as a reaction on the parent: the daemon's 👀 ack
+        becomes ⏳, then ✅ or ❌."""
+        ts = self._parent(channel, self._ts(ts))
+        cfg = self._check(channel, ts, False)
+        k = '%s/%s' % (channel, ts)
+        rows = self.store.q('SELECT thread_key FROM threads WHERE channel=? AND thread_ts=?', channel, ts)
+        if rows:
+            k = rows[0]['thread_key']
         have = self.store.q('SELECT ts FROM status WHERE thread_key=?', k)
+        if not have:
+            self._rate(channel, False)
+        body = compose(text, self.resolver, cfg, self.defaults)
+        if len(body) > 4000:
+            raise Refused('message over 4,000 characters; upload a file instead')
         if have:
             r = self.web.call('chat.update', {'channel': channel, 'ts': have[0]['ts'], 'text': body}, write=True)
+            self.audit('status_edit', channel, ts, have[0]['ts'], body)
         else:
             r = self.web.call('chat.postMessage', {'channel': channel, 'thread_ts': ts, 'text': body,
                                                     'unfurl_links': False, 'unfurl_media': False}, write=True)
             self.store.x('INSERT OR REPLACE INTO status VALUES (?,?)', k, r['ts'])
-        self.audit('status', channel, ts, r.get('ts'), body)
+            self._index(channel, r.get('ts'), ts)
+            self.audit('status', channel, ts, r.get('ts'), body)
+        state = mark or 'working'
+        self._mark(channel, ts, STATUS_MARKS[state],
+                   remove=[cfg['reactions']['ack']] + [e for st, e in STATUS_MARKS.items() if st != state])
         return r
 
     def react(self, channel, ts, emoji):
+        ts = self._ts(ts)
         cfg = self.channels.get(channel)
         if cfg is None or not cfg['write']['allowed']:
             raise Refused('writing is not allowed in %s' % channel)
         if not re.fullmatch(r'[a-z0-9_+-]{1,64}', emoji):
             raise Refused('bad emoji name')
+        self._rate(channel, False)
         try:
             self.web.call('reactions.add', {'channel': channel, 'timestamp': ts, 'name': emoji}, write=True)
         except SlackError as e:
             if str(e) != 'already_reacted':   # de-duplicated per (ts, emoji)
                 raise
+        self.audit('react', channel, ts, ts, ':%s:' % emoji)
 
 
 def _opt(args, name, default=None, flag=False):
@@ -1079,10 +1398,49 @@ def _opt(args, name, default=None, flag=False):
         if flag:
             args.pop(i)
             return True
+        if i + 1 >= len(args):
+            raise Refused('%s needs a value' % name)
         v = args[i + 1]
         del args[i:i + 2]
         return v
     return False if flag else default
+
+
+def channel_add(cid, args, web=None, path=None):
+    """Create or UPDATE a channel entry. Only the flags given change; an
+    existing entry keeps its controllers, write settings and everything else
+    hand-tuned in the file."""
+    raw = read_raw(path)
+    entry = dict(raw.get(cid) or {})
+    track = _opt(args, '--track')
+    quiet = _opt(args, '--quiet')
+    write = _opt(args, '--write', flag=True)
+    ext = _opt(args, '--allow-external', flag=True)
+    if args:
+        raise Refused('unknown arguments: %s' % ' '.join(args))
+    if track is not None:
+        if not re.fullmatch(r'reaction:[a-z0-9_+-]+|all|mention', track):
+            raise Refused('bad --track')
+        entry['track'] = track
+    if quiet is not None:
+        entry['quiet_minutes'] = int(quiet)
+    if write:
+        entry['write'] = dict(entry.get('write') or {}, allowed=True)
+    if ext:
+        entry['allow_external'] = True
+    if web is not None:
+        # The bot must already be in the channel (a person invites it: that is
+        # the consent step), and a Slack Connect channel needs an explicit opt-in.
+        try:
+            info = web.call('conversations.info', {'channel': cid})['channel']
+        except (SlackError, KeyError) as e:
+            raise Refused('cannot look up %s (%s); is the bot invited?' % (cid, e))
+        if not info.get('is_member'):
+            raise Refused('the bot is not a member of %s; ask someone to /invite it first' % cid)
+        if info.get('is_ext_shared') and not entry.get('allow_external'):
+            raise Refused('%s is a Slack Connect channel; pass --allow-external to opt in' % cid)
+    raw[cid] = entry
+    write_raw(raw, path)
 
 
 def main(argv=None):
@@ -1094,6 +1452,14 @@ def main(argv=None):
     if cmd == 'daemon':
         run_daemon()
         return 0
+    try:
+        return _main(cmd, rest)
+    except (Refused, SlackError) as e:
+        print('local-slack: refused: %s' % e, file=sys.stderr)
+        return 1
+
+
+def _main(cmd, rest):
     channels, defaults = load_config()
     if cmd == 'channels':
         for cid, c in sorted(channels.items()):
@@ -1102,22 +1468,14 @@ def main(argv=None):
                 c['allow_external']))
         return 0
     if cmd == 'channel' and rest[:1] == ['add'] and len(rest) >= 2:
-        args = rest[2:]
-        cid = rest[1]
-        c = json.loads(json.dumps(DEFAULT_CHANNEL))
-        c['track'] = _opt(args, '--track', 'all')
-        c['quiet_minutes'] = int(_opt(args, '--quiet', 30))
-        c['write']['allowed'] = _opt(args, '--write', flag=True)
-        c['allow_external'] = _opt(args, '--allow-external', flag=True)
-        if not re.fullmatch(r'reaction:[a-z0-9_+-]+|all|mention', c['track']):
-            sys.exit('local-slack: bad --track')
-        channels[cid] = _merge(DEFAULT_CHANNEL, c)
-        save_config(channels, defaults)
-        print('added %s' % cid)
+        token = os.environ.get('SLACK_BOT_TOKEN')
+        channel_add(rest[1], rest[2:], Web(token) if token else None)
+        print('saved %s' % rest[1])
         return 0
     if cmd == 'channel' and rest[:1] == ['rm'] and len(rest) == 2:
-        channels.pop(rest[1], None)
-        save_config(channels, defaults)
+        raw = read_raw()
+        raw.pop(rest[1], None)
+        write_raw(raw)
         Store(os.path.join(state_dir(), 'slack.db')).purge_channel(rest[1])
         print('removed %s and purged its rows' % rest[1])
         return 0
@@ -1145,23 +1503,20 @@ def main(argv=None):
     me = web.call('auth.test')
     store = Store(os.path.join(state_dir(), 'slack.db'))
     w = Writer(web, store, channels, defaults, {'user_id': me['user_id']})
-    try:
-        if cmd == 'reply' and len(rest) == 3:
-            r = w.reply(*rest)
-        elif cmd == 'post' and len(rest) == 2:
-            r = w.post(*rest)
-        elif cmd == 'status' and len(rest) >= 3:
-            args = rest[3:]
-            r = w.status(rest[0], rest[1], rest[2], 'done' if '--done' in args else 'failed' if '--failed' in args else None)
-        elif cmd == 'react' and len(rest) == 3:
-            w.react(*rest)
-            r = {}
-        else:
-            print(USAGE, file=sys.stderr)
-            return 2
-    except (Refused, SlackError) as e:
-        print('local-slack: refused: %s' % e, file=sys.stderr)
-        return 1
+    w.team = me.get('team_id') or ''
+    if cmd == 'reply' and len(rest) == 3:
+        r = w.reply(*rest)
+    elif cmd == 'post' and len(rest) == 2:
+        r = w.post(*rest)
+    elif cmd == 'status' and len(rest) >= 3:
+        args = rest[3:]
+        r = w.status(rest[0], rest[1], rest[2], 'done' if '--done' in args else 'failed' if '--failed' in args else None)
+    elif cmd == 'react' and len(rest) == 3:
+        w.react(*rest)
+        r = {}
+    else:
+        print(USAGE, file=sys.stderr)
+        return 2
     print(json.dumps({'ts': r.get('ts')}))
     return 0
 
