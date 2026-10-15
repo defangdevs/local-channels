@@ -771,7 +771,9 @@ class WS:
                 raise SlackError('websocket handshake closed')
             buf += chunk
         head, _, self.buf = buf.partition(b'\r\n\r\n')
-        accept = base64.b64encode(hashlib.sha1(
+        # SHA-1 is what RFC 6455 section 4.2.2 mandates for Sec-WebSocket-Accept.
+        # It proves the server read our handshake; it protects nothing.
+        accept = base64.b64encode(hashlib.sha1(  # NOSONAR
             (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
         if b' 101 ' not in head.split(b'\r\n')[0] or accept.encode() not in head:
             raise SlackError('websocket handshake refused')
