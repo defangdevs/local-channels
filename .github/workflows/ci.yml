@@ -40,6 +40,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run test suite
         run: python -m unittest discover -s tests -v
+      - name: End-to-end test of local-slack (mock Slack, real local-webhook bus)
+        run: python tests/e2e/run_e2e.py
 
   tag:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

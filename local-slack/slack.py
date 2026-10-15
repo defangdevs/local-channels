@@ -43,6 +43,9 @@ VERSION = '0.1.0'
 
 API_HOST = 'slack.com'
 
+# How often the settle ticker runs. 30 s is the spec's; tests shorten it.
+TICK_SECONDS = float(os.environ.get('LOCAL_SLACK_TICK_S') or 30)
+
 # --------------------------------------------------------------------------
 # 1. text
 # --------------------------------------------------------------------------
@@ -157,12 +160,17 @@ def check_link(url, allowed_hosts):
         scan_secrets(dec)
 
 
-def compose(text, resolver, cfg, defaults):
+_EMAIL_RE = re.compile(r'(?<![\w.+-])[\w.+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b')
+_URL_TAIL = '.,;:!?\'"'
+
+
+def compose(text, resolver, cfg, defaults, unresolved=None):
     """Build the text Slack receives. `resolver(kind, name)` returns an id for
     ('@', name) / ('#', name) / ('!', group) or None. Compose, don't filter:
     everything the agent wrote is escaped first, then only the tokens WE insert
     are live markup, and the result is re-checked for any token we did not
-    insert (spec M2)."""
+    insert (spec M2). Names that stay literal text because nothing resolved
+    them are appended to `unresolved` when given, so the caller can say so."""
     write = cfg.get('write', {})
     if _IMAGE_MD_RE.search(text):
         raise Refused('image Markdown is refused; use upload')
@@ -192,10 +200,12 @@ def compose(text, resolver, cfg, defaults):
         # not rewritten.
         pieces, p2 = [], 0
         for m in _URL_RE.finditer(seg):
-            check_link(m.group(0), allowed_hosts)
+            # Sentence punctuation after a link is not part of it.
+            url = m.group(0).rstrip(_URL_TAIL)
+            check_link(url, allowed_hosts)
             pieces.append(('t', seg[p2:m.start()]))
-            pieces.append(('u', m.group(0)))
-            p2 = m.end()
+            pieces.append(('u', url))
+            p2 = m.start() + len(url)
         pieces.append(('t', seg[p2:]))
         for kind, chunk in pieces:
             if kind != 't':
@@ -204,6 +214,10 @@ def compose(text, resolver, cfg, defaults):
                 raise Refused('links other than http(s) are refused: %s:' % m.group(0).split(':')[0])
             for m in _BARE_HOST_RE.finditer(chunk):
                 check_link(m.group(0), allowed_hosts)
+            # Slack may turn a bare address into a mailto: link, so its domain
+            # gets the same host check as any other link.
+            for m in _EMAIL_RE.finditer(chunk):
+                check_link(m.group(1), allowed_hosts)
         for kind, chunk in pieces:
             if kind == 'u':
                 host = urllib.parse.urlsplit(chunk).hostname
@@ -230,6 +244,8 @@ def compose(text, resolver, cfg, defaults):
                     # Not a known person or channel: leave it as the literal
                     # text it is. Only what would become a live token is
                     # refused or resolved.
+                    if unresolved is not None and sigil + name not in unresolved:
+                        unresolved.append(sigil + name)
                     return sigil + name
                 if rid.startswith('S'):  # user group
                     if not write.get('groups'):
@@ -491,19 +507,27 @@ class Tracker:
     def _key(self, team, channel, thread_ts):
         return '%s/%s/%s' % (team, channel, thread_ts)
 
+    def _summary(self, row, extra):
+        replies = row['replies'] or 0
+        people = len([x for x in (row['participants'] or '').split(',') if x])
+        out = 'v%d · %d %s, %d %s' % (row['version'], replies, 'reply' if replies == 1 else 'replies',
+                                      people, 'person' if people == 1 else 'people')
+        # `reason` means something only on thread.settled.
+        if extra and extra.get('reason'):
+            out += ' · reason: %s' % extra['reason']
+        return out
+
     def _payload(self, row, action, ts=None, user=None, extra=None):
         p = {
             'identifier': row['thread_key'],
             'title': row['title'] or '',
-            'summary': 'v%d · %d replies, %d people · reason: %s' % (
-                row['version'], row['replies'] or 0,
-                len([x for x in (row['participants'] or '').split(',') if x]),
-                (extra or {}).get('reason', action)),
+            'summary': self._summary(row, extra),
             'action': action,
             'team': row['team'], 'channel': row['channel'], 'thread': row['thread_ts'],
             'ts': ts or row['thread_ts'], 'user': user or '', 'version': row['version'],
             'external': bool(row['external']),
-            'url': 'https://slack.com/archives/%s/p%s' % (row['channel'], row['thread_ts'].replace('.', '')),
+            'url': '%sarchives/%s/p%s' % (self.bot.get('url') or 'https://slack.com/', row['channel'],
+                                          row['thread_ts'].replace('.', '')),
         }
         if row['extra_ts']:
             p['also'] = row['extra_ts']
@@ -1092,7 +1116,10 @@ def run_daemon():
         sys.exit('local-slack: SLACK_BOT_TOKEN and SLACK_APP_TOKEN must both be set')
     web = Web(bot_token, app_token)
     me = web.call('auth.test')
-    bot = {'user_id': me['user_id'], 'bot_id': me.get('bot_id')}
+    # auth.test's `url` is this workspace's own host, which permalinks should use.
+    wurl = me.get('url') or ''
+    bot = {'user_id': me['user_id'], 'bot_id': me.get('bot_id'),
+           'url': wurl if wurl.endswith('/') else wurl + '/' if wurl else ''}
     store = Store(os.path.join(state_dir(), 'slack.db'))
     channels, defaults = load_config()
 
@@ -1147,7 +1174,7 @@ def run_daemon():
 
     def ticker():
         while True:
-            time.sleep(30)
+            time.sleep(TICK_SECONDS)
             # One bad tick must not end the thread: a dead ticker means no
             # thread ever settles again, with the daemon still looking healthy.
             try:
@@ -1321,7 +1348,8 @@ class Writer:
             thread_ts = self._parent(channel, self._ts(thread_ts))
         cfg = self._check(channel, thread_ts, top_level)
         self._rate(channel, top_level)
-        body = compose(text, self.resolver, cfg, self.defaults)
+        unresolved = []
+        body = compose(text, self.resolver, cfg, self.defaults, unresolved)
         if self.defaults.get('disclosure'):
             body += '\n\n' + self.defaults['disclosure']
         if len(body) > 4000:
@@ -1332,7 +1360,9 @@ class Writer:
         r = self.web.call('chat.postMessage', params, write=True)
         self._index(channel, r.get('ts'), thread_ts)
         self.audit(kind, channel, thread_ts, r.get('ts'), body)
-        return r
+        # A name nothing resolved went out as plain text and pinged nobody:
+        # say so, or a typo'd @name fails silently and the agent never knows.
+        return dict(r, unresolved=unresolved)
 
     def audit(self, kind, channel, thread, ts, text):
         self.store.x('INSERT INTO audit VALUES (?,?,?,?,?,?,?)', time.time(), channel, thread, ts,
@@ -1374,7 +1404,8 @@ class Writer:
         have = self.store.q('SELECT ts FROM status WHERE thread_key=?', k)
         if not have:
             self._rate(channel, False)
-        body = compose(text, self.resolver, cfg, self.defaults)
+        unresolved = []
+        body = compose(text, self.resolver, cfg, self.defaults, unresolved)
         if len(body) > 4000:
             raise Refused('message over 4,000 characters; upload a file instead')
         if have:
@@ -1389,7 +1420,7 @@ class Writer:
         state = mark or 'working'
         self._mark(channel, ts, STATUS_MARKS[state],
                    remove=[cfg['reactions']['ack']] + [e for st, e in STATUS_MARKS.items() if st != state])
-        return r
+        return dict(r, unresolved=unresolved)
 
     def react(self, channel, ts, emoji):
         ts = self._ts(ts)
@@ -1532,7 +1563,10 @@ def _main(cmd, rest):
     else:
         print(USAGE, file=sys.stderr)
         return 2
-    print(json.dumps({'ts': r.get('ts')}))
+    out = {'ts': r.get('ts')}
+    if r.get('unresolved'):
+        out['unresolved'] = r['unresolved']
+    print(json.dumps(out))
     return 0
 
 

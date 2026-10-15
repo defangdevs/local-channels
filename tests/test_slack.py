@@ -239,6 +239,20 @@ class TestTracker(Rig):
         self.assertEqual(self.store.q('SELECT COUNT(*) c FROM msgs')[0]['c'], 0)
 
 
+class TestPayloadShape(Rig):
+    def test_permalink_uses_the_workspace_host_and_summary_reads_well(self):
+        self.tr.bot = dict(BOT, url='https://acme.slack.com/')
+        self.tr.handle(msg('1.1'))
+        p = self.events[0][1]
+        self.assertEqual(p['url'], 'https://acme.slack.com/archives/C1/p11')
+        self.assertEqual(p['summary'], 'v1 · 0 replies, 1 person')      # no reason on message.posted
+        self.tr.handle(msg('1.2', thread_ts='1.1', user='U2'))
+        self.assertEqual(self.events[-1][1]['summary'], 'v2 · 1 reply, 2 people')
+        self.advance(601)
+        self.tr.tick()
+        self.assertTrue(self.events[-1][1]['summary'].endswith('· reason: quiet'))
+
+
 class TestRetention(Rig):
     def test_unrecorded_index_rows_age_out(self):
         self.cfg['track'] = 'mention'
@@ -497,6 +511,12 @@ class TestWriter(unittest.TestCase):
             self.w.reply('C1', TS, 'token xoxb-1234567890-abcdefghij')
         self.assertEqual(self.calls, [])
 
+    def test_send_result_lists_unresolved_names(self):
+        self.ask()
+        r = self.w.reply('C1', TS, 'thanks @alise')
+        self.assertEqual(r['unresolved'], ['@alise'])
+        self.assertEqual(self.w.status('C1', TS, 'hi @alise')['unresolved'], ['@alise'])
+
     def test_audit_row_written_with_the_session(self):
         self.ask()
         self.w.reply('C1', TS, 'hello')
@@ -569,6 +589,23 @@ class TestReviewRegressions(Rig):
             with self.assertRaises(slack.Refused, msg=text):
                 self.c(text)
         self.assertEqual(self.c('see github.com/o/r and README.md'), 'see github.com/o/r and README.md')
+
+    def test_trailing_punctuation_stays_out_of_links(self):
+        self.assertEqual(self.c('see https://github.com/x/y/pull/1.'),
+                         'see <https://github.com/x/y/pull/1|github.com>.')
+        self.assertEqual(self.c('(https://github.com/x), then https://github.com/y!'),
+                         '(<https://github.com/x|github.com>), then <https://github.com/y|github.com>!')
+
+    def test_bare_email_domain_is_checked(self):
+        with self.assertRaises(slack.Refused):
+            self.c('mail x@evil.com')
+        self.assertEqual(self.c('mail x@github.com'), 'mail x@github.com')
+
+    def test_unresolved_names_are_reported(self):
+        cfg = slack._merge(slack.DEFAULT_CHANNEL, {})
+        un = []
+        out = slack.compose('hi @alise and #42 and @alise', lambda *_: None, cfg, self.DEF, un)
+        self.assertEqual((out, un), ('hi @alise and #42 and @alise', ['@alise']))
 
     def test_kebab_case_is_not_a_secret(self):
         self.assertEqual(self.c('branch sk-feature-improve-the-login-flow-now'), 'branch sk-feature-improve-the-login-flow-now')

@@ -91,4 +91,10 @@ reach a subscribed session; `conversations.replies`/`users.list` return data;
 whether `markdown_text` accepts mention syntax (this sends mrkdwn `text`);
 whether Slack linkifies a bare domain in API `text`.
 
-Tests: `python -m unittest discover -s tests`.
+Tests: `python -m unittest discover -s tests` for the unit layer, and
+`python tests/e2e/run_e2e.py` for an end-to-end run (about 25 s): a mock Slack
+(Web API plus a Socket Mode WebSocket server), this repo's real local-webhook
+receiver with the documented `slack` source, a simulated agent session and a
+standing watch, and the real `slack.py daemon` and CLI. It proves the pieces
+work together and with the bus; it does not prove Slack agrees with our reading
+of its docs. `LOCAL_SLACK_TICK_S` shortens the settle ticker for it.
