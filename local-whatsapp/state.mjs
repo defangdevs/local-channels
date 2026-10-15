@@ -61,26 +61,27 @@ function contentOf(message) {
   return null;
 }
 
-export function parseInbound(message, credentials, sentIds, prefix = '@box') {
+export function parseInbound(message, credentials, sentIds, prefix = '@box', allowBareMedia = false) {
   const key = message?.key;
   const chat = key?.remoteJid?.replace(/:\d+@/, '@');
   if (!key?.id || !key?.fromMe || !ownChatIds(credentials).includes(chat)) return null;
   if (Object.hasOwn(sentIds, `wa:${key.id}`)) return null;
   const content = contentOf(message.message);
-  const media = content?.imageMessage || content?.documentMessage;
+  const media = content?.imageMessage || content?.documentMessage || content?.videoMessage;
   const fullText = content?.conversation || content?.extendedTextMessage?.text || media?.caption || '';
   if (typeof fullText !== 'string' || fullText.length > MAX_TEXT + prefix.length + 1) return null;
   const head = `${prefix} `;
-  if (!fullText.toLowerCase().startsWith(head.toLowerCase()) && !(media && fullText.toLowerCase() === prefix.toLowerCase())) return null;
-  const text = fullText.slice(head.length).trim();
+  const prefixed = fullText.toLowerCase().startsWith(head.toLowerCase()) || (media && fullText.toLowerCase() === prefix.toLowerCase());
+  if (!prefixed && !(media && allowBareMedia)) return null;
+  const text = (prefixed ? fullText.slice(head.length) : fullText).trim();
   if (!text && !media) return null;
   return {
     id: createHash('sha256').update(`${chat}\0${key.id}`).digest('hex').slice(0, 24),
     chat,
     text,
     ...(media ? { attachment: {
-      kind: content.imageMessage ? 'image' : 'document',
-      name: String(media.fileName || (content.imageMessage ? 'image' : 'document')).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200),
+      kind: content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document',
+      name: String(media.fileName || (content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document')).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200),
       mimeType: String(media.mimetype || 'application/octet-stream').slice(0, 100),
       declaredSize: Number(media.fileLength || 0),
     } } : {}),
@@ -138,7 +139,7 @@ export async function receiveAttachment(dir, inbound, download) {
     if (!size) throw new Error('attachment is empty');
     closeSync(fd); fd = undefined;
     // Images get an extension for local image viewers; documents are opaque.
-    const ext = attachment.kind === 'image' ? ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[attachment.mimeType] || '.bin') : '.bin';
+    const ext = attachment.kind === 'image' ? ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[attachment.mimeType] || '.bin') : attachment.kind === 'video' && attachment.mimeType === 'video/mp4' ? '.mp4' : '.bin';
     const path = join(mediaDir, inbound.id + ext);
     renameSync(temporary, path); temporary = undefined;
     attachment.path = path;
@@ -159,7 +160,7 @@ export function cleanMediaInbox(dir, state, removePartial = false) {
   const retained = new Set(Object.values(state.messages).map((m) => m.attachment?.path));
   for (const name of readdirSync(mediaDir)) {
     const path = join(mediaDir, name);
-    if (/^[a-f0-9]{24}\.(part|bin|jpg|png|webp)$/.test(name) && (removePartial || !name.endsWith('.part')) && !retained.has(path)) unlinkSync(path);
+    if (/^[a-f0-9]{24}\.(part|bin|jpg|png|webp|mp4)$/.test(name) && (removePartial || !name.endsWith('.part')) && !retained.has(path)) unlinkSync(path);
   }
 }
 

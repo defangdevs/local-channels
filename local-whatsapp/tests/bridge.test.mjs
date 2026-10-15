@@ -69,9 +69,9 @@ esac
         ev.emit('connection.update', { connection: 'open' });
         ev.emit('messages.upsert', { type: 'notify', messages: [{
           key: { id: process.env.FAKE_INBOUND_ID || 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' },
-          message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: '@' + userInfo().username + ' inspect this', mimetype: 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
+          message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: process.env.FAKE_MEDIA_CAPTION ?? ('@' + userInfo().username + ' inspect this'), mimetype: process.env.FAKE_MEDIA === 'videoMessage' ? 'video/mp4' : 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
         }] });
-      }, 100);
+      }, Number(process.env.FAKE_INBOUND_DELAY || 100));
       return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
         async requestPairingCode() {
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
@@ -365,7 +365,7 @@ test('reply-image CLI queues a durable image, retries after restart, and cleans 
   }
 });
 
-for (const kind of ['imageMessage', 'documentMessage']) {
+for (const kind of ['imageMessage', 'documentMessage', 'videoMessage']) {
 for (const harness of ['codex', 'claude']) {
 test(`incoming ${kind} downloads and reaches ${harness} with a private local path`, async () => {
   const f = setup();
@@ -412,4 +412,36 @@ test(`incoming ${kind} downloads and reaches ${harness} with a private local pat
   }
 });
 }
+}
+
+for (const kind of ['videoMessage', 'documentMessage']) {
+test(`receive-files CLI enables captionless ${kind} and persists its expiry`, async () => {
+  const f = setup();
+  const argsFile = join(f.dir, 'args');
+  const codexBin = join(f.dir, 'codex');
+  writeFileSync(codexBin, '#!/bin/sh\nprintf "%s\\n" "$@" > "$CODEX_ARGS_FILE"\n');
+  chmodSync(codexBin, 0o700);
+  writeFileSync(join(f.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'codex', name: 'codex' }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, LOCAL_WHATSAPP_CODEX_BIN: codexBin,
+    CODEX_ARGS_FILE: argsFile, FAKE_MEDIA: kind, FAKE_MEDIA_CAPTION: '', FAKE_INBOUND_DELAY: '700' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+  try {
+    await waitUntil(() => existsSync(join(f.state, 'bridge.sock')), 'bridge socket');
+    const result = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'receive-files'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /enabled until/);
+    await waitUntil(() => existsSync(argsFile), 'captionless upload queued');
+    const state = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(state.acceptMediaUntil > Date.now());
+    assert.ok(state.acceptMediaUntil <= Date.now() + 600000);
+    const [entry] = Object.values(state.messages);
+    assert.equal(entry.text, '');
+    assert.equal(readFileSync(entry.attachment.path, 'utf8'), 'downloaded attachment');
+    if (kind === 'videoMessage') assert.ok(entry.attachment.path.endsWith('.mp4'));
+  } finally {
+    await stop(daemon);
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
 }

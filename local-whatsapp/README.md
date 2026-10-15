@@ -116,6 +116,7 @@ again.
 | `node bridge.mjs register codex` | Bind an agent-box Codex name to this task's thread ID |
 | `node bridge.mjs reply ID TEXT` | Queue a text reply to the original WhatsApp chat |
 | `node bridge.mjs reply-image ID ABSOLUTE_PATH [CAPTION]` | Queue a native image reply in the original chat |
+| `node bridge.mjs receive-files` | Allow captionless self-chat media for 10 minutes |
 | `node bridge.mjs status` | Show connection, target, and pending count |
 
 The bridge has no shell-session adapter. The message transport and the target
@@ -143,12 +144,15 @@ bytes and caption is idempotent; trying to replace a reply is rejected. As with
 text replies, a crash after WhatsApp accepts a send but before the bridge records
 success can cause a duplicate. Inbound images and documents are supported as described below.
 
-## Receiving images and files
+## Receiving images, videos, and files
 
-Send an image or document to Message Yourself with a caption beginning with
+Send an image, video, or document to Message Yourself with a caption beginning with
 `@agent ` (replace `agent` with the bridge Linux username). A caption of just
-`@agent` also works. Captionless attachments and attachments from other chats
-are ignored. View-once media is not imported.
+`@agent` also works. Attachments from other chats are ignored. To upload without a caption, first
+send `@agent /attach` as a text message. This enables captionless media in your
+self-chat for 10 minutes. The agent can enable the same window with
+`node bridge.mjs receive-files`. Outside that window, media needs an explicit
+prefix. Ordinary unprefixed text is always ignored. View-once media is not imported.
 
 The bridge downloads at most 20 MiB per attachment, streams it into its private
 `media-inbox` directory, and includes the absolute path and metadata in the

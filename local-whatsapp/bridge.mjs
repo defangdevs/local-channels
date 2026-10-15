@@ -334,7 +334,10 @@ async function serve() {
         if (!inbound.control || inbound.reply) continue;
         try {
           const available = await sessions();
-          if (inbound.text === '/sessions') {
+          if (inbound.text === '/attach') {
+            state.acceptMediaUntil = Date.now() + 10 * 60 * 1000;
+            queueReply(state, inbound.id, 'Ready: send images, videos, or files here without a caption for the next 10 minutes (up to 20 MiB each).');
+          } else if (inbound.text === '/sessions') {
             const listing = available.map(({ name, harness, status, selected }) =>
               `${name} (${harness}, ${status}${selected ? ', selected' : ''})`).join(', ') || 'none available';
             queueReply(state, inbound.id, `Box sessions: ${listing.slice(0, 3900)}`);
@@ -399,8 +402,12 @@ async function serve() {
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, status: connected ? 'sending' : 'queued until WhatsApp reconnects', id: entry.id })}\n`);
             drainReplies().catch((error) => process.stderr.write(`reply drain failed: ${error.message}\n`));
+          } else if (value.op === 'receive-files') {
+            state.acceptMediaUntil = Date.now() + 10 * 60 * 1000;
+            saveState(dir, state);
+            peer.write(`${JSON.stringify({ ok: true, until: new Date(state.acceptMediaUntil).toISOString() })}\n`);
           } else if (value.op === 'status') {
-            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply).length })}\n`);
+            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, acceptMediaUntil: state.acceptMediaUntil || null, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply).length })}\n`);
           } else {
             peer.write(`${JSON.stringify({ ok: false, error: 'unknown operation' })}\n`);
           }
@@ -430,14 +437,14 @@ async function serve() {
       inboundQueue = inboundQueue.then(async () => {
         if (type !== 'notify') return;
         for (const message of messages) {
-          const inbound = parseInbound(message, credentials.creds, state.sentIds, `@${userInfo().username}`);
+          const inbound = parseInbound(message, credentials.creds, state.sentIds, `@${userInfo().username}`, Date.now() < (state.acceptMediaUntil || 0));
           if (!inbound || Object.hasOwn(state.messages, inbound.id)) continue;
           try {
             if (Object.values(state.messages).filter((m) => !m.reply).length >= 200) throw new Error('inbox full');
             if (inbound.attachment) {
               await receiveAttachment(dir, inbound, () => downloadMediaMessage(message, 'stream', { options: { timeout: 60000 } }, { logger, reuploadRequest: socket.updateMediaMessage }));
             }
-            const control = !inbound.attachment && (inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
+            const control = !inbound.attachment && (inbound.text === '/attach' || inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
               inbound.text.startsWith('/profile'));
             if (control) inbound.control = true;
             else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
@@ -549,11 +556,16 @@ async function main() {
     process.stdout.write(`${result.status}\n`);
     return;
   }
+  if (command === 'receive-files') {
+    const result = await request({ op: 'receive-files' });
+    process.stdout.write(`Captionless self-chat uploads enabled until ${result.until}\n`);
+    return;
+  }
   if (command === 'status') {
     process.stdout.write(`${JSON.stringify({ ...await request({ op: 'status' }), profile: config().profile }, null, 2)}\n`);
     return;
   }
-  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|reply ID TEXT|reply-image ID ABSOLUTE_PATH [CAPTION]|status');
+  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|receive-files|reply ID TEXT|reply-image ID ABSOLUTE_PATH [CAPTION]|status');
 }
 
 main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });
