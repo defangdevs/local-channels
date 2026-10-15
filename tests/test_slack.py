@@ -238,6 +238,49 @@ class TestTracker(Rig):
         self.assertEqual(self.store.q('SELECT COUNT(*) c FROM msgs')[0]['c'], 0)
 
 
+class TestRetention(Rig):
+    def test_unrecorded_index_rows_age_out(self):
+        self.cfg['track'] = 'mention'
+        self.tr.handle(msg('1.1', 'no mention'))     # indexed, never a record
+        self.assertEqual(self.store.q('SELECT COUNT(*) c FROM msgs')[0]['c'], 1)
+        self.advance(31 * 86400)
+        self.store.prune(self.t[0], 30)
+        self.assertEqual(self.store.q('SELECT COUNT(*) c FROM msgs')[0]['c'], 0)
+
+    def test_open_record_rows_survive(self):
+        self.tr.handle(msg('1.1'))
+        self.store.prune(self.t[0] + 31 * 86400, 30)
+        self.assertEqual(self.store.q('SELECT COUNT(*) c FROM msgs')[0]['c'], 1)
+
+    def test_tick_uses_configured_retention(self):
+        self.tr.retention_days = 1
+        self.cfg['track'] = 'mention'
+        self.tr.handle(msg('1.1'))
+        self.advance(2 * 86400)
+        self.tr.tick()
+        self.assertEqual(self.store.q('SELECT COUNT(*) c FROM msgs')[0]['c'], 0)
+
+    def test_purge_channel_clears_both_status_key_shapes(self):
+        self.store.x("INSERT INTO status VALUES ('T1/C1/1.1','9.9'), ('C1/2.2','9.8'), ('T1/C2/3.3','9.7')")
+        self.store.purge_channel('C1')
+        self.assertEqual([r['thread_key'] for r in self.store.q('SELECT thread_key FROM status')], ['T1/C2/3.3'])
+
+
+class TestEmitter(unittest.TestCase):
+    def test_failures_are_logged_not_raised(self):
+        old = os.environ.get('LOCAL_SLACK_EMIT')
+        os.environ['LOCAL_SLACK_EMIT'] = '/nonexistent/emit-cmd'
+        try:
+            slack.make_emitter()('message.posted', {'team': 'T', 'channel': 'C'})  # FileNotFoundError
+            os.environ['LOCAL_SLACK_EMIT'] = 'false'
+            slack.make_emitter()('message.posted', {'team': 'T', 'channel': 'C'})  # exit 1
+        finally:
+            if old is None:
+                del os.environ['LOCAL_SLACK_EMIT']
+            else:
+                os.environ['LOCAL_SLACK_EMIT'] = old
+
+
 class TestClassifier(Rig):
     def test_topics_are_comma_wrapped(self):
         self.tr.classify = lambda cfg, key: ['feature-request']
@@ -313,7 +356,7 @@ class TestText(unittest.TestCase):
         with self.assertRaises(slack.Refused):
             self.c('https://github.com/x?t=ghp_%s' % ('A' * 36))
         with self.assertRaises(slack.Refused):
-            self.c('https://github.com/x#%s' % '%67hp_' .replace('%67', 'g') + 'A' * 36)
+            self.c('https://github.com/x#%67hp_' + 'A' * 36)
 
     def test_image_markdown_refused(self):
         with self.assertRaises(slack.Refused):

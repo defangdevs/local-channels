@@ -345,12 +345,21 @@ class Store:
             self.x('DELETE FROM msgs WHERE team=? AND channel=? AND thread_ts=?',
                    r['team'], r['channel'], r['thread_ts'])
         self.x("DELETE FROM threads WHERE state IN ('settled','dropped') AND ended_at < ?", cut)
+        # Index rows that never got a record (a `mention` channel's unmentioned
+        # messages, lookup results) hang off no thread, so age them out too;
+        # rows of a still-open or held record stay.
+        self.x('DELETE FROM msgs WHERE at < ? AND NOT EXISTS (SELECT 1 FROM threads t '
+               "WHERE t.team=msgs.team AND t.channel=msgs.channel AND t.thread_ts=msgs.thread_ts "
+               "AND t.state IN ('open','held'))", cut)
         self.x('DELETE FROM audit WHERE at < ?', now - audit_days * 86400)
 
     def purge_channel(self, channel):
         for t in ('msgs', 'threads', 'audit'):
             self.x('DELETE FROM %s WHERE channel=?' % t, channel)
-        self.x('DELETE FROM status WHERE thread_key LIKE ?', '%/' + channel + '/%')
+        # Two key shapes: team/channel/ts, and channel/ts when Writer.status
+        # found no record to take a key from.
+        self.x('DELETE FROM status WHERE thread_key LIKE ? OR thread_key LIKE ?',
+               '%/' + channel + '/%', channel + '/%')
 
     def purge_all(self):
         for t in ('seen', 'msgs', 'threads', 'status', 'audit'):
@@ -372,9 +381,10 @@ class Tracker:
     on an index miss. `users(user_id)` returns {'guest':bool,'external':bool}."""
 
     def __init__(self, store, channels, bot, emit, now=time.time, lookup=None, users=None,
-                 react=None, classify=None):
+                 react=None, classify=None, retention_days=30):
         self.store, self.channels, self.bot = store, channels, bot
         self.emit, self.now = emit, now
+        self.retention_days = retention_days
         self.lookup = lookup or (lambda channel, ts: None)
         self.users = users or (lambda uid: {'guest': False, 'external': False})
         self.react = react or (lambda channel, ts, emoji: None)
@@ -682,7 +692,7 @@ class Tracker:
             maxed = now >= row['first_seen_at'] + cfg['max_wait_hours'] * 3600
             if self._finish(row, 'max_wait' if maxed else 'quiet', cfg):
                 n += 1
-        self.store.prune(now, 30)
+        self.store.prune(now, self.retention_days)
         return n
 
 
@@ -842,8 +852,15 @@ def make_emitter(source='slack'):
         topic_payload = dict(payload)
         # The bus keys routing on the payload; `topic` is team/channel.
         topic_payload['topic'] = 'slack:%s/%s' % (payload['team'], payload['channel'])
-        subprocess.run(cmd + [source, json.dumps(topic_payload), '--event', action],
-                       check=False, timeout=15, stdout=subprocess.DEVNULL)
+        # A missing command or a hung ingress must not stop the daemon or the
+        # ticker thread; log it and carry on.
+        try:
+            r = subprocess.run(cmd + [source, json.dumps(topic_payload), '--event', action],
+                               check=False, timeout=15, stdout=subprocess.DEVNULL)
+            if r.returncode:
+                print('local-slack: emit %s exited %d' % (action, r.returncode), file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as e:
+            print('local-slack: emit %s failed: %s' % (action, e), file=sys.stderr)
     return emit
 
 
@@ -855,7 +872,7 @@ def run_daemon():
     me = web.call('auth.test')
     bot = {'user_id': me['user_id'], 'bot_id': me.get('bot_id')}
     store = Store(os.path.join(state_dir(), 'slack.db'))
-    channels, _ = load_config()
+    channels, defaults = load_config()
 
     def lookup(channel, ts):
         try:
@@ -866,17 +883,25 @@ def run_daemon():
             return None
 
     tracker = Tracker(store, channels, bot, make_emitter(), lookup=lookup,
-                      react=lambda c, ts, e: web.call('reactions.add', {'channel': c, 'timestamp': ts, 'name': e}, write=True))
+                      react=lambda c, ts, e: web.call('reactions.add', {'channel': c, 'timestamp': ts, 'name': e}, write=True),
+                      retention_days=defaults['retention_days'])
 
     def ticker():
         while True:
             time.sleep(30)
-            tracker.channels, _ = load_config()   # hot-reload the allowlist
-            tracker.tick()
+            # One bad tick must not end the thread: a dead ticker means no
+            # thread ever settles again, with the daemon still looking healthy.
+            try:
+                tracker.channels, d = load_config()   # hot-reload the allowlist
+                tracker.retention_days = d['retention_days']
+                tracker.tick()
+            except Exception as e:
+                print('local-slack: tick failed: %s' % e, file=sys.stderr)
     threading.Thread(target=ticker, daemon=True).start()
 
     backoff = 1
     while True:
+        ws = None
         try:
             url = web.call('apps.connections.open', token=app_token)['url']
             ws = WS(url)
@@ -895,6 +920,11 @@ def run_daemon():
                     ws.send(json.dumps({'envelope_id': env['envelope_id']}))
         except (SlackError, OSError, ValueError) as e:
             print('local-slack: %s; reconnecting in %ds' % (e, backoff), file=sys.stderr)
+        finally:
+            # Every exit from the inner loop (disconnect, EOF, error) leaves the
+            # old socket behind otherwise; close it before dialling again.
+            if ws is not None:
+                ws.close()
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
