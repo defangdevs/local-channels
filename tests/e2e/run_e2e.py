@@ -223,6 +223,7 @@ reads = [(c[1], c[2]) for c in mock.calls if c[1] in ('conversations.replies', '
 check('W8 read methods are form-encoded (not JSON)', reads and all(ct != 'application/json' for _, ct in reads), str(sorted(set(reads))))
 
 # ---------------------------------------------------------------- feedback + quiet settle + watch
+got = []   # reset: E8's result must not satisfy E10 if it cannot run
 if bot_ts:
     mock.event('Ev9', {'type': 'message', 'channel': 'C1', 'user': 'UBOT', 'bot_id': 'BBOT', 'text': 'bot reply', 'ts': bot_ts, 'thread_ts': A})
     pump(1)

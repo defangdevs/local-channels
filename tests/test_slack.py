@@ -843,7 +843,10 @@ class TestBusRouting(unittest.TestCase):
                 self.assertIn('0.27.1', slack.find_webhook_py())            # not 0.9.0 or 0.10.0
             finally:
                 slack.__file__ = old_file
-                os.environ['HOME'] = old_home
+                if old_home is None:
+                    os.environ.pop('HOME', None)
+                else:
+                    os.environ['HOME'] = old_home
         self.assertTrue(slack.find_webhook_py().startswith(REPO))           # the checkout, no walk
 
     def test_emit_command_is_resolved_once(self):
