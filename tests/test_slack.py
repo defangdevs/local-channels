@@ -41,10 +41,12 @@ class Rig(unittest.TestCase):
         self.store = slack.Store(':memory:')
         self.cfg = slack._merge(slack.DEFAULT_CHANNEL, {'quiet_minutes': 10, 'max_wait_hours': 1})
         self.extra = {}
+        self.defaults = {}
         self.tr = slack.Tracker(
             self.store, {'C1': self.cfg}, BOT, lambda a, p: self.events.append((a, p)),
             now=lambda: self.t[0], react=lambda c, ts, e: self.reacts.append((c, ts, e)),
-            lookup=lambda c, ts: self.extra.get(ts), users=lambda uid: {'guest': False, 'external': False})
+            lookup=lambda c, ts: self.extra.get(ts), users=lambda uid: {'guest': False, 'external': False},
+            defaults=self.defaults)
 
     def actions(self):
         return [a for a, _ in self.events]
@@ -133,7 +135,8 @@ class TestTracker(Rig):
         self.tr.handle(msg('1.1', sub='channel_join'))
         self.assertEqual(self.events, [])
 
-    def test_mention_settles_immediately_and_acks(self):
+    def test_mention_settles_immediately_and_acks_only_when_configured(self):
+        self.cfg['reactions']['ack'] = 'eyes'
         self.tr.handle(msg('1.1', 'help <@UBOT>'))
         self.assertEqual(self.actions(), ['message.posted', 'thread.settled'])
         self.assertEqual(self.events[-1][1]['reason'], 'mention')
@@ -216,6 +219,7 @@ class TestTracker(Rig):
         self.assertEqual(self.store.q('SELECT extra_ts FROM threads')[0]['extra_ts'], '2.1')
 
     def test_feedback_on_bot_message(self):
+        self.defaults['feedback_reactions'] = ['+1', '-1']
         self.tr.handle(msg('1.1'))
         self.store.x('INSERT INTO msgs VALUES (?,?,?,?,?,?,?)', 'T1', 'C1', '1.5', '1.1', 'UBOT', 0, 0)
         self.tr.handle(reaction('1.5', '+1'))
@@ -407,6 +411,16 @@ class TestConfigAndBuckets(unittest.TestCase):
             self.assertEqual(df['dm_allowlist'], ['U1'])
             self.assertIn('disclosure', df)
 
+    def test_the_documented_example_loads_and_is_the_recommended_policy(self):
+        ch, df = slack.load_config(os.path.join(REPO, 'local-slack', 'channels.example.json'))
+        self.assertEqual(ch['C0123456789']['reactions']['ack'], 'eyes')
+        self.assertEqual(df['feedback_reactions'], ['+1', '-1'])
+        self.assertEqual(df['limits']['session_writes'], 20)
+        # ...and a bare install carries none of it.
+        self.assertIsNone(slack.DEFAULT_CHANNEL['reactions']['ack'])
+        self.assertEqual((slack.DEFAULT_DEFAULTS['disclosure'], slack.DEFAULT_DEFAULTS['feedback_reactions'],
+                          slack.DEFAULT_DEFAULTS['status_marks']), ('', [], {}))
+
     def test_reads_survive_a_write_burst(self):
         t = [0.0]
         b = slack.Bucket(45, now=lambda: t[0])
@@ -443,7 +457,6 @@ class TestWriter(unittest.TestCase):
         m, p = self.calls[-1]
         self.assertEqual((m, p['thread_ts'], p['unfurl_links'], p['unfurl_media']),
                          ('chat.postMessage', TS, False, False))
-        self.assertTrue(p['text'].endswith(slack.DEFAULT_DEFAULTS['disclosure']))
         self.assertNotIn('parse', p)
 
     def test_unconfigured_or_readonly_channel_refused(self):
@@ -488,6 +501,8 @@ class TestWriter(unittest.TestCase):
             self.w.status('C1', TS, 'working')
 
     def test_status_creates_then_edits_one_message_and_moves_the_reaction(self):
+        self.w.defaults['status_marks'] = {'working': 'hourglass_flowing_sand', 'done': 'white_check_mark', 'failed': 'x'}
+        self.cfg['reactions']['ack'] = 'eyes'
         self.ask()
         self.w.status('C1', TS, 'working')
         self.w.status('C1', TS, 'finished', 'done')
@@ -498,6 +513,36 @@ class TestWriter(unittest.TestCase):
         removes = [p['name'] for m, p in self.calls if m == 'reactions.remove']
         self.assertEqual(adds, ['hourglass_flowing_sand', 'white_check_mark'])
         self.assertIn('eyes', removes)   # the daemon's ack is replaced
+
+    def test_status_makes_no_reactions_unless_marks_are_configured(self):
+        self.cfg['reactions']['ack'] = 'eyes'
+        self.ask()
+        self.w.status('C1', TS, 'working')
+        self.w.status('C1', TS, 'done', 'done')
+        self.assertEqual([m for m, _ in self.calls if m.startswith('reactions.')], [])
+
+    def test_limits_come_from_config_and_zero_turns_a_cap_off(self):
+        self.ask()
+        self.w.defaults['limits'] = {'session_writes': 2}
+        self.w.reply('C1', TS, 'a')
+        self.w.reply('C1', TS, 'b')
+        with self.assertRaises(slack.Refused):
+            self.w.reply('C1', TS, 'c')
+        self.w.defaults['limits'] = {'session_writes': 0}
+        self.w.reply('C1', TS, 'd')
+        self.cfg['write']['top_level'] = True
+        self.w.defaults['limits'] = {'session_writes': 0, 'top_level_per_hour': 1}
+        self.w.post('C1', 'x')
+        with self.assertRaises(slack.Refused):
+            self.w.post('C1', 'y')
+
+    def test_no_disclosure_line_unless_configured(self):
+        self.ask()
+        self.w.reply('C1', TS, 'hello')
+        self.assertEqual(self.calls[-1][1]['text'], 'hello')
+        self.w.defaults['disclosure'] = '_— bot_'
+        self.w.reply('C1', TS, 'hello')
+        self.assertTrue(self.calls[-1][1]['text'].endswith('_— bot_'))
 
     def test_status_edits_do_not_eat_the_session_cap(self):
         self.ask()
@@ -672,16 +717,18 @@ class TestReviewRegressions(Rig):
         self.assertEqual(self.actions(), ['message.posted'])
 
     def test_feedback_resolves_and_never_reopens_the_thread(self):
+        self.defaults['feedback_reactions'] = ['+1']
         self.tr.handle(msg('1.1'))
         self.advance(601)
         self.tr.tick()                                   # settled
         self.tr.handle(msg('1.5', user='UBOT', thread_ts='1.1'))   # our own reply, indexed not counted
         self.assertEqual(self.actions().count('thread.settled'), 1)
         self.tr.handle(reaction('1.5', '+1'))
-        self.tr.handle(reaction('1.5', 'tada'))
         self.assertEqual(self.actions()[-1], 'feedback')
+        self.tr.handle(reaction('1.5', 'tada'))      # not a configured feedback reaction
+        self.assertEqual(self.actions()[-1], 'reaction.added')
+        self.assertTrue(self.events[-1][1]['on_bot_message'])
         self.assertNotIn('thread.reopened', self.actions())
-        self.assertNotIn('reaction.added', self.actions())
 
     def test_merged_message_still_emits_and_a_mention_in_it_settles(self):
         self.cfg['merge_window_minutes'] = 10
@@ -690,6 +737,27 @@ class TestReviewRegressions(Rig):
         self.tr.handle(msg('2.1', 'also <@UBOT> please'))
         self.assertEqual(self.actions(), ['message.posted', 'message.posted', 'thread.settled'])
         self.assertEqual(self.events[-1][1]['reason'], 'mention')
+
+    def test_with_no_feedback_reactions_configured_a_thumb_is_a_plain_reaction(self):
+        self.tr.handle(msg('1.1'))
+        self.advance(601)
+        self.tr.tick()
+        self.tr.handle(msg('1.5', user='UBOT', thread_ts='1.1'))
+        v = self.store.q('SELECT version FROM threads')[0]['version']
+        self.tr.handle(reaction('1.5', '+1'))
+        self.tr.handle(reaction('1.5', '+1', kind='reaction_removed'))
+        self.assertEqual(self.actions()[-2:], ['reaction.added', 'reaction.removed'])
+        self.assertTrue(all(p['on_bot_message'] for a, p in self.events[-2:]))
+        self.assertNotIn('feedback', self.actions())
+        self.assertEqual(self.store.q('SELECT version FROM threads')[0]['version'], v)   # never activity
+        self.assertNotIn('thread.reopened', self.actions())
+
+    def test_no_outward_action_without_config(self):
+        self.tr.handle(msg('1.1', 'help <@UBOT>'))
+        self.tr.handle(msg('2.1'))
+        self.tr.handle(reaction('2.1', 'white_check_mark'))
+        self.assertEqual(self.reacts, [])        # no ack: the daemon does not write by itself
+        self.assertIn('thread.settled', self.actions())
 
     def test_activity_during_a_hold_moves_the_version(self):
         self.tr.handle(msg('1.1'))

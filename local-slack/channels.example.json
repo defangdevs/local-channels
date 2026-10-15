@@ -1,0 +1,18 @@
+{
+  "C0123456789": {
+    "track": "all",
+    "quiet_minutes": 30,
+    "max_wait_hours": 24,
+    "resettle": true,
+    "reactions": {"ready": "white_check_mark", "hold": "raised_hand", "drop": "x", "ack": "eyes"},
+    "write": {"allowed": true, "mode": "on_request", "top_level": false, "broadcast": false, "groups": false}
+  },
+  "_defaults": {
+    "disclosure": "_— AI agent · can be wrong · 👍/👎 to rate_",
+    "limits": {"session_writes": 20, "session_window_s": 600, "top_level_per_hour": 5},
+    "feedback_reactions": ["+1", "-1"],
+    "status_marks": {"working": "hourglass_flowing_sand", "done": "white_check_mark", "failed": "x"},
+    "links": {"allowed_hosts": ["github.com"]},
+    "retention_days": 30
+  }
+}

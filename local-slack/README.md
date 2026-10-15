@@ -69,20 +69,65 @@ characters only (no backslash, no `user@`), path/query/fragment capped and
 scanned decoded, never unfurled; a scheme-less `evil.com` or `www.` link and
 `mailto:` are held to the same check. Image Markdown and secret patterns
 (zero-width characters ignored) are refused; a disclosure line is appended to
-`reply` and `post`; at most 20 writes per session per 10 minutes (`status`
-edits and the first-message count excepted) and 5 top-level posts per channel
-per hour; `reply`, `post`, `status` and `react` are audited in SQLite. Slack
+`reply` and `post` when `_defaults.disclosure` is set; write caps from
+`_defaults.limits` (fresh defaults 20 per session per 10 minutes, `status` edits
+excepted, and 5 top-level posts per channel per hour); `reply`, `post`, `status` and `react` are audited in SQLite. Slack
 calls go through per-tier token buckets with 40% reserved for reads; read
 methods are form-encoded, writes JSON.
 
-`status` keeps one message per thread and moves a reaction on the parent: the
-daemon's 👀 ack becomes ⏳, then ✅ (`--done`) or ❌ (`--failed`).
+`status` keeps one message per thread. If `_defaults.status_marks` names them it
+also moves a progress reaction on the parent (the ack, if configured, gives way
+to `working`, then `done` or `failed`); with none configured it makes no
+reactions.
 
 The session name is `AGENT_BOX_SESSION_ID` (else `AGENT_BOX_SESSION`); with
 neither set the per-session cap is shared by everyone on the box.
 
 Controllers (who may `ready`/`hold`/`drop`) default to full workspace members,
 looked up with `users.info`; a failed lookup counts as not a member.
+
+## Mechanism, not policy
+
+This repo carries mechanism only (Lio's rule from closing #13); the recommended
+*policy* belongs to agent-box, which renders it into `channels.json`.
+[`channels.example.json`](channels.example.json) is that recommendation, written
+out as the file agent-box would render.
+
+**Mechanism, and not configurable because it is correctness or a Slack fact:**
+de-duplication, persist-then-ack and the outbox; the settle state machine and its
+compare-and-swap; the message index; compose-don't-filter and the token-smuggle
+check; *enforcing* the broadcast flag, the link allowlist and the write gate; the
+classifier as an opaque command; `SECRET_PATTERNS` as a safety floor; the
+4,000-character limit; and that a reaction on the bot's own message is never
+thread activity.
+
+**Fail-closed, on purpose:** a channel not in `channels.json` is ignored, writing
+is off, a failed user lookup counts as a guest, and a Slack Connect channel is
+refused unless allowed.
+
+**The daemon does not act in Slack by itself.** With an empty `_defaults` it
+makes no reaction, appends no disclosure line, and keeps no status reactions.
+These are all opt-in: `reactions.ack` (per channel), `_defaults.disclosure`,
+`_defaults.status_marks`.
+
+**What a reaction on the bot's own message means is configurable.**
+`_defaults.feedback_reactions` names the reactions that go out as `feedback`;
+with none configured it goes out as a plain `reaction.added` / `reaction.removed`
+carrying `on_bot_message: true`, and the consumer decides.
+
+**Fresh defaults.** These are starting values only. An explicit value always
+wins, and nothing else in the code depends on them: `quiet_minutes` 30,
+`max_wait_hours` 24, the ✅/✋/❌ control reactions, `write.mode: on_request`,
+`retention_days` 30, and the write caps `_defaults.limits`
+(`session_writes` 20 per `session_window_s` 600, `top_level_per_hour` 5; 0 turns a
+cap off).
+
+Not done yet, deliberately: emitting the bot's own messages and reactions with
+`self: true` so a consumer can seed an exclude (the way local-webhook seeds its
+GitHub echo exclude). The settle timer already ignores them. When grants land
+(socket-service mode) they take the scope as given, with no built-in rule that a
+watch-started session is limited to its thread: deciding that is agent-box's
+spawn path.
 
 ## Not yet verified against Slack
 

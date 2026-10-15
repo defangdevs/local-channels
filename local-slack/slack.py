@@ -285,11 +285,17 @@ def config_path():
     return os.environ.get('LOCAL_SLACK_CONFIG') or os.path.expanduser('~/.config/local-slack/channels.json')
 
 
+# MECHANISM, NOT POLICY (this repo's rule, see the README). What follows are
+# fresh defaults: plain starting values a deployment replaces by writing its own,
+# and nothing else in the code depends on them. Anything that would make the
+# daemon ACT in Slack by itself (an ack reaction, status reactions, a disclosure
+# line) defaults to nothing; the recommended values live in agent-box's policy
+# and are rendered into channels.json (see channels.example.json).
 DEFAULT_CHANNEL = {
     'track': 'all',
     'quiet_minutes': 30, 'max_wait_hours': 24, 'merge_window_minutes': 0,
     'resettle': True, 'track_bots': False,
-    'reactions': {'ready': 'white_check_mark', 'hold': 'raised_hand', 'drop': 'x', 'ack': 'eyes'},
+    'reactions': {'ready': 'white_check_mark', 'hold': 'raised_hand', 'drop': 'x', 'ack': None},
     'controllers': [], 'ignore_users': [],
     'write': {'allowed': False, 'mode': 'on_request', 'top_level': False,
               'broadcast': False, 'groups': False},
@@ -297,8 +303,20 @@ DEFAULT_CHANNEL = {
 }
 DEFAULT_DEFAULTS = {
     'dm_allowlist': [], 'links': {'allowed_hosts': []},
-    'disclosure': '_— AI agent · can be wrong · 👍/👎 to rate_',
+    # Appended to reply/post/dm when set. The wording is the deployment's.
+    'disclosure': '',
     'retention_days': 30,
+    # Write caps. A value of 0 (or null) turns that cap off.
+    'limits': {'session_writes': 20, 'session_window_s': 600, 'top_level_per_hour': 5},
+    # Reaction names that mean "feedback" on one of the bot's own messages. With
+    # none configured such a reaction goes out as a plain reaction.added /
+    # reaction.removed carrying on_bot_message: true, and consumers decide what
+    # it means. Either way it is never thread activity.
+    'feedback_reactions': [],
+    # {'working': 'hourglass_flowing_sand', 'done': 'white_check_mark', 'failed': 'x'}:
+    # progress reactions `status` keeps on the thread parent. None configured,
+    # none made.
+    'status_marks': {},
 }
 
 
@@ -485,10 +503,11 @@ class Tracker:
     on an index miss. `users(user_id)` returns {'guest':bool,'external':bool}."""
 
     def __init__(self, store, channels, bot, emit, now=time.time, lookup=None, users=None,
-                 react=None, classify=None, retention_days=30):
+                 react=None, classify=None, retention_days=30, defaults=None):
         self.store, self.channels, self.bot = store, channels, bot
         self.emit, self.now = emit, now
         self.retention_days = retention_days
+        self.defaults = defaults if defaults is not None else {}
         self.lookup = lookup or (lambda channel, ts: None)
         # Fails CLOSED: with no way to ask Slack who a user is, nobody counts as a
         # full member, so nobody can ready, hold or drop a thread.
@@ -788,11 +807,18 @@ class Tracker:
         # 👍/👎 on one of the bot's own messages is feedback, not activity.
         m = self.store.q('SELECT user FROM msgs WHERE team=? AND channel=? AND ts=?', team, channel, ts)
         if m and m[0]['user'] == self.bot.get('user_id'):
-            # A reaction on the bot's own message is feedback or nothing; it is
-            # never thread activity, or rating a reply would re-settle the thread.
-            if emoji in ('+1', '-1', 'thumbsup', 'thumbsdown') and etype == 'reaction_added':
+            # A reaction on the bot's own message is never thread activity (that is
+            # correctness: rating a reply must not re-settle the thread). What it
+            # MEANS is the deployment's call: a configured feedback reaction goes
+            # out as `feedback`, anything else as a plain reaction flagged
+            # on_bot_message, for the consumer to interpret.
+            if etype == 'reaction_added' and emoji in (self.defaults.get('feedback_reactions') or []):
                 self.emit('feedback', self._payload(row, 'feedback', ts=ts, user=user,
                                                     extra={'rating': emoji, 'reason': 'feedback'}))
+            else:
+                act = 'reaction.added' if etype == 'reaction_added' else 'reaction.removed'
+                self.emit(act, self._payload(row, act, ts=ts, user=user,
+                                             extra={'reaction': emoji, 'on_bot_message': True}))
             return
         if etype == 'reaction_added':
             self._bump(row, cfg, now, user, reply=False)
@@ -809,11 +835,14 @@ class Tracker:
             return
         if row['state'] == 'held' or row['state'] == 'dropped':
             return
-        # Acknowledge before any agent exists (S1).
-        try:
-            self.react(row['channel'], ts, cfg['reactions']['ack'])
-        except Exception:
-            pass
+        # Acknowledge before any agent exists (S1), but only if the deployment
+        # configured an ack reaction: the daemon does not write to Slack by itself.
+        ack = cfg['reactions'].get('ack')
+        if ack:
+            try:
+                self.react(row['channel'], ts, ack)
+            except Exception:
+                pass
         # A human asked for the agent here: this is what unlocks replies in
         # write.mode on_request, and a plain quiet settle never does.
         self.store.x('UPDATE threads SET asked=1 WHERE thread_key=?', row['thread_key'])
@@ -1142,7 +1171,8 @@ def run_daemon():
         threading.Thread(target=go, daemon=True).start()
 
     tracker = Tracker(store, channels, bot, store.outbox_put, lookup=lookup, react=react,
-                      users=make_users_lookup(web), retention_days=defaults['retention_days'])
+                      users=make_users_lookup(web), retention_days=defaults['retention_days'],
+                      defaults=defaults)
 
     def prime_channels():
         for cid in list(tracker.channels):
@@ -1180,6 +1210,7 @@ def run_daemon():
             try:
                 tracker.channels, d = load_config()   # hot-reload the allowlist
                 tracker.retention_days = d['retention_days']
+                tracker.defaults = d
                 prime_channels()
                 tracker.tick()
                 wake.set()
@@ -1250,7 +1281,6 @@ guardrails in compose() and the per-channel write settings.''' % VERSION
 
 
 _TS_RE = re.compile(r'\d{9,}\.\d{1,9}')
-STATUS_MARKS = {'working': 'hourglass_flowing_sand', 'done': 'white_check_mark', 'failed': 'x'}
 
 
 class Writer:
@@ -1324,16 +1354,20 @@ class Writer:
         return cfg
 
     def _rate(self, channel, top_level):
+        lim = dict(DEFAULT_DEFAULTS['limits'], **(self.defaults.get('limits') or {}))
         now = time.time()
-        n = self.store.q("SELECT COUNT(*) c FROM audit WHERE session=? AND at>? AND kind != 'status_edit'",
-                         self.session, now - 600)[0]['c']
-        if n >= 20:
-            raise Refused('at most 20 writes per session per 10 minutes')
-        if top_level:
+        cap, window = lim.get('session_writes'), lim.get('session_window_s') or 600
+        if cap:
+            n = self.store.q("SELECT COUNT(*) c FROM audit WHERE session=? AND at>? AND kind != 'status_edit'",
+                             self.session, now - window)[0]['c']
+            if n >= cap:
+                raise Refused('at most %d writes per session per %d seconds' % (cap, window))
+        cap = lim.get('top_level_per_hour')
+        if top_level and cap:
             c = self.store.q("SELECT COUNT(*) c FROM audit WHERE channel=? AND kind='post' AND at>?",
                              channel, now - 3600)[0]['c']
-            if c >= 5:
-                raise Refused('at most 5 top-level posts per channel per hour')
+            if c >= cap:
+                raise Refused('at most %d top-level posts per channel per hour' % cap)
 
     def _index(self, channel, ts, thread_ts):
         """Index our own post, so a 👍/👎 on it resolves to its thread."""
@@ -1417,9 +1451,14 @@ class Writer:
             self.store.x('INSERT OR REPLACE INTO status VALUES (?,?)', k, r['ts'])
             self._index(channel, r.get('ts'), ts)
             self.audit('status', channel, ts, r.get('ts'), body)
+        marks = self.defaults.get('status_marks') or {}
         state = mark or 'working'
-        self._mark(channel, ts, STATUS_MARKS[state],
-                   remove=[cfg['reactions']['ack']] + [e for st, e in STATUS_MARKS.items() if st != state])
+        if marks.get(state):
+            # Progress reactions only when the deployment named them: the 👀 ack
+            # (if any) and the other states' marks give way to this one.
+            self._mark(channel, ts, marks[state],
+                       remove=[e for e in [cfg['reactions'].get('ack')] +
+                               [m for st, m in marks.items() if st != state] if e])
         return dict(r, unresolved=unresolved)
 
     def react(self, channel, ts, emoji):

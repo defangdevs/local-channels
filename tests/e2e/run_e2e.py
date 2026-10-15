@@ -180,8 +180,21 @@ mock.event('Ev8', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': '<@
 got = wait_notes(lambda n: act(n) == 'thread.settled')
 check('E8 a mention settles the thread immediately', got, got[0]['content'][:220] if got else 'no thread.settled')
 time.sleep(1.5)
+wrote = [c for c in mock.calls if c[1] in ('reactions.add', 'chat.postMessage', 'chat.update')]
+check('E8 with no ack configured the daemon writes nothing to Slack by itself', not wrote,
+      json.dumps([c[1:2] + (c[3],) for c in wrote])[:200])
+# Now a deployment opts in: an ack reaction and a disclosure line (hot-reloaded by the ticker).
+cfg = json.load(open(CFG))
+cfg['C1'].setdefault('reactions', {})['ack'] = 'eyes'
+cfg['_defaults']['disclosure'] = '_— AI agent · can be wrong_'
+json.dump(cfg, open(CFG, 'w'), indent=2)
+time.sleep(5)
+F = '1760500020.000100'
+mock.event('Ev8b', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': '<@UBOT> and this one?', 'ts': F})
+wait_notes(lambda n: act(n) == 'thread.settled' and F in json.dumps(n))
+time.sleep(1.5)
 eyes = [c for c in mock.calls if c[1] == 'reactions.add' and c[3].get('name') == 'eyes']
-check('E8 the daemon acknowledges the mention with 👀', eyes, json.dumps(eyes[0][3]) if eyes else 'no reactions.add eyes')
+check('E8b once configured, the daemon acknowledges a mention with 👀', eyes, json.dumps(eyes[0][3]) if eyes else 'no reactions.add eyes')
 
 # ---------------------------------------------------------------- writes through the CLI
 rc, out = cli('reply', 'C1', A, 'Thanks @alice, tracked in https://github.com/defangdevs/agent-box/issues/863')
@@ -215,8 +228,9 @@ if bot_ts:
     pump(1)
     mock.event('Ev10', {'type': 'reaction_added', 'user': 'U1', 'reaction': '+1',
                         'item': {'type': 'message', 'channel': 'C1', 'ts': bot_ts}, 'event_ts': '1760500010.000100'})
-    got = wait_notes(lambda n: act(n) == 'feedback')
-    check('E10 👍 on the bot\'s reply arrives as feedback', got, got[0]['content'][:200] if got else 'no feedback event')
+    got = wait_notes(lambda n: act(n) == 'reaction.added')
+check('E10 with no feedback_reactions configured, 👍 on the bot\'s reply is a plain reaction.added',
+      got and not [n for n in notes if act(n) == 'feedback'], got[0]['content'][:200] if got else 'no reaction.added')
 D = '1760500011.000100'
 mock.event('Ev11', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': 'Can we add CSV export?', 'ts': D})
 print('waiting for the quiet period (6 s) plus the ticker...', flush=True)
