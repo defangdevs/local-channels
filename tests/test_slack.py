@@ -673,6 +673,16 @@ class TestReviewRegressions(Rig):
         self.tr.handle(msg('1.2'))
         self.assertTrue(self.events[0][1]['external'])
 
+    def test_bot_rejoining_a_channel_resumes_tracking(self):
+        self.tr.handle({'team_id': 'T1', 'event_id': 'l1', 'event': {
+            'type': 'member_left_channel', 'channel': 'C1', 'user': 'UBOT'}})
+        self.tr.handle(msg('1.1'))
+        self.assertEqual(self.events, [])
+        self.tr.handle({'team_id': 'T1', 'event_id': 'j1', 'event': {
+            'type': 'member_joined_channel', 'channel': 'C1', 'user': 'UBOT'}})
+        self.tr.handle(msg('1.2'))
+        self.assertEqual(self.actions(), ['message.posted'])
+
     def test_a_dead_bus_leaves_the_outbox_rows(self):
         self.store.outbox_put('thread.settled', {'team': 'T', 'channel': 'C', 'n': 1})
         self.store.outbox_put('thread.settled', {'team': 'T', 'channel': 'C', 'n': 2})
@@ -714,6 +724,35 @@ class TestBusRouting(unittest.TestCase):
         self.assertEqual(key, 'T0123/C0456')
         self.assertTrue(webhook.match_topic('slack', key, 'slack:T0123/C0456'))
         self.assertFalse(webhook.match_topic('slack', key, 'slack:T0123/C9999'))
+
+    def test_cache_lookup_picks_the_newest_version_and_checkout_wins(self):
+        with tempfile.TemporaryDirectory() as home:
+            for v in ('0.9.0', '0.27.1', '0.10.0'):
+                d = os.path.join(home, '.claude/plugins/cache/local-channels/local-webhook', v)
+                os.makedirs(d)
+                open(os.path.join(d, 'webhook.py'), 'w').close()
+            old_home, old_file = os.environ.get('HOME'), slack.__file__
+            os.environ['HOME'] = home
+            slack.__file__ = os.path.join(home, 'elsewhere', 'slack.py')     # no sibling checkout
+            try:
+                self.assertIn('0.27.1', slack.find_webhook_py())            # not 0.9.0 or 0.10.0
+            finally:
+                slack.__file__ = old_file
+                os.environ['HOME'] = old_home
+        self.assertTrue(slack.find_webhook_py().startswith(REPO))           # the checkout, no walk
+
+    def test_emit_command_is_resolved_once(self):
+        calls = []
+        old_cmd, old_run = slack.emit_command, slack.subprocess.run
+        slack.emit_command = lambda: calls.append(1) or ['x', 'emit']
+        slack.subprocess.run = lambda cmd, **kw: type('R', (), {'returncode': 0})()
+        try:
+            e = slack.make_emitter()
+            for _ in range(5):
+                e('a', {'team': 'T', 'channel': 'C'})
+        finally:
+            slack.emit_command, slack.subprocess.run = old_cmd, old_run
+        self.assertEqual(len(calls), 1)
 
     def test_default_emit_command_is_one_that_exists(self):
         os.environ.pop('LOCAL_SLACK_EMIT', None)

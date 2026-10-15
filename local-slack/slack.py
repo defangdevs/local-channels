@@ -537,9 +537,12 @@ class Tracker:
                 self._reaction(team, ev, etype, now)
             elif etype in ('channel_shared', 'channel_unshared'):
                 self.external[ev.get('channel')] = (etype == 'channel_shared')
-            elif etype == 'member_left_channel':
+            elif etype in ('member_left_channel', 'member_joined_channel'):
+                # Joining restores what leaving paused; without it a bot that is
+                # removed and re-invited would drop every message, silently,
+                # until the daemon restarted.
                 if self._is_bot_self(user=ev.get('user')):
-                    self.member[ev.get('channel')] = False
+                    self.member[ev.get('channel')] = (etype == 'member_joined_channel')
             self.store.mark_seen(eid, now)
 
     def prime(self, channel, info):
@@ -982,20 +985,28 @@ class WS:
 # 7. daemon
 # --------------------------------------------------------------------------
 
+def _version_key(path):
+    return [int(n) for n in re.findall(r'\d+', path)]
+
+
 def find_webhook_py():
     """The local-webhook CLI that has `emit`. agent-box's `agent-box-webhook`
     wrapper does not, so default to the plugin's own webhook.py: next to this
-    plugin in a checkout, else in the Claude plugin cache."""
+    plugin in a checkout, else the newest one in the Claude plugin cache. The
+    checkout is tried first so the common case never walks the cache (which can
+    hold node_modules-sized trees)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    cands = [os.path.join(here, '..', 'local-webhook', 'webhook.py')]
+    local = os.path.normpath(os.path.join(here, '..', 'local-webhook', 'webhook.py'))
+    if os.path.isfile(local):
+        return local
     cache = os.path.expanduser('~/.claude/plugins/cache')
+    cands = []
     for root, _dirs, files in os.walk(cache) if os.path.isdir(cache) else []:
-        if os.path.basename(root) != '.git' and 'webhook.py' in files and 'local-webhook' in root:
+        if 'webhook.py' in files and 'local-webhook' in root:
             cands.append(os.path.join(root, 'webhook.py'))
-    for c in cands:
-        if os.path.isfile(c):
-            return os.path.normpath(c)
-    return None
+    # os.walk order is arbitrary, so pick the highest version rather than the
+    # first found: a stale cached copy must not win.
+    return max(cands, key=_version_key) if cands else None
 
 
 def emit_command():
@@ -1012,8 +1023,12 @@ def make_emitter(source='slack'):
     subscriptions AND standing-watch dispatch like any other delivery. Returns
     True on success: the outbox keeps a row until this does. The payload goes
     on stdin, not argv, where another local user could read it in /proc."""
+    resolved = []   # resolved once; retried only while nothing was found
+
     def emit(action, payload):
-        cmd = emit_command()
+        if not resolved or resolved[0] is None:
+            resolved[:] = [emit_command()]
+        cmd = resolved[0]
         if not cmd:
             print('local-slack: no emit command (set LOCAL_SLACK_EMIT, or install local-webhook)',
                   file=sys.stderr)

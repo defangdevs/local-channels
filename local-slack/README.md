@@ -19,7 +19,7 @@ only author of its input.
    `channels:history groups:history channels:read groups:read chat:write
    reactions:read reactions:write users:read`, and bot events
    `message.channels message.groups reaction_added reaction_removed
-   channel_shared channel_unshared member_left_channel`. Do **not** add
+   channel_shared channel_unshared member_left_channel member_joined_channel`. Do **not** add
    `app_mentions:read` (mentions are read from `message` events; subscribing to
    both delivers each twice).
 2. Set `SLACK_APP_TOKEN` (`xapp-…`) and `SLACK_BOT_TOKEN` (`xoxb-…`).
