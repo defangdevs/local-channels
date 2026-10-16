@@ -38,14 +38,26 @@ only author of its input.
    overrides the command. Events are written to an outbox table in the same
    transaction pass that updates the thread and delivered by a worker that
    keeps the row until the emit succeeds, so a bus that is down delays events
-   and does not lose them.
+   and does not lose them. **If the receiver is socket-activated** (agent-box
+   runs it as `agent-box-webhook@<user>.socket`), its daemon writes the file
+   `emit` uses to find the ingress only after something has connected, so
+   under a clean systemd environment every emit fails with "no ingress". Set
+   `LOCAL_WEBHOOK_HTTP_SOCK` to the receiver's socket path in the daemon's
+   environment; the emit failure message names it. The path is the
+   deployment's, so agent-box's unit sets it (agent-box#864), not this repo.
 5. Invite the bot to a channel (`/invite`), then `slack.py channel add C0123`.
    It refuses a channel the bot is not in, and a Slack Connect channel unless
    `--allow-external`. `channel add` on an existing channel changes only the
    flags you pass and refuses to touch a `channels.json` that does not parse.
+   A new entry starts as a copy of the file's `_channel_defaults` object, if it
+   has one (see [`channels.example.json`](channels.example.json)); explicit flags
+   win, and an existing entry is never re-templated.
    **A channel missing from `channels.json` is never processed, even if the bot
    is in it.**
-6. `slack.py daemon`.
+6. `slack.py daemon`. It logs one line when Socket Mode connects (team, bot
+   user, configured channel count) and keeps `connection.json` in the state dir
+   up to date; `slack.py doctor` reports it, and says so when the recorded pid
+   is gone.
 
 ## Events (topic `slack:<team>/<channel>`)
 
@@ -131,10 +143,11 @@ spawn path.
 
 ## Not yet verified against Slack
 
-Nothing here has talked to a real workspace. First live run, in order: events
-reach a subscribed session; `conversations.replies`/`users.list` return data;
-whether `markdown_text` accepts mention syntax (this sends mrkdwn `text`);
-whether Slack linkifies a bare domain in API `text`.
+First live test (2026-10-16, issue #88) passed for: events reaching a subscribed
+session, `conversations.replies`, the ack reaction, `thread.settled`/`reopened`,
+`reply`, and `@channel` refusal. Still unverified: `users.list` (`@name`
+resolution), whether `markdown_text` accepts mention syntax (this sends mrkdwn
+`text`), and whether Slack linkifies a bare domain in API `text`.
 
 Tests: `python -m unittest discover -s tests` for the unit layer, and
 `python tests/e2e/run_e2e.py` for an end-to-end run (about 25 s): a mock Slack

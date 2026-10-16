@@ -1093,12 +1093,21 @@ def make_emitter(source='slack'):
         body['route'] = '%s/%s' % (payload['team'], payload['channel'])
         try:
             r = subprocess.run(cmd + [source, '-', '--event', action], input=json.dumps(body).encode(),
-                               check=False, timeout=15, stdout=subprocess.DEVNULL)
+                               check=False, timeout=15, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE)
         except (OSError, subprocess.SubprocessError) as e:
             print('local-slack: emit %s failed: %s' % (action, e), file=sys.stderr)
             return False
         if r.returncode:
-            print('local-slack: emit %s exited %d' % (action, r.returncode), file=sys.stderr)
+            err = (r.stderr or b'').decode('utf-8', 'replace').strip()
+            print('local-slack: emit %s exited %d%s' % (action, r.returncode, ': ' + err if err else ''),
+                  file=sys.stderr)
+            if 'no ingress' in err and not os.environ.get('LOCAL_WEBHOOK_HTTP_SOCK'):
+                # A socket-activated receiver (agent-box) writes its discovery
+                # file only once something has connected, so under a clean
+                # systemd environment `emit` cannot find it by itself.
+                print('local-slack: hint: set LOCAL_WEBHOOK_HTTP_SOCK to the receiver socket in this '
+                      "daemon's environment (see the README, Setup step 4)", file=sys.stderr)
             return False
         return True
     return emit
@@ -1137,6 +1146,29 @@ def make_users_lookup(web, ttl=3600):
         cache[uid] = (time.time(), out)
         return out
     return users
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def write_connection_status(state, **info):
+    """One small file `doctor` reads, since a daemon that logs only errors
+    cannot otherwise be asked whether it is connected."""
+    doc = dict(info, state=state, at=int(time.time()), pid=os.getpid())
+    path = os.path.join(state_dir(), 'connection.json')
+    try:
+        with open(path + '.tmp', 'w') as f:
+            json.dump(doc, f)
+        os.replace(path + '.tmp', path)
+    except OSError as e:
+        print('local-slack: cannot write %s: %s' % (path, e), file=sys.stderr)
 
 
 def run_daemon():
@@ -1224,6 +1256,10 @@ def run_daemon():
         try:
             url = web.call('apps.connections.open', token=app_token)['url']
             ws = WS(url)
+            info = {'team': me.get('team_id'), 'bot_user': me['user_id'], 'channels': len(tracker.channels)}
+            print('local-slack: connected to Socket Mode (team %s, bot %s, %d configured channels)' % (
+                info['team'], info['bot_user'], info['channels']), file=sys.stderr, flush=True)
+            write_connection_status('connected', **info)
             while True:
                 raw = ws.recv()
                 if raw is None:
@@ -1251,6 +1287,7 @@ def run_daemon():
             # old socket behind otherwise; close it before dialling again.
             if ws is not None:
                 ws.close()
+            write_connection_status('disconnected')
         # Only a connection that lasted counts as healthy: a server that
         # disconnects at once (link_disabled) must not be redialled every second.
         backoff = 1 if time.time() - t0 > 30 else min(backoff * 2, 60)
@@ -1496,7 +1533,12 @@ def channel_add(cid, args, web=None, path=None):
     existing entry keeps its controllers, write settings and everything else
     hand-tuned in the file."""
     raw = read_raw(path)
-    entry = dict(raw.get(cid) or {})
+    # A new entry starts from the file's `_channel_defaults` template (its
+    # contents are the deployment's policy; copying it is the mechanism). An
+    # existing entry is never re-templated, and explicit flags below still win.
+    tmpl = raw.get('_channel_defaults')
+    entry = dict(raw[cid]) if isinstance(raw.get(cid), dict) else (
+        json.loads(json.dumps(tmpl)) if isinstance(tmpl, dict) else {})
     track = _opt(args, '--track')
     quiet = _opt(args, '--quiet')
     write = _opt(args, '--write', flag=True)
@@ -1579,6 +1621,14 @@ def _main(cmd, rest):
         print('app token: %s' % ('set …' + os.environ['SLACK_APP_TOKEN'][-4:]
                                  if os.environ.get('SLACK_APP_TOKEN') else 'MISSING'))
         print('channels configured: %d (config %s)' % (len(channels), config_path()))
+        try:
+            with open(os.path.join(state_dir(), 'connection.json')) as f:
+                c = json.load(f)
+            print('daemon: %s since %s (pid %s%s)' % (
+                c.get('state'), time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(c.get('at', 0))),
+                c.get('pid'), '' if _pid_alive(c.get('pid')) else ', NOT RUNNING - status is stale'))
+        except (OSError, ValueError):
+            print('daemon: no status file (never started)')
         return 0
     if cmd == 'thread' and len(rest) == 2:
         r = web.call('conversations.replies', {'channel': rest[0], 'ts': rest[1], 'limit': 200})
