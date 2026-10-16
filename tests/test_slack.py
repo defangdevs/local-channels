@@ -6,6 +6,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -412,8 +413,16 @@ class TestConfigAndBuckets(unittest.TestCase):
             self.assertIn('disclosure', df)
 
     def test_the_documented_example_loads_and_is_the_recommended_policy(self):
-        ch, df = slack.load_config(os.path.join(REPO, 'local-slack', 'channels.example.json'))
-        self.assertEqual(ch['C0123456789']['reactions']['ack'], 'eyes')
+        path = os.path.join(REPO, 'local-slack', 'channels.example.json')
+        ch, df = slack.load_config(path)
+        self.assertEqual(ch, {})   # a template, not a placeholder channel
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'c.json')
+            shutil.copy(path, p)
+            slack.channel_add('C9', ['--quiet', '5'], None, p)
+            ch, _ = slack.load_config(p)
+            self.assertEqual(ch['C9']['reactions']['ack'], 'eyes')
+            self.assertEqual(ch['C9']['quiet_minutes'], 5)   # explicit flag wins
         self.assertEqual(df['feedback_reactions'], ['+1', '-1'])
         self.assertEqual(df['limits']['session_writes'], 20)
         # ...and a bare install carries none of it.
@@ -909,6 +918,43 @@ class TestCliSmoke(unittest.TestCase):
                 slack.channel_add('C1', [], W({'is_member': True, 'is_ext_shared': True}), p)
             slack.channel_add('C1', ['--allow-external'], W({'is_member': True, 'is_ext_shared': True}), p)
             self.assertTrue(json.load(open(p))['C1']['allow_external'])
+
+    def test_channel_add_does_not_retemplate_an_existing_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'c.json')
+            json.dump({'_channel_defaults': {'quiet_minutes': 9}, 'C1': {'quiet_minutes': 3}}, open(p, 'w'))
+            slack.channel_add('C1', ['--write'], None, p)
+            self.assertEqual(json.load(open(p))['C1']['quiet_minutes'], 3)
+
+    def test_connection_status_file_and_doctor_liveness(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ['LOCAL_SLACK_STATE_DIR'] = d
+            try:
+                slack.write_connection_status('connected', team='T1', channels=2)
+                c = json.load(open(os.path.join(d, 'connection.json')))
+                self.assertEqual((c['state'], c['team'], c['pid']), ('connected', 'T1', os.getpid()))
+                self.assertTrue(slack._pid_alive(os.getpid()))
+                self.assertFalse(slack._pid_alive(None))
+            finally:
+                del os.environ['LOCAL_SLACK_STATE_DIR']
+
+    def test_emit_failure_shows_the_reason_and_hints_at_the_socket(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, 'emit.py')
+            open(fake, 'w').write("import sys; sys.exit('no ingress to deliver to')")
+            os.environ['LOCAL_SLACK_EMIT'] = '%s %s' % (sys.executable, fake)
+            os.environ.pop('LOCAL_WEBHOOK_HTTP_SOCK', None)
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    ok = slack.make_emitter()('message.posted', {'team': 'T', 'channel': 'C'})
+            finally:
+                del os.environ['LOCAL_SLACK_EMIT']
+            self.assertFalse(ok)
+            self.assertIn('no ingress', err.getvalue())
+            self.assertIn('LOCAL_WEBHOOK_HTTP_SOCK', err.getvalue())
 
     def test_channel_add_rm(self):
         with tempfile.TemporaryDirectory() as d:
