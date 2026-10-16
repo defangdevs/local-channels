@@ -142,8 +142,9 @@ caption. No public URL, new account, or re-pairing is required.
 A message ID holds one pending reply at a time, either text or an image. To send an
 acknowledgement and then a final text reply to the same message, wait until the first
 reaches `sent` before queuing the next; a different text queued while the first is still
-`queued` or `sending` is rejected with `message already has a different reply`. Repeating the same image
-bytes and caption is idempotent; trying to replace a reply is rejected. As with
+`queued` or `sending` is rejected with `message already has a different reply`. Repeating
+the same image bytes and caption is idempotent; replacing an image reply with a different
+reply is rejected. As with
 text replies, a crash after WhatsApp accepts a send but before the bridge records
 success can cause a duplicate. Inbound images and documents are supported as described below.
 
