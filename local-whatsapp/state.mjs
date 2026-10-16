@@ -70,11 +70,15 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   const media = content?.imageMessage || content?.documentMessage || content?.videoMessage;
   const fullText = content?.conversation || content?.extendedTextMessage?.text || media?.caption || '';
   if (typeof fullText !== 'string' || fullText.length > MAX_TEXT + prefix.length + 1) return null;
+  // An empty prefix means plain mode: the owner self-chat is already checked
+  // above, so every text is accepted. Captioned media is accepted too.
+  const plain = prefix === '';
   const head = `${prefix} `;
-  const prefixed = fullText.toLowerCase().startsWith(head.toLowerCase()) || (media && fullText.toLowerCase() === prefix.toLowerCase());
-  if (!prefixed && !(media && allowBareMedia)) return null;
+  const prefixed = !plain && (fullText.toLowerCase().startsWith(head.toLowerCase()) || fullText.toLowerCase() === prefix.toLowerCase());
+  if (!prefixed && !plain && !(media && allowBareMedia)) return null;
+  if (plain && media && !fullText.trim() && !allowBareMedia) return null;
   const text = (prefixed ? fullText.slice(head.length) : fullText).trim();
-  if (!text && !media) return null;
+  if (text.length > MAX_TEXT || (!text && !media)) return null;
   return {
     id: createHash('sha256').update(`${chat}\0${key.id}`).digest('hex').slice(0, 24),
     chat,
