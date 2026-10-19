@@ -2403,7 +2403,7 @@ def summarize_generic(event, key, p):
     # carried. A short string without control characters, and only when present.
     ident = p.get('identifier') if isinstance(p, dict) else None
     if (isinstance(ident, str) and 0 < len(ident) <= 200
-            and not re.search(r'[\x00-\x1f\x7f]', ident)):
+            and not re.search(r'[\x00-\x1f\x7f-\x9f]', ident)):
         meta['identifier'] = ident
     fields = generic_scalars(p)
     for env_key in GENERIC_ENVELOPE_KEYS:

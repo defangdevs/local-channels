@@ -1274,7 +1274,7 @@ class TestSummarizeGeneric(StateDirCase):
         self.assertEqual(meta['identifier'], 'T1/C1/1.5')
 
     def test_identifier_absent_or_not_a_short_string_is_left_out(self):
-        for p in ({}, {'identifier': 7}, {'identifier': ''}, {'identifier': 'x' * 201}, {'identifier': 'a\nb'}, {'identifier': 'a\x7fb'}, None):
+        for p in ({}, {'identifier': 7}, {'identifier': ''}, {'identifier': 'x' * 201}, {'identifier': 'a\nb'}, {'identifier': 'a\x7fb'}, {'identifier': 'a\x85b'}, None):
             _, meta = self.mod.summarize_generic('e', 'k', p)
             self.assertNotIn('identifier', meta, p)
 
