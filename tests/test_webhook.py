@@ -1315,6 +1315,15 @@ class TestSummarizeGithubCiMeta(StateDirCase):
 class TestSummarizeGeneric(StateDirCase):
     """A generic sender's identifying fields live one envelope down."""
 
+    def test_identifier_rides_in_the_meta(self):
+        _, meta = self.mod.summarize_generic('thread.settled', 'T1/C1', {'identifier': 'T1/C1/1.5'})
+        self.assertEqual(meta['identifier'], 'T1/C1/1.5')
+
+    def test_identifier_absent_or_not_a_short_string_is_left_out(self):
+        for p in ({}, {'identifier': 7}, {'identifier': ''}, {'identifier': 'x' * 201}, {'identifier': 'a\nb'}, {'identifier': 'a\x7fb'}, {'identifier': 'a\x85b'}, None):
+            _, meta = self.mod.summarize_generic('e', 'k', p)
+            self.assertNotIn('identifier', meta, p)
+
     def summary(self, payload, event='Issue', key='ENG'):
         return self.mod.summarize_generic(event, key, payload)[0]
 

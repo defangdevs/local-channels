@@ -2485,6 +2485,16 @@ def generic_scalars(p, prefix=''):
 
 def summarize_generic(event, key, p):
     meta = {'event': event, 'key': key}
+    # The sender's own name for the object (Slack: team/channel/thread_ts). A
+    # spawn command scopes a claim to it instead of falling back to GitHub's
+    # number/sha shapes, which a non-GitHub event never has (agent-box#875).
+    # Top level only, because the claim predicate a consumer writes addresses
+    # that same path; a sender that nests it (Linear's data.identifier) is not
+    # carried. A short string without control characters, and only when present.
+    ident = p.get('identifier') if isinstance(p, dict) else None
+    if (isinstance(ident, str) and 0 < len(ident) <= 200
+            and not re.search(r'[\x00-\x1f\x7f-\x9f]', ident)):
+        meta['identifier'] = ident
     fields = generic_scalars(p)
     for env_key in GENERIC_ENVELOPE_KEYS:
         if isinstance(p, dict) and isinstance(p.get(env_key), dict):
