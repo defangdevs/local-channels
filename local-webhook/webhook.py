@@ -716,32 +716,52 @@ def note_error(note, dispatch):
     n = len(note)
     if n <= note_limit(dispatch):
         return None
-    return ('note is %d characters; the maximum for a %s is %d. A note is cut nowhere, so a long one '
-            'would lose its END — usually the part that matters. Shorten it%s.'
+    return ('note is %d characters; the maximum for a %s is %d. Notes are never cut, because a cut '
+            'would lose the END, usually the part that matters. Shorten it%s.'
             % (n, 'standing watch' if dispatch else 'session subscription', note_limit(dispatch),
                '' if dispatch else ', or pass deliver_to:"subagent" for a watch (limit %d)' % NOTE_MAX_WATCH))
 
 
+# A day is far beyond any coalescing purpose, and a larger value would not even
+# arm a threading.Timer (OverflowError), wedging the bucket for good.
+SPAWN_WINDOW_MAX = 86400
+
+
+def spawn_window_ok(v):
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= SPAWN_WINDOW_MAX
+
+
 def spawn_window_error(v):
-    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
-        return 'spawn_window_s must be an integer >= 0 (seconds), or null to clear'
+    if not spawn_window_ok(v):
+        return ('spawn_window_s must be an integer from 0 to %d (seconds), or null to clear'
+                % SPAWN_WINDOW_MAX)
     return None
 
 
-def clip_note(t, note_max, where):
-    note = t.get('note')
-    if not isinstance(note, str):
-        return ''
-    if len(note) > note_max:
-        # Reported once per process and entry: this runs on every delivery.
-        mark = (where, t.get('topic'), t.get('name'))
+def entry_note(e):
+    """The note as it is USED (delivery text, spawn env): cut at the entry's
+    limit. The stored note stays whole, so a rewrite of the file never makes a
+    cut permanent; webhook_subscriptions reports it with a warning."""
+    note = e.get('note') or ''
+    limit = e.get('noteMax') or NOTE_MAX_WATCH
+    if len(note) > limit:
+        mark = (e.get('topic'), e.get('name'))
         if mark not in _NOTE_CLIPPED:
             _NOTE_CLIPPED.add(mark)
             print('local-webhook: the note on %s%s is %d characters; only the first %d are used '
-                  '(hand-edited file?)' % (t.get('topic'), ' name=%s' % t['name'] if t.get('name') else '',
-                                           len(note), note_max), file=sys.stderr)
-        return note[:note_max]
+                  '(hand-edited file?)' % (e.get('topic'), ' name=%s' % e['name'] if e.get('name') else '',
+                                           len(note), limit), file=sys.stderr)
+        return note[:limit]
     return note
+
+
+def note_warning(e):
+    note = e.get('note') or ''
+    limit = e.get('noteMax') or NOTE_MAX_WATCH
+    if len(note) > limit:
+        return ('note is %d characters; only the first %d are used (hand-edited file?). '
+                'Resubscribe with a shorter one.' % (len(note), limit))
+    return ''
 
 
 def normalize_entry(t, note_max=NOTE_MAX_WATCH, where=''):
@@ -773,13 +793,12 @@ def normalize_entry(t, note_max=NOTE_MAX_WATCH, where=''):
             # (write_filter no longer emits the old names).
             'include': t.get('include', t.get('when', None)),
             'exclude': t.get('exclude', t.get('drop', None)),
-            'note': clip_note(t, note_max, where),
+            'note': t['note'] if isinstance(t.get('note'), str) else '',
+            'noteMax': note_max,
             # #93: this watch's own coalescing window, seconds; None = the
             # global LOCAL_WEBHOOK_SPAWN_WINDOW. Only a dispatch entry reads it,
             # normalized on both files like spawnConfig.
-            'spawnWindowS': (t['spawnWindowS'] if isinstance(t.get('spawnWindowS'), int)
-                             and not isinstance(t.get('spawnWindowS'), bool) and t['spawnWindowS'] >= 0
-                             else None),
+            'spawnWindowS': t['spawnWindowS'] if spawn_window_ok(t.get('spawnWindowS')) else None,
             # Opaque to this repo; only a dispatch entry can do anything with
             # it, but it is normalized on both files so a mis-filed one stays
             # visible in webhook_subscriptions rather than vanishing on read.
@@ -1727,8 +1746,9 @@ def format_delivery(env, entry):
     # event is being routed here at all.
     if entry and (entry['note'] or entry['subscribedAt']):
         age = age_str(entry['subscribedAt'], now_ms())
+        note = entry_note(entry)
         text += '\n[subscribed to %s%s%s]' % (
-            entry['topic'], ' %s ago' % age if age else '', ': %s' % entry['note'] if entry['note'] else '')
+            entry['topic'], ' %s ago' % age if age else '', ': %s' % note if note else '')
     return text, meta
 
 
@@ -1994,7 +2014,13 @@ class Dispatcher:
         st = self.keys[key]
         if st['running'] or not st['pending'] or self.active >= self.max:
             return
-        delay = 0 if st['last_start'] is None else st['last_start'] + st.get('window', self.window) - self.clock()
+        # A batch the spawn command declined (exit 75) is paced by the larger of
+        # the watch's window and the global one, with a floor of one second:
+        # a watch window of 0 must not turn the deferral into a hot loop.
+        win = st.get('window', self.window)
+        if st['defer_since'] is not None:
+            win = max(win, self.window, 1)
+        delay = 0 if st['last_start'] is None else st['last_start'] + win - self.clock()
         if delay > 0:
             if st['timer'] is None:
                 st['timer'] = threading.Timer(delay, self._on_timer, args=(key,))
@@ -2279,7 +2305,7 @@ def dispatch_event(env):
         'key': env.get('key', ''),
         'event': env.get('event', ''),
         'topic': entry['topic'] if entry else '',
-        'note': entry['note'] if entry else '',
+        'note': entry_note(entry) if entry else '',
         # Which watch matched, in the watch's own words (agent-box#321). Flat and separate
         # from 'payload' so the two can never shadow each other.
         'spawnConfig': entry['spawnConfig'] if entry else {},
@@ -2725,8 +2751,9 @@ TOOLS = [
                         'nothing. Omit to keep on renew; pass {} to clear.',
                 },
                 'spawn_window_s': {
-                    'type': 'integer',
+                    'type': ['integer', 'null'],
                     'minimum': 0,
+                    'maximum': SPAWN_WINDOW_MAX,
                     'description':
                         'Standing watches only (deliver_to:"subagent"): this watch\'s own coalescing '
                         'window in seconds — after a session starts for it, further events wait this long '
@@ -2734,7 +2761,10 @@ TOOLS = [
                         'suits GitHub (one failure\'s check_run + workflow_run become one session) but '
                         'makes a chat watch feel slow; 0 starts a follow-up as soon as the previous '
                         'spawn finishes. Part of what keeps buckets apart, so two watches on one topic '
-                        'with different windows do not share timing. Refused on a session subscription. '
+                        'with different windows do not share timing. At most 86400. The default 60 s also covers '
+                        'the seconds a spawned session needs to claim its object: a shorter window lets '
+                        'a same-object follow-up start a second session, so pick a value at or above '
+                        'your spawn-to-claim latency. Refused on a session subscription. '
                         'Omit to keep on renew; pass null to clear.',
                 },
                 'ownership': {
@@ -2876,6 +2906,8 @@ def call_tool(params):
                 o['name'] = e['name']
             if e['note']:
                 o['note'] = e['note']
+            if note_warning(e):
+                o['warning'] = note_warning(e)
             if e['ttlHours'] is not None:
                 o['ttlHours'] = e['ttlHours']
             if e['renewOnEvent']:
@@ -3855,7 +3887,7 @@ def run_cli(argv):
             try:
                 args['spawn_window_s'] = int(value())
             except ValueError:
-                die('--spawn-window needs a whole number of seconds >= 0')
+                die('--spawn-window needs a whole number of seconds from 0 to %d' % SPAWN_WINDOW_MAX)
         elif a == '--no-spawn-window':
             args['spawn_window_s'] = None
         elif a == '--read-only':

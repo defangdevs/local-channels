@@ -1044,6 +1044,22 @@ class TestSpawnConfig(StateDirCase):
         self.assertIn('maximum for a session subscription is 300', out)
         self.assertNotIn('error', self.call('webhook_subscribe', topic='o/r', note='z' * 300))
 
+    def test_a_spawn_window_has_an_upper_bound(self):  # review of #96
+        self.assertIn('0 to 86400', self.watch(spawn_window_s=10 ** 10))
+        self.assertNotIn('error', self.watch(spawn_window_s=86400))
+        f = self.mod.normalize_entry({'topic': 'github:o/r', 'spawnWindowS': 10 ** 10})
+        self.assertIsNone(f['spawnWindowS'])
+
+    def test_a_long_hand_edited_note_is_kept_whole_and_reported(self):  # review of #96
+        self.write_json('filter.dispatch.json', {'enabled': True, 'topics': [
+            {'topic': 'github:o/r', 'include': ANY_EVENT, 'ttlHours': 0, 'note': 'n' * 1500}]})
+        self.assertIn('only the first 1000 are used', self.call('webhook_subscriptions'))
+        self.call('webhook_subscribe', topic='o/other', **self.WATCH)  # rewrites the file
+        notes = [e.get('note') for e in self.read_json('filter.dispatch.json')['topics']]
+        self.assertIn('n' * 1500, notes)
+        f = self.mod.read_filter(self.mod.DISPATCH_FILE)
+        self.assertEqual(len(self.mod.entry_note(f['topics'][0])), 1000)
+
     def test_a_watch_stores_and_echoes_its_config(self):
         out = self.watch(spawn_config={'profile': 'cheap-triage'})
         self.assertIn('[spawn config: profile=cheap-triage]', out)
@@ -2362,6 +2378,14 @@ class TestDispatcher(StateDirCase):
         self.assertLess(text.index('declined'), text.index('arrived-while-waiting'))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
         self.assertIsNone(d.keys['k']['defer_since'])   # streak closed on acceptance
+
+    def test_a_declined_batch_is_not_retried_in_a_hot_loop_at_window_0(self):  # review of #96
+        log = os.path.join(self.state, 'declines.log')
+        d = self.mod.Dispatcher('echo x >> %s; exit 75' % log, 2, 60, 30)
+        d.add('k', 'declined', {'key': 'k', 'spawnWindowS': 0})
+        time.sleep(2)
+        with open(log, encoding='utf-8') as f:
+            self.assertLessEqual(len(f.read().split()), 2)
 
     def test_a_deferred_batch_is_re_checked_for_ownership(self):
         # The whole point of waiting is that the answer changes while you
