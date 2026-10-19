@@ -365,7 +365,13 @@ under every delivery on that topic:
 
 so a session that has since lost its context still knows what the event relates
 to. Omitting `note` (or `ttl_hours`) on re-subscribe keeps the existing values;
-pass `""` to clear the note.
+pass `""` to clear the note. A note is **never cut silently** (0.32.0, #95):
+at most 300 characters on a session subscription (it rides on every delivery)
+and 1000 on a standing watch (it reaches the spawned session once); a longer
+one is refused with the limit and the length. A hand-edited file with a longer
+note is kept whole on disk, used only up to the limit, and reported with a
+`warning` in `webhook_subscriptions` and once on stderr. A worker's full instructions
+belong in an agent-box profile, with the note kept as short context.
 
 ### Dispatch: delivery into a fresh session (0.9.0)
 
@@ -438,7 +444,19 @@ Differences from session routing, all deliberate:
   events arriving while that spawn runs, or within `LOCAL_WEBHOOK_SPAWN_WINDOW`
   (60 s) of its start, batch into one follow-up spawn — a 10-PR dependabot
   burst costs two sessions, not ten. At most `LOCAL_WEBHOOK_SPAWN_MAX` (2)
-  spawn commands run concurrently across all keys.
+  spawn commands run concurrently across all keys. A watch can carry its own
+  window (0.32.0, #93): `--spawn-window 5` / `spawn_window_s: 5` lets a chat
+  watch start a follow-up session 5 s after the last instead of 60, while a
+  GitHub watch keeps merging a failure's events. It is part of the bucket, so
+  two watches on one topic with different windows do not share timing; absent
+  means `LOCAL_WEBHOOK_SPAWN_WINDOW`; shown as `spawnWindowS` in listings. The
+  value is 0 to 86400. The 60 s default also covers the seconds a spawned
+  session needs to open its peer and claim its object: a shorter window lets a
+  same-object follow-up pass the ownership check and start a second session, so
+  pick a value at or above your spawn-to-claim latency. A batch the spawn
+  command declines (exit `75`) is retried no faster than the larger of the
+  watch's window, `LOCAL_WEBHOOK_SPAWN_WINDOW` and one second, so a window of 0
+  never makes a hot loop.
 - **The spawn command can say "not now" (0.16.0).** Its exit code is a
   three-way answer: `0` accepted the batch; **`75`** (`EX_TEMPFAIL`) means the
   command understood the request and declines it *for now*; any other non-zero
@@ -555,6 +573,7 @@ into `LOCAL_WEBHOOK_SPAWN_CONFIG`.
 { "topic": "github:defangdevs/*",
   "include": { "any": [ { "path": "action", "in": ["opened", "reopened"] } ] },
   "spawnConfig": { "profile": "cheap-triage" },
+  "spawnWindowS": 5,
   "note": "standing watch: new issues and PRs", "ttlHours": 0,
   "subscribedAt": "2026-09-01T00:00:00Z" }
 ```
@@ -857,7 +876,7 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; resolves `"@self"` in ignore lists (no longer the filter-file key) |
 | `LOCAL_WEBHOOK_SPAWN_CMD` | — | ingress owner only: shell command run per dispatched event batch (prompt text on stdin, `LOCAL_WEBHOOK_SPAWN_*` env). Unset = dispatch subscriptions are inert |
 | `LOCAL_WEBHOOK_SPAWN_MAX` | `2` | max concurrent spawn commands across all keys |
-| `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
+| `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | default (a watch's `spawn_window_s` overrides it); seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
 | `LOCAL_WEBHOOK_SPAWN_TIMEOUT` | `600` | seconds before a running spawn command is killed (and its batch dropped) |
 | `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S` | `300` | how long a batch the spawn command keeps declining (exit `75`) is kept before it is dropped; `0` disables deferral |
 | `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` | `200` | max event lines waiting per key; past it the oldest are dropped |
