@@ -1367,9 +1367,15 @@ CODEX_PEER_IDLE_S = max(30, _int_env('LOCAL_WEBHOOK_CODEX_IDLE', default=300))
 CODEX_QUEUE_TIMEOUT_S = max(5, _int_env('LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT', default=30))
 # Consecutive `codex queue` failures before the peer stops trying. A thread
 # that has been deleted, or a codex install that has gone away, fails every
-# time, and a peer that keeps retrying it just fills its log; the events are
-# gone either way (like a failed spawn, there is nothing to retry into). One
-# failure is not enough — the app-server daemon can be restarting.
+# time, and a peer that keeps retrying it just fills its log. One failure is
+# not enough — the app-server daemon can be restarting. Counted per EVENT,
+# not per attempt (0.33.0): a spooled delivery that fails goes back into the
+# session's inbox and is retried every LOCAL_WEBHOOK_SPOOL_POLL_S, and if each
+# retry counted, one event during a brief app-server outage would make the
+# peer give up within seconds — stranding every later delivery to that
+# session until it subscribes again. So it takes this many DIFFERENT events
+# failing in a row, as it always did; what the peer leaves behind when it
+# does give up is kept in the spool rather than lost.
 CODEX_FAIL_MAX = max(1, _int_env('LOCAL_WEBHOOK_CODEX_FAIL_MAX', default=3))
 # Bound on the text handed to `codex queue`. The message is one argv element
 # and no shell is involved, so nothing in it is parsed — this is about ARG_MAX
@@ -1508,23 +1514,31 @@ if CODEX_PEER:
 # Delivery counters, read by the peer's own idle loop. Written from the IPC
 # thread, read from the main one; both are single assignments of ints, and the
 # only consumer is a log line and a give-up test, so no lock earns its keep.
-CODEX_STATS = {'delivered': 0, 'failed': 0, 'consecutiveFailures': 0, 'lastAt': 0, 'lastError': ''}
+CODEX_STATS = {'delivered': 0, 'failed': 0, 'consecutiveFailures': 0, 'lastAt': 0, 'lastError': '',
+               'lastFailedId': None}
 
 
 # Returns whether the message was handed over. Since 0.33.0 a False is not the
 # end of the event: a spooled delivery goes back into this session's inbox and
 # is offered again (see "spool"), where it used to be gone.
-def codex_deliver(text, meta):
+#
+# event_id is the spool id when this is a spooled delivery: a retry of the
+# event that failed last does not count as another consecutive failure (see
+# CODEX_FAIL_MAX).
+def codex_deliver(text, meta, event_id=None):
     ok, detail = codex_queue(CODEX_PEER_THREAD, text)
     CODEX_STATS['lastAt'] = now_ms()
     if ok:
         CODEX_STATS['delivered'] += 1
         CODEX_STATS['consecutiveFailures'] = 0
+        CODEX_STATS['lastFailedId'] = None
         print('local-webhook: queued %s delivery for codex thread %s'
               % (meta.get('source', '?'), CODEX_PEER_THREAD), file=sys.stderr)
     else:
         CODEX_STATS['failed'] += 1
-        CODEX_STATS['consecutiveFailures'] += 1
+        if event_id is None or event_id != CODEX_STATS['lastFailedId']:
+            CODEX_STATS['consecutiveFailures'] += 1
+        CODEX_STATS['lastFailedId'] = event_id
         CODEX_STATS['lastError'] = detail
         print('local-webhook: codex delivery failed (%s)' % detail, file=sys.stderr)
     return ok
@@ -2456,7 +2470,7 @@ def inbox_take(sid, q=None):
         q.done(sid)
         return 'expired'
     try:
-        res = handle_event(rec['env'], at=rec['acceptedMs'])
+        res = handle_event(rec['env'], at=rec['acceptedMs'], sid=sid)
     except Exception:
         q.release(sid)
         raise
@@ -2733,7 +2747,7 @@ def spool_status(now_s=None):
     return out
 
 
-def handle_event(env, at=None):
+def handle_event(env, at=None, sid=None):
     """Route one envelope through THIS session's filter and deliver it.
     'delivered', 'filtered' (the filter declined it) or 'failed' (the last
     inch — codex queue — did not take it)."""
@@ -2745,7 +2759,7 @@ def handle_event(env, at=None):
     if CODEX_PEER:
         # Same text, same meta, same UNTRUSTED framing — a codex session just
         # has to be handed it rather than notified.
-        return 'delivered' if codex_deliver(text, meta) else 'failed'
+        return 'delivered' if codex_deliver(text, meta, sid) else 'failed'
     out({
         'jsonrpc': '2.0',
         'method': 'notifications/claude/channel',
@@ -2811,11 +2825,15 @@ def broadcast(env, spool=None):
 
 def handle_ipc_envelope(env):
     sp = env.pop('spool', None) if isinstance(env, dict) else None
+    # Claim mode only while this peer's marker exists: without it the
+    # receiver takes this peer for a pre-0.33.0 one and drops the copy after
+    # the socket write, so there would be nothing to claim — the envelope
+    # itself has to be the delivery. A failed claim needs no wake-up: the
+    # poll offers it again, paced, rather than in a tight retry loop.
     if (SPOOL_ENABLED and isinstance(sp, dict) and isinstance(sp.get('id'), str)
             and SPOOL_NAME.match(sp['id']) and isinstance(sp.get('keys'), list)
-            and FILTER_KEY in sp['keys']):
-        if inbox_take(sp['id']) == 'failed':
-            INBOX_WAKE.set()
+            and FILTER_KEY in sp['keys'] and os.path.exists(IPC_INBOX_MARKER)):
+        inbox_take(sp['id'])
         return
     handle_event(env)
 
@@ -2872,8 +2890,11 @@ if not RECEIVER_ONLY and not CLI:
         # that copy and find nothing. A marker without a socket is harmless.
         try:
             open(IPC_INBOX_MARKER, 'w').close()
-        except OSError:
-            pass
+        except OSError as e:
+            # Not fatal: without the marker this peer is treated exactly like
+            # a pre-0.33.0 one (handoff on the socket write), which still works.
+            print('local-webhook: cannot create inbox marker %s (%s) — this session gets live '
+                  'deliveries only' % (IPC_INBOX_MARKER, e), file=sys.stderr)
         # Leases under OUR pid can only be a dead predecessor's (pid reuse
         # after a reboot or in a container): nothing in this process has
         # claimed anything yet. Later passes cannot tell them from our own.

@@ -2674,7 +2674,7 @@ class TestSpoolDrain(SpoolCase):
     def test_a_failed_last_inch_puts_the_event_back(self):
         self.subscribe('testsess')
         sid = self.accept(self.env('fail-1'))
-        self.mod.handle_event = lambda env, at=None: 'failed'
+        self.mod.handle_event = lambda env, at=None, sid=None: 'failed'
         self.assertEqual(self.mod.inbox_take(sid), 'failed')
         self.assertEqual(self.box('testsess').names(), [sid])
 
@@ -2694,6 +2694,16 @@ class TestSpoolDrain(SpoolCase):
         # this key, so the envelope itself is the delivery, as before.
         self.subscribe('testsess')
         env = dict(self.env('direct-1'), spool={'id': 'github~direct-1', 'keys': ['someone-else']})
+        self.mod.handle_ipc_envelope(env)
+        self.assertEqual(len(self.lines), 1)
+
+    def test_without_its_marker_a_peer_acts_on_the_envelope_itself(self):
+        # The receiver treats a marker-less peer as pre-0.33.0 and drops the
+        # copy after the socket write, so claiming would find nothing.
+        self.subscribe('testsess')
+        sid = self.accept(self.env('nomarker-1'))
+        self.box('testsess').drop(sid)        # the receiver's handoff drop
+        env = dict(self.env('nomarker-1'), spool={'id': sid, 'keys': ['testsess']})
         self.mod.handle_ipc_envelope(env)
         self.assertEqual(len(self.lines), 1)
 
@@ -3090,6 +3100,22 @@ class CodexFake:
 class TestCodexDelivery(StateDirCase):
     """The codex last inch (0.26.0): thread resolution, `codex queue`, and the
     peer bookkeeping around it."""
+
+    def test_retries_of_one_spooled_event_count_as_one_failure(self):
+        fake = CodexFake(self.state, exit_code=1, message='app-server down')
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path, LOCAL_WEBHOOK_CODEX_THREAD='thr-x')
+        mod.CODEX_PEER_THREAD = 'thr-x'
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        self.addCleanup(setattr, sys, 'stderr', real)
+        for _ in range(5):
+            self.assertFalse(mod.codex_deliver('t', {}, 'github~same'))
+        self.assertEqual(mod.CODEX_STATS['consecutiveFailures'], 1)
+        self.assertEqual(mod.CODEX_STATS['failed'], 5)
+        mod.codex_deliver('t', {}, 'github~other')
+        mod.codex_deliver('t', {})            # not spooled: every attempt is an event
+        self.assertEqual(mod.CODEX_STATS['consecutiveFailures'], 3)
 
     def test_thread_resolution_precedence(self):
         f = self.mod.codex_thread_from_env
@@ -4318,8 +4344,11 @@ class TestSpoolEndToEnd(EndToEndCase):
             f.write('open(%r, "a").write(sys.argv[sys.argv.index("--message") + 1] + "\\n")\n' % queued)
         os.chmod(fake, 0o755)
         open(failing, 'w').close()
+        # The DEFAULT give-up limit (3): retries of one event must not count
+        # as three failures, or a brief app-server outage would make the peer
+        # exit and strand everything after it (CodeRabbit on #100).
         env = {'LOCAL_WEBHOOK_CODEX_BIN': fake, 'CODEX_THREAD_ID': 'thr-retry',
-               'LOCAL_WEBHOOK_SPOOL_POLL_S': '1', 'LOCAL_WEBHOOK_CODEX_FAIL_MAX': '1000'}
+               'LOCAL_WEBHOOK_SPOOL_POLL_S': '1'}
         self.addCleanup(self.reap_codex_peer, 'codexretry')
         r = self.cli('subscribe', 'o/r', '--note', 'codex retry', session='codexretry', extra_env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -4330,6 +4359,19 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertFalse(os.path.exists(queued))
         st = self.status('codexretry')['sessions']['codexretry']
         self.assertEqual(st['pending'] + st['leased'], 1)
+
+        def attempts():
+            with open(calls, encoding='utf-8') as f:
+                return f.read().count('call')
+        deadline = time.time() + 20
+        while time.time() < deadline and attempts() < 7:
+            time.sleep(0.2)
+        # Past the peer's 5s give-up check, with more failed attempts than
+        # CODEX_FAIL_MAX — and the peer is still there to deliver.
+        self.assertGreaterEqual(attempts(), 7)
+        rec = self.codex_peer_record('codexretry')
+        self.assertIsNotNone(rec)
+        os.kill(rec['pid'], 0)
         os.unlink(failing)
         self.assertTrue(self.wait_file(queued, contains='title here'),
                         'the failed codex delivery was never offered again')
