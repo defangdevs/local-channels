@@ -1835,13 +1835,26 @@ def socket_call(path, cmd, args, session=None):
     c.settimeout(CLIENT_TIMEOUT_S)
     try:
         c.connect(path)
-        c.sendall(json.dumps({'cmd': cmd, 'args': args, 'session': session}).encode() + b'\n')
+        sent = None
+        try:
+            c.sendall(json.dumps({'cmd': cmd, 'args': args, 'session': session}).encode() + b'\n')
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # A daemon that sheds us answers and closes before we write; the
+            # answer is still readable, so read it rather than hide it.
+            sent = e
         buf = b''
         while not buf.endswith(b'\n'):
-            chunk = c.recv(65536)
+            try:
+                chunk = c.recv(65536)
+            except OSError:
+                if sent is None:
+                    raise
+                chunk = b''
             if not chunk:
                 break
             buf += chunk
+        if sent is not None and not buf:
+            raise sent
     except OSError as e:
         raise Refused('no answer from the local-slack daemon at %s: %s (the request may still have '
                       'been sent; check the thread before retrying)' % (path, e))
