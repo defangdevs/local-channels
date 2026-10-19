@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.30.0'
+VERSION = '0.32.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -698,7 +698,53 @@ def watch_name_error(v):
 # gh-webhook 0.2.x is read as github topics. Entries normalize to
 # { topic, name, note, ignoreSenders, spawnConfig, subscribedAt, lastActivityAt }
 # so string and object forms mix freely.
-def normalize_entry(t):
+# #95: the longest note a subscription may carry. A session note rides along on
+# EVERY delivery, so it stays short; a standing watch's note reaches a spawned
+# session once, in its first prompt, so it may be longer. Never trimmed
+# silently: webhook_subscribe refuses an over-limit note and says the limit
+# and the length, and a hand-edited file is reported on read.
+NOTE_MAX_SESSION = 300
+NOTE_MAX_WATCH = 1000
+_NOTE_CLIPPED = set()
+
+
+def note_limit(dispatch):
+    return NOTE_MAX_WATCH if dispatch else NOTE_MAX_SESSION
+
+
+def note_error(note, dispatch):
+    n = len(note)
+    if n <= note_limit(dispatch):
+        return None
+    return ('note is %d characters; the maximum for a %s is %d. A note is cut nowhere, so a long one '
+            'would lose its END — usually the part that matters. Shorten it%s.'
+            % (n, 'standing watch' if dispatch else 'session subscription', note_limit(dispatch),
+               '' if dispatch else ', or pass deliver_to:"subagent" for a watch (limit %d)' % NOTE_MAX_WATCH))
+
+
+def spawn_window_error(v):
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        return 'spawn_window_s must be an integer >= 0 (seconds), or null to clear'
+    return None
+
+
+def clip_note(t, note_max, where):
+    note = t.get('note')
+    if not isinstance(note, str):
+        return ''
+    if len(note) > note_max:
+        # Reported once per process and entry: this runs on every delivery.
+        mark = (where, t.get('topic'), t.get('name'))
+        if mark not in _NOTE_CLIPPED:
+            _NOTE_CLIPPED.add(mark)
+            print('local-webhook: the note on %s%s is %d characters; only the first %d are used '
+                  '(hand-edited file?)' % (t.get('topic'), ' name=%s' % t['name'] if t.get('name') else '',
+                                           len(note), note_max), file=sys.stderr)
+        return note[:note_max]
+    return note
+
+
+def normalize_entry(t, note_max=NOTE_MAX_WATCH, where=''):
     if isinstance(t, str):
         t = {'topic': t}
     if isinstance(t, dict) and isinstance(t.get('topic'), str):
@@ -727,7 +773,13 @@ def normalize_entry(t):
             # (write_filter no longer emits the old names).
             'include': t.get('include', t.get('when', None)),
             'exclude': t.get('exclude', t.get('drop', None)),
-            'note': t['note'][:300] if isinstance(t.get('note'), str) else '',
+            'note': clip_note(t, note_max, where),
+            # #93: this watch's own coalescing window, seconds; None = the
+            # global LOCAL_WEBHOOK_SPAWN_WINDOW. Only a dispatch entry reads it,
+            # normalized on both files like spawnConfig.
+            'spawnWindowS': (t['spawnWindowS'] if isinstance(t.get('spawnWindowS'), int)
+                             and not isinstance(t.get('spawnWindowS'), bool) and t['spawnWindowS'] >= 0
+                             else None),
             # Opaque to this repo; only a dispatch entry can do anything with
             # it, but it is normalized on both files so a mis-filed one stays
             # visible in webhook_subscriptions rather than vanishing on read.
@@ -779,7 +831,8 @@ def read_filter(path=FILTER_FILE):
             'topicsConfigured': topics is not None,
             'state': 'ok' if topics is not None else 'unconfigured',
             'topics': [dict(e, ttlHours=capped_ttl(e['ttlHours'], session))
-                       for e in map(normalize_entry, topics or []) if e],
+                       for e in (normalize_entry(x, NOTE_MAX_SESSION if session else NOTE_MAX_WATCH, path)
+                       for x in topics or []) if e],
         }
     except OSError:
         # No file: this session never subscribed. Distinct from the case below,
@@ -825,6 +878,8 @@ def write_filter(f, path=FILTER_FILE):
             o['spawnConfig'] = e['spawnConfig']
         if e.get('ownership') == 'none':
             o['ownership'] = 'none'
+        if e.get('spawnWindowS') is not None:
+            o['spawnWindowS'] = e['spawnWindowS']
         if e['lastActivityAt']:
             o['lastActivityAt'] = e['lastActivityAt']
         topics.append(o)
@@ -1901,6 +1956,11 @@ class Dispatcher:
     @staticmethod
     def _bucket(key, meta):
         cfg = (meta or {}).get('spawnConfig') or {}
+        win = (meta or {}).get('spawnWindowS')
+        # #93: two watches on one topic with different windows must not share
+        # timing, so the window joins the bucket like the config does.
+        if win is not None:
+            cfg = dict(cfg, **{'\x01window': win})
         return key if not cfg else '%s\x00%s' % (key, json.dumps(cfg, sort_keys=True))
 
     # The routing key a bucket belongs to. Every message says what an operator
@@ -1921,6 +1981,8 @@ class Dispatcher:
                                             'last_start': None, 'timer': None,
                                             'defer_since': None, 'defer_n': 0})
             st['pending'].append((text, meta, env))
+            win = (meta or {}).get('spawnWindowS')
+            st['window'] = self.window if win is None else win
             self._trim(key, st)
             self._pump(key)
 
@@ -1932,7 +1994,7 @@ class Dispatcher:
         st = self.keys[key]
         if st['running'] or not st['pending'] or self.active >= self.max:
             return
-        delay = 0 if st['last_start'] is None else st['last_start'] + self.window - self.clock()
+        delay = 0 if st['last_start'] is None else st['last_start'] + st.get('window', self.window) - self.clock()
         if delay > 0:
             if st['timer'] is None:
                 st['timer'] = threading.Timer(delay, self._on_timer, args=(key,))
@@ -2225,6 +2287,8 @@ def dispatch_event(env):
         # the live-peer probe too — the entry itself is gone by then, only
         # this meta travels with the queued item.
         'ownership': entry['ownership'] if entry else 'required',
+        # #93: this watch's own coalescing window (None = global default).
+        'spawnWindowS': entry.get('spawnWindowS') if entry else None,
         # Object identity (number, action, conclusion, ...) — whatever the
         # source's summarizer put in the same meta a channel notification
         # gets. Kept nested so it can ride to LOCAL_WEBHOOK_SPAWN_META as one
@@ -2588,7 +2652,10 @@ TOOLS = [
                     'description':
                         'Short reason for subscribing ("waiting on Lio to wire the hook, issue 15"). Echoed under '
                         'every delivery on this topic so a fresh-context session knows why the event matters. '
-                        'Omit to keep the existing note; pass "" to clear.',
+                        'At most 300 characters for a session subscription, 1000 for a standing watch '
+                        '(deliver_to:"subagent"); a longer note is REFUSED, never cut. Keep it to context: a '
+                        'worker\'s full instructions belong in its profile. Omit to keep the existing note; '
+                        'pass "" to clear.',
                 },
                 'ttl_hours': {
                     'type': 'number',
@@ -2656,6 +2723,19 @@ TOOLS = [
                         'readable from the spawned process\'s environment, so put a lookup key there, '
                         'never a credential. Refused on a deliver_to:"session" subscription, which spawns '
                         'nothing. Omit to keep on renew; pass {} to clear.',
+                },
+                'spawn_window_s': {
+                    'type': 'integer',
+                    'minimum': 0,
+                    'description':
+                        'Standing watches only (deliver_to:"subagent"): this watch\'s own coalescing '
+                        'window in seconds — after a session starts for it, further events wait this long '
+                        'to share the next one. Absent = LOCAL_WEBHOOK_SPAWN_WINDOW (default 60), which '
+                        'suits GitHub (one failure\'s check_run + workflow_run become one session) but '
+                        'makes a chat watch feel slow; 0 starts a follow-up as soon as the previous '
+                        'spawn finishes. Part of what keeps buckets apart, so two watches on one topic '
+                        'with different windows do not share timing. Refused on a session subscription. '
+                        'Omit to keep on renew; pass null to clear.',
                 },
                 'ownership': {
                     'type': 'string',
@@ -2810,6 +2890,8 @@ def call_tool(params):
                 o['spawnConfig'] = e['spawnConfig']
             if e.get('ownership') == 'none':
                 o['ownership'] = 'none'
+            if e.get('spawnWindowS') is not None:
+                o['spawnWindowS'] = e['spawnWindowS']
             if e['subscribedAt']:
                 o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
             if e['lastActivityAt']:
@@ -2909,7 +2991,8 @@ def call_tool(params):
                 (' (ignoring %s)' % ', '.join(e['ignoreSenders']) if e['ignoreSenders'] else '') + \
                 (' [%s rules]' % '+'.join(rules) if rules else '') + \
                 (' [spawn config: %s]' % cfg if cfg else '') + \
-                (' [ownership: none]' if e.get('ownership') == 'none' else '')
+                (' [ownership: none]' if e.get('ownership') == 'none' else '') + \
+                (' [spawn window: %ss]' % e['spawnWindowS'] if e.get('spawnWindowS') is not None else '')
 
         def listing(ts):
             return ', '.join(show(e) for e in ts) or '(none)'
@@ -2981,6 +3064,20 @@ def call_tool(params):
                     'deliver_to:"session" subscription never spawns anything. Pass '
                     'deliver_to:"subagent", or drop it.')
             raw_note = arguments.get('note', _MISSING)
+            if raw_note is not _MISSING:
+                err = note_error(str(raw_note).strip(), dispatch)
+                if err:
+                    return text('error: %s' % err)
+            raw_win = arguments.get('spawn_window_s', _MISSING)
+            if raw_win is not _MISSING and raw_win is not None:
+                err = spawn_window_error(raw_win)
+                if err:
+                    return text('error: %s' % err)
+                if not dispatch:
+                    return text(
+                        'error: spawn_window_s only applies to a standing watch — it is how long that '
+                        'watch coalesces events before starting a session, and a deliver_to:"session" '
+                        'subscription starts nothing. Pass deliver_to:"subagent", or drop it.')
             # Predicates are validated NOW, not at delivery time: a typo that
             # only surfaced as a match-nothing predicate would read as a watch
             # that quietly went dark (agent-box#170). null and {} mean "clear".
@@ -3054,7 +3151,7 @@ def call_tool(params):
                 if raw_ig is not _MISSING:
                     e['ignoreSenders'] = [str(x).strip() for x in raw_ig if str(x).strip()]
                 if raw_note is not _MISSING:
-                    e['note'] = str(raw_note).strip()[:300]
+                    e['note'] = str(raw_note).strip()
                 if raw_ttl is not _MISSING:
                     e['ttlHours'] = raw_ttl
                 if raw_renew is not _MISSING:
@@ -3067,6 +3164,8 @@ def call_tool(params):
                     e['spawnConfig'] = clean_spawn_config(raw_cfg)
                 if raw_own is not _MISSING:
                     e['ownership'] = raw_own
+                if raw_win is not _MISSING:
+                    e['spawnWindowS'] = raw_win
                 topics = list(f['topics'])
                 topics[idx] = e
                 write_filter({**f, 'enabled': True, 'topics': topics}, path)
@@ -3096,9 +3195,10 @@ def call_tool(params):
                 'ignoreSenders': [str(x).strip() for x in (raw_ig if raw_ig is not _MISSING else []) if str(x).strip()],
                 'include': (raw_include or None) if raw_include is not _MISSING else None,
                 'exclude': (raw_exclude or None) if raw_exclude is not _MISSING else default_exclude,
-                'note': '' if raw_note is _MISSING else str(raw_note).strip()[:300],
+                'note': '' if raw_note is _MISSING else str(raw_note).strip(),
                 'spawnConfig': {} if raw_cfg is _MISSING else clean_spawn_config(raw_cfg),
                 'ownership': 'required' if raw_own is _MISSING else raw_own,
+                'spawnWindowS': None if raw_win is _MISSING else raw_win,
                 # A dispatch entry defaults to pinned (ttlHours 0): it is a
                 # standing watch, and a spawned session has no warm cache whose
                 # loss the session-filter TTL exists to bound.
@@ -3386,6 +3486,7 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
                                   [--ignore-sender LOGIN]...
                                   [--include JSON] [--exclude JSON]
                                   [--spawn-config KEY=VALUE]... [--read-only]
+                                  [--spawn-window SECONDS]
        webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME]
        webhook.py ls
@@ -3472,6 +3573,12 @@ source or for everything: name a key or a prefix.
                        collides with a worker session the way two pushes to
                        one branch do. Spawns regardless of what a live peer
                        has claimed. --no-read-only clears it on re-subscribe
+  --spawn-window N     standing watches only: this watch's own coalescing
+                       window in seconds (#93), instead of
+                       LOCAL_WEBHOOK_SPAWN_WINDOW (60). A chat watch wants a
+                       few seconds; GitHub wants the default, which merges one
+                       failure's check_run + workflow_run. --no-spawn-window
+                       clears it on re-subscribe
   --codex-thread ID    deliver into this codex thread (a session UUID or an
                        exact session name) instead of the one this process's
                        environment names. Rarely needed: run from inside a
@@ -3744,6 +3851,13 @@ def run_cli(argv):
         elif a == '--no-spawn-config':
             saw_spawn_config = True
             spawn_config = {}
+        elif a == '--spawn-window':
+            try:
+                args['spawn_window_s'] = int(value())
+            except ValueError:
+                die('--spawn-window needs a whole number of seconds >= 0')
+        elif a == '--no-spawn-window':
+            args['spawn_window_s'] = None
         elif a == '--read-only':
             args['ownership'] = 'none'
         elif a == '--no-read-only':
