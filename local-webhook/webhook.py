@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.30.0'
+VERSION = '0.31.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -2395,6 +2395,13 @@ def generic_scalars(p, prefix=''):
 
 def summarize_generic(event, key, p):
     meta = {'event': event, 'key': key}
+    # The sender's own name for the object (Slack: team/channel/thread_ts,
+    # Linear: ENG-42). A spawn command scopes a claim to it instead of falling
+    # back to GitHub's number/sha shapes, which a non-GitHub event never has
+    # (agent-box#875). Top level only, a short string, and only when present.
+    ident = p.get('identifier') if isinstance(p, dict) else None
+    if isinstance(ident, str) and 0 < len(ident) <= 200:
+        meta['identifier'] = ident
     fields = generic_scalars(p)
     for env_key in GENERIC_ENVELOPE_KEYS:
         if isinstance(p, dict) and isinstance(p.get(env_key), dict):
