@@ -65,6 +65,8 @@ only author of its input.
 `reaction.removed`, `thread.settled` (`reason`: `quiet`, `max_wait`, `ready`,
 `mention`), `thread.reopened`, `thread.dropped`, `feedback`. Message text is
 never inlined; `title` is sanitised and capped at 200 characters.
+Every payload carries `identifier` = `team/channel/thread_ts`, which local-webhook
+(0.31.0+) passes on in the spawn meta so a spawn command can claim the thread.
 
 ## Writing
 
