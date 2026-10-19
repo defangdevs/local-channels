@@ -2212,7 +2212,7 @@ class TestDispatcher(StateDirCase):
 
     def pending(self, d, key):
         st = d.keys.get(key) or {}
-        return [t for t, _, _ in st.get('pending', [])]
+        return [item[0] for item in st.get("pending", [])]
 
     def wait_for(self, cond, timeout=15):
         deadline = time.time() + timeout
@@ -2452,6 +2452,611 @@ class TestDispatcher(StateDirCase):
         self.assertIn('hit the 3-line cap', err.getvalue())
 
 
+class SpoolCase(StateDirCase):
+    """The durable inbox (#60): names, the queue primitive, fan-out, expiry."""
+
+    ISSUE = {'repository': {'full_name': 'o/r'}, 'sender': {'login': 'someone'},
+             'action': 'opened', 'issue': {'number': 5, 'title': 'title here'}}
+
+    def env(self, delivery='d-1', key='o/r', payload=None):
+        return {'source': 'github', 'format': 'github', 'event': 'issues', 'key': key,
+                'sender': 'someone', 'delivery': delivery, 'payload': payload or self.ISSUE}
+
+    def subscribe(self, session, topic='github:o/r', **entry):
+        e = {'topic': topic, 'subscribedAt': self.mod.iso_at(self.mod.now_ms())}
+        e.update(entry)
+        self.write_json('filter.%s.json' % session, {'topics': [e]})
+
+    def accept(self, env):
+        acc = self.mod.spool_accept(env)
+        self.assertIsNotNone(acc)
+        sid, at = acc
+        self.mod.spool_process(sid, env, at, live=True, enqueue=True)
+        return sid
+
+    def box(self, session):
+        return self.mod.peer_queue(session)
+
+    def quiet(self):
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        self.addCleanup(setattr, sys, 'stderr', real)
+        return err
+
+
+class TestSpoolNames(SpoolCase):
+    UNSAFE = ['../../../etc/passwd', 'a/b', '.hidden', '..', 'x' * 300, 'é-ü', 'a b',
+              'line\nbreak', '-flag', 'nul\x00byte', '~@forged']
+
+    def test_a_plain_delivery_id_stays_readable(self):
+        self.assertEqual(self.mod.spool_id('github', '8b8475a0-cc06-11f1-9189-b3037ed5d435'),
+                         'github~8b8475a0-cc06-11f1-9189-b3037ed5d435')
+        self.assertIsNone(self.mod.spool_id('github', ''))
+
+    def test_an_unsafe_delivery_id_never_reaches_a_path(self):
+        names = set()
+        for d in self.UNSAFE:
+            sid = self.mod.spool_id('github', d)
+            self.assertRegex(sid, r'^[0-9a-f]{40}$', d)
+            self.assertTrue(self.mod.SPOOL_NAME.match(sid))
+            names.add(sid)
+        self.assertEqual(len(names), len(self.UNSAFE))
+        # An unsafe SOURCE is hashed too, and the source is part of the
+        # identity: one id under two sources is two deliveries.
+        self.assertRegex(self.mod.spool_id('a/b', 'ok'), r'^[0-9a-f]{40}$')
+        self.assertNotEqual(self.mod.spool_id('github', 'x1'), self.mod.spool_id('linear', 'x1'))
+
+    def test_a_session_key_cannot_escape_the_peers_dir(self):
+        root = os.path.realpath(self.mod.SPOOL_PEERS)
+        for key in ('', '.', '..', '.x', '...', 'a' * 150, 'plain-key', 'a.b_c'):
+            box = self.mod.spool_box(key)
+            self.assertTrue(self.mod.SPOOL_BOX.match(box), (key, box))
+            path = os.path.realpath(os.path.join(self.mod.SPOOL_PEERS, box))
+            self.assertEqual(os.path.dirname(path), root, key)
+        self.assertEqual(self.mod.spool_box('plain-key'), 'plain-key')
+        self.assertEqual(self.mod.spool_box(''), '@shared')
+
+    def test_no_name_reaches_a_path_outside_its_directory(self):
+        d = os.path.join(self.state, 'spool', 'x')
+        self.assertEqual(self.mod.spool_path(d, 'github~ok'), os.path.join(os.path.abspath(d), 'github~ok'))
+        self.assertTrue(self.mod.spool_path(d, 'github~ok:123').endswith('github~ok:123'))
+        for bad in ('../x', '..', '.', '', 'a/b', '/etc/passwd', 'github~ok:x', None, '~@'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.mod.spool_path(d, bad)
+
+    def test_planted_entries_are_never_read(self):
+        q = self.mod.SpoolQueue(os.path.join(self.state, 'spool', 'peers', 'testsess'))
+        q.ensure()
+        secret = os.path.join(self.state, 'outside.json')
+        with open(secret, 'w', encoding='utf-8') as f:
+            json.dump({'id': 'x', 'acceptedMs': 1, 'env': {}}, f)
+        os.symlink(secret, os.path.join(q.new, 'github~planted'))
+        open(os.path.join(q.new, 'not a valid name'), 'w').close()
+        self.assertEqual(q.names(), [])
+        self.assertIsNone(q.load(os.path.join(q.new, 'github~planted')))  # O_NOFOLLOW
+        self.assertIsNone(q.claim('../outside.json'))
+
+
+class TestSpoolAccept(SpoolCase):
+    def test_a_redelivery_is_accepted_once(self):
+        self.subscribe('sessa')
+        sid = self.accept(self.env('dup-1'))
+        self.assertEqual(self.box('sessa').names(), [sid])
+        self.assertIsNone(self.mod.spool_accept(self.env('dup-1')))   # backfill redelivers it
+        self.assertEqual(self.box('sessa').names(), [sid])
+        # A different id is a different delivery, even with the same body.
+        self.accept(self.env('dup-2'))
+        self.assertEqual(len(self.box('sessa').names()), 2)
+
+    def test_a_reused_id_with_a_different_body_is_a_new_event(self):
+        # A generic sender whose delivery header is constant per hook must not
+        # have every later event dropped as a "duplicate" for three days.
+        err = self.quiet()
+        self.subscribe('sessa')
+        first = self.mod.spool_accept(self.env('same-id'), 'aaaa')
+        self.mod.spool_process(first[0], self.env('same-id'), first[1], live=True, enqueue=True,
+                               digest='aaaa')
+        self.assertIsNone(self.mod.spool_accept(self.env('same-id'), 'aaaa'))     # true duplicate
+        second = self.mod.spool_accept(self.env('same-id'), 'bbbb')               # same id, new body
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second[0], first[0])
+        self.assertIn('already used for a different body', err.getvalue())
+        # ...and the same while the first is still mid-fan-out.
+        a = self.mod.spool_accept(self.env('busy-id'), 'cccc')
+        b = self.mod.spool_accept(self.env('busy-id'), 'dddd')
+        self.assertIsNotNone(b)
+        self.assertNotEqual(a[0], b[0])
+        self.assertIsNone(self.mod.spool_accept(self.env('busy-id'), 'cccc'))
+
+    def test_a_delivery_still_being_fanned_out_is_a_duplicate_too(self):
+        first = self.mod.spool_accept(self.env('inflight'))
+        self.assertIsNotNone(first)
+        self.assertIsNone(self.mod.spool_accept(self.env('inflight')))
+
+    def test_an_event_without_an_id_is_never_deduplicated(self):
+        self.subscribe('sessa')
+        a = self.accept(self.env(''))
+        b = self.accept(self.env(''))
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(self.box('sessa').names()), 2)
+        seen = os.path.join(self.state, 'spool', 'seen')
+        self.assertEqual(os.listdir(seen) if os.path.isdir(seen) else [], [])
+
+    def test_only_sessions_whose_filter_accepts_get_a_copy_and_it_is_one_copy(self):
+        self.subscribe('wants')
+        self.subscribe('other', topic='github:other/repo')
+        self.subscribe('declines', include={'path': 'action', 'in': ['closed']})
+        sid = self.accept(self.env('fan-1'))
+        self.assertEqual(self.box('wants').names(), [sid])
+        self.assertEqual(self.box('other').names(), [])
+        self.assertEqual(self.box('declines').names(), [])
+        self.assertEqual(self.mod.SPOOL_INBOX.names(), [])   # committed and retired
+        # A hard link to one inode, not a copy per session.
+        self.subscribe('also')
+        sid2 = self.accept(self.env('fan-2'))
+        a = os.stat(os.path.join(self.box('wants').new, sid2))
+        b = os.stat(os.path.join(self.box('also').new, sid2))
+        self.assertEqual((a.st_ino, a.st_dev), (b.st_ino, b.st_dev))
+
+    def test_an_at_self_mute_is_left_to_the_session(self):
+        # The receiver cannot know what "@self" means for another session, so
+        # it spools; the session's own filter has the last word on drain.
+        self.subscribe('muted', ignoreSenders=['@self'])
+        sid = self.accept(self.env('self-1'))
+        self.assertEqual(self.box('muted').names(), [sid])
+
+    def test_an_interrupted_fan_out_is_finished_by_recovery(self):
+        self.subscribe('sessa')
+        sid, at = self.mod.spool_accept(self.env('crash-1'))   # ...and the receiver dies here
+        self.assertEqual(self.box('sessa').names(), [])
+        self.assertEqual(self.mod.spool_recover(), (1, 0))
+        self.assertEqual(self.box('sessa').names(), [sid])
+        self.assertEqual(self.mod.SPOOL_INBOX.names(), [])
+        self.assertIsNone(self.mod.spool_accept(self.env('crash-1')))  # and it is now "seen"
+
+
+class TestSpoolDrain(SpoolCase):
+    """A session peer draining its own box: what gets delivered, and when."""
+
+    def setUp(self):
+        SpoolCase.setUp(self)
+        self.lines = []
+        self.mod.out = lambda msg: self.lines.append(msg)
+
+    def test_a_backlog_is_delivered_once_in_accept_order(self):
+        self.subscribe('testsess')
+        a = self.accept(self.env('order-1', payload=dict(self.ISSUE, issue={'number': 1, 'title': 'first'})))
+        b = self.accept(self.env('order-2', payload=dict(self.ISSUE, issue={'number': 2, 'title': 'second'})))
+        os.utime(os.path.join(self.box('testsess').new, a), (time.time() - 5, time.time() - 5))
+        self.assertEqual(self.mod.inbox_drain(), 2)
+        texts = [m['params']['content'] for m in self.lines]
+        self.assertIn('first', texts[0])
+        self.assertIn('second', texts[1])
+        self.assertEqual(self.mod.inbox_drain(), 0)
+        self.assertEqual(self.box('testsess').names(), [])
+        self.assertIsNone(self.mod.inbox_take(b))   # nothing left to claim twice
+
+    def test_a_subscription_that_lapsed_during_the_outage_still_gets_its_event(self):
+        # Subscribed 50 minutes ago with a 1h TTL; the event arrived then;
+        # nobody could deliver it for 20 minutes. Routed as of acceptance.
+        then = self.mod.now_ms() - 70 * 60 * 1000
+        self.subscribe('testsess', subscribedAt=self.mod.iso_at(then - 50 * 60 * 1000), ttlHours=1)
+        env = self.env('lapsed-1')
+        sid = 'github~lapsed-1'
+        q = self.mod._peer_queue_for_key('testsess')
+        rec = {'v': 1, 'kind': 'webhook', 'id': sid, 'acceptedMs': int(then), 'env': env}
+        q.publish(sid, json.dumps(rec).encode(), mtime_ms=then)
+        self.assertEqual(self.mod.inbox_take(sid), 'delivered')
+
+    def test_an_unsubscribe_discards_what_was_waiting(self):
+        self.subscribe('testsess')
+        sid = self.accept(self.env('unsub-1'))
+        self.write_json('filter.testsess.json', {'topics': []})
+        self.assertEqual(self.mod.inbox_take(sid), 'filtered')
+        self.assertEqual(self.lines, [])
+        self.assertEqual(self.box('testsess').names(), [])
+
+    def test_a_peer_does_not_deliver_past_the_age_bound(self):
+        err = self.quiet()
+        self.subscribe('testsess')
+        sid = self.accept(self.env('aged-1'))
+        self.mod.SPOOL_PEER_MAX_S = 1
+        path = os.path.join(self.box('testsess').new, sid)
+        rec = json.load(open(path, encoding='utf-8'))
+        rec['acceptedMs'] -= 5000
+        os.unlink(path)
+        self.box('testsess').publish(sid, json.dumps(rec).encode())
+        self.assertEqual(self.mod.inbox_take(sid), 'expired')
+        self.assertEqual(self.lines, [])
+        self.assertIn('past LOCAL_WEBHOOK_SPOOL_PEER_MAX_S', err.getvalue())
+
+    def test_a_failed_last_inch_puts_the_event_back(self):
+        self.subscribe('testsess')
+        sid = self.accept(self.env('fail-1'))
+        self.mod.handle_event = lambda env, at=None, sid=None: 'failed'
+        self.assertEqual(self.mod.inbox_take(sid), 'failed')
+        self.assertEqual(self.box('testsess').names(), [sid])
+
+    def test_a_dead_claimant_s_lease_goes_back_in_line(self):
+        self.subscribe('testsess')
+        sid = self.accept(self.env('lease-1'))
+        p = subprocess.Popen([PYTHON, '-c', 'pass'])
+        p.wait()
+        q = self.box('testsess')
+        self.assertIsNotNone(q.claim(sid, owner=p.pid))   # took it, then died mid-delivery
+        self.assertEqual(q.names(), [])
+        self.assertEqual(self.mod.inbox_drain(), 1)
+        self.assertEqual(q.leases(), [])
+
+    def test_an_envelope_for_another_key_is_handled_directly(self):
+        # An older receiver, or one whose probe said no: no spool claim for
+        # this key, so the envelope itself is the delivery, as before.
+        self.subscribe('testsess')
+        env = dict(self.env('direct-1'), spool={'id': 'github~direct-1', 'keys': ['someone-else']})
+        self.mod.handle_ipc_envelope(env)
+        self.assertEqual(len(self.lines), 1)
+
+    def test_without_its_marker_a_peer_acts_on_the_envelope_itself(self):
+        # The receiver treats a marker-less peer as pre-0.33.0 and drops the
+        # copy after the socket write, so claiming would find nothing.
+        self.subscribe('testsess')
+        sid = self.accept(self.env('nomarker-1'))
+        self.box('testsess').drop(sid)        # the receiver's handoff drop
+        env = dict(self.env('nomarker-1'), spool={'id': sid, 'keys': ['testsess']})
+        self.mod.handle_ipc_envelope(env)
+        self.assertEqual(len(self.lines), 1)
+
+    def test_an_envelope_naming_an_unsafe_spool_id_is_not_trusted_as_a_path(self):
+        self.subscribe('testsess')
+        env = dict(self.env('direct-2'), spool={'id': '../../filter.testsess.json',
+                                                'keys': ['testsess']})
+        self.mod.handle_ipc_envelope(env)
+        self.assertEqual(len(self.lines), 1)    # treated as a plain envelope
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'filter.testsess.json')))
+
+
+class TestSpoolReaper(SpoolCase):
+    def age(self, path, seconds):
+        t = time.time() - seconds
+        os.utime(path, (t, t))
+
+    def test_mail_past_the_age_bound_is_discarded_out_loud(self):
+        err = self.quiet()
+        self.subscribe('sessa')
+        old = self.accept(self.env('old-1'))
+        new = self.accept(self.env('new-1'))
+        self.age(os.path.join(self.box('sessa').new, old), self.mod.SPOOL_PEER_MAX_S + 10)
+        self.mod.spool_reap()
+        self.assertEqual(self.box('sessa').names(), [new])
+        self.assertIn('discarded 1 spooled event(s) for session sessa', err.getvalue())
+
+    def test_a_box_over_its_cap_loses_the_oldest(self):
+        err = self.quiet()
+        self.mod.SPOOL_PEER_MAX_N = 2
+        self.subscribe('sessa')
+        sids = [self.accept(self.env('cap-%d' % i)) for i in range(4)]
+        for i, sid in enumerate(sids):
+            self.age(os.path.join(self.box('sessa').new, sid), 100 - i)
+        self.mod.spool_reap()
+        self.assertEqual(self.box('sessa').names(), sids[2:])
+        self.assertIn('LOCAL_WEBHOOK_SPOOL_PEER_MAX=2', err.getvalue())
+
+    def test_a_removed_session_loses_its_box(self):
+        # agent-box's `session rm` deletes the filter file; a later session
+        # under the same name must not inherit the dead one's mail.
+        err = self.quiet()
+        self.subscribe('gone')
+        self.accept(self.env('gone-1'))
+        os.unlink(os.path.join(self.state, 'filter.gone.json'))
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(self.box('gone').root))
+        self.assertIn('no filter file any more', err.getvalue())
+
+    def test_a_hashed_box_is_reaped_by_its_recorded_key(self):
+        self.quiet()
+        self.subscribe('..')                  # SESSION's charset admits it
+        self.accept(self.env('dots-1'))
+        box = self.mod.spool_box('..')
+        self.assertTrue(box.startswith('@'))
+        self.assertEqual(self.mod._box_key(box), '..')
+        self.assertEqual(len(self.mod.peer_queue('..').names()), 1)
+        os.unlink(os.path.join(self.state, 'filter....json'))
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(self.mod.peer_queue('..').root))
+
+    def test_dedup_memory_expires(self):
+        self.accept(self.env('seen-1'))
+        seen = os.path.join(self.state, 'spool', 'seen', 'github~seen-1')
+        self.assertTrue(os.path.exists(seen))
+        self.age(seen, self.mod.SPOOL_SEEN_S + 10)
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(seen))
+        self.assertIsNotNone(self.mod.spool_accept(self.env('seen-1')))
+
+    def test_dispatch_records_nobody_can_run_age_out(self):
+        # A receiver restarted WITHOUT a spawn command inherits a queue it will
+        # never run; it must not keep it forever, and must say so.
+        err = self.quiet()
+        q = self.mod.SPOOL_DISPATCH
+        q.publish('github~orphan-1', b'{"v":1,"kind":"dispatch","id":"github~orphan-1","acceptedMs":1}')
+        q.publish('github~orphan-2', b'{"v":1,"kind":"dispatch","id":"github~orphan-2","acceptedMs":1}')
+        self.age(os.path.join(q.new, 'github~orphan-1'), self.mod.SPAWN_DEFER_MAX_S + 10)
+        self.mod.spool_reap()
+        self.assertEqual(q.names(), ['github~orphan-2'])
+        self.assertIn('no LOCAL_WEBHOOK_SPAWN_CMD is configured', err.getvalue())
+
+    def test_status_shows_what_is_waiting(self):
+        self.subscribe('sessa')
+        self.accept(self.env('st-1'))
+        st = self.mod.spool_status()
+        self.assertTrue(st['enabled'])
+        self.assertEqual(st['sessions']['sessa']['pending'], 1)
+        self.assertEqual(st['inbox'], 0)
+        self.assertEqual(st['seen'], 1)
+
+
+class TestSpoolFailureModes(SpoolCase):
+    """Regressions from review: a fan-out that fails part-way, recovery that
+    meets a bad record, a peer racing its own marker, a lease under a reused
+    pid."""
+
+    def test_a_failing_commit_is_retried_without_redelivering(self):
+        # Before the inbox had steps, every reaper pass re-linked the copy a
+        # session had already drained and re-queued a watch that had already
+        # spawned — for as long as the failure lasted.
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions')
+        err = self.quiet()
+        log = os.path.join(self.state, 'spawns.log')
+        self.mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo RUN; } >> %s' % log)
+        self.write_json('filter.dispatch.json', {'topics': [{'topic': 'github:o/r', 'include': ANY_EVENT}]})
+        self.subscribe('sessa')
+        seen = os.path.join(self.state, 'spool', 'seen')
+        os.makedirs(seen)
+        os.chmod(seen, 0o500)
+        self.addCleanup(os.chmod, seen, 0o700)
+        env = self.env('stuck-1')
+        sid, at = self.mod.spool_accept(env, 'dd')
+        with self.assertRaises(OSError):
+            self.mod.spool_process(sid, env, at, live=True, enqueue=True, digest='dd')
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'spool', 'inbox', 'dispatched', sid)))
+        self.box('sessa').drop(sid)                     # the session drained its copy
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(log):
+            time.sleep(0.05)
+        for i in range(3):                              # three reaper passes, still failing
+            self.mod.spool_reap(now_s=time.time() + 120 * (i + 1))
+        self.assertEqual(self.box('sessa').names(), [])
+        time.sleep(0.5)
+        with open(log, encoding='utf-8') as f:
+            self.assertEqual(f.read().count('RUN'), 1)
+        self.assertIn('could not finish the fan-out', err.getvalue())
+        os.chmod(seen, 0o700)                           # the disk recovers
+        self.mod.spool_reap(now_s=time.time() + 600)
+        self.assertEqual(self.mod.spool_status()['inbox'], 0)
+        self.assertIsNone(self.mod.spool_accept(env, 'dd'))   # and it is remembered
+
+    def test_a_fan_out_failing_for_ever_is_eventually_discarded(self):
+        err = self.quiet()
+        env = self.env('forever-1')
+        sid, at = self.mod.spool_accept(env, 'ee')
+        self.mod.spool_fanout = lambda *a: (_ for _ in ()).throw(OSError('disk on fire'))
+        self.mod.spool_reap(now_s=time.time() + 120)
+        self.assertEqual(self.mod.spool_status()['inbox'], 1)        # retried, kept
+        self.mod.spool_reap(now_s=time.time() + self.mod.SPOOL_PEER_MAX_S + 10)
+        self.assertEqual(self.mod.spool_status()['inbox'], 0)        # then let go, out loud
+        self.assertIn('discarding accepted event %s' % sid, err.getvalue())
+
+    def test_recovery_survives_a_bad_record_and_still_reloads_the_watch_queue(self):
+        err = self.quiet()
+        self.mod.spool_accept(self.env('bad-1'), 'aa')
+        self.mod.spool_accept(self.env('good-1'), 'bb')
+        calls = []
+        real = self.mod.spool_fanout
+
+        def flaky(sid, env, at, src):
+            if 'bad-1' in sid:
+                raise ValueError('payload the summarizer chokes on')
+            calls.append(sid)
+            return real(sid, env, at, src)
+        self.mod.spool_fanout = flaky
+
+        class FakeDispatcher:
+            recovered = 0
+
+            def recover(self):
+                FakeDispatcher.recovered += 1
+                return 0
+        self.mod.DISPATCHER = FakeDispatcher()
+        self.mod.dispatch_event = lambda *a, **k: None
+        self.assertEqual(self.mod.spool_recover(), (1, 0))
+        self.assertEqual(calls, ['github~good-1'])
+        self.assertEqual(FakeDispatcher.recovered, 1)
+        self.assertIn('could not finish the fan-out of github~bad-1', err.getvalue())
+
+    def test_a_lease_under_a_reused_live_pid_is_expired(self):
+        err = self.quiet()
+        self.subscribe('sessa')
+        sid = self.accept(self.env('reused-1'))
+        q = self.box('sessa')
+        lease = q.claim(sid, owner=os.getpid())     # "alive": the pid was reused
+        q.recover()
+        self.assertEqual(q.names(), [])             # recover() cannot tell
+        self.age(lease, self.mod.SPOOL_PEER_MAX_S + 10)
+        self.mod.spool_reap()
+        self.assertEqual(q.leases(), [])
+        self.assertIn('never finished', err.getvalue())
+
+    def age(self, path, seconds):
+        t = time.time() - seconds
+        os.utime(path, (t, t))
+
+    def test_a_peer_reclaims_leases_left_under_its_own_pid_and_marks_itself_first(self):
+        self.subscribe('peerkey')
+        sid = self.accept(self.env('mine-1'))
+        q = self.box('peerkey')
+        q.claim(sid, owner=os.getpid())   # a dead predecessor that had our pid
+        argv = sys.argv
+        sys.argv = argv[:1]     # any argv beyond the script makes the module a one-shot CLI
+        try:
+            peer = self.load(LOCAL_WEBHOOK_RECEIVER_ONLY='', LOCAL_WEBHOOK_SESSION='peerkey')
+        finally:
+            sys.argv = argv
+        self.addCleanup(lambda: [os.unlink(f) for f in (peer.IPC_SOCK, peer.IPC_INBOX_MARKER)
+                                 if os.path.exists(f)])
+        self.assertTrue(os.path.exists(peer.IPC_INBOX_MARKER))
+        self.assertTrue(os.path.exists(peer.IPC_SOCK))
+        self.assertEqual(q.names(), [sid])
+
+    def test_a_dead_peer_loses_its_marker_with_its_socket(self):
+        self.quiet()
+        inst = os.path.join(self.state, 'instances')
+        p = subprocess.Popen([PYTHON, '-c', 'pass'])
+        p.wait()
+        sock = os.path.join(inst, 'ghost.%d.sock' % p.pid)
+        open(sock, 'w').close()             # not a socket: connect fails like a dead one
+        open(sock[:-5] + '.inbox', 'w').close()
+        self.mod.broadcast(self.env('ghost-1'))
+        self.assertFalse(os.path.exists(sock))
+        self.assertFalse(os.path.exists(sock[:-5] + '.inbox'))
+
+
+class TestDispatchSpool(SpoolCase):
+    """The standing-watch queue on disk: what a restart keeps, and what it
+    still re-checks before it spends a session."""
+
+    def setUp(self):
+        SpoolCase.setUp(self)
+        self.q = self.mod.SpoolQueue(os.path.join(self.state, 'spool', 'dispatch'))
+        self.err = self.quiet()
+
+    def put(self, sid, text, key='o/r', event='issues', at=None):
+        at = int(self.mod.now_ms() if at is None else at)
+        meta = {'key': key, 'event': event, 'topic': 'github:%s' % key}
+        env = {'source': 'github', 'key': key, 'event': event, 'sender': 's', 'payload': {}}
+        self.q.publish(sid, json.dumps({'v': 1, 'kind': 'dispatch', 'id': sid, 'acceptedMs': at,
+                                        'routingKey': key, 'text': text, 'meta': meta,
+                                        'env': env}).encode(), mtime_ms=at)
+        return text, meta, env, sid
+
+    def recorder(self, name):
+        path = os.path.join(self.state, name + '.log')
+        return path, '{ cat; echo RUN; } >> %s' % path
+
+    def runs(self, path):
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding='utf-8') as f:
+            return [ln for ln in f.read().splitlines() if ln == 'RUN']
+
+    def wait_for(self, cond, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_declined_batch_survives_a_restart_with_its_streak(self):
+        d = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q)
+        text, meta, env, sid = self.put('github~cap-1', 'held at capacity')
+        d.add('o/r', text, meta, env, sid=sid)
+        self.assertTrue(self.wait_for(lambda: d.keys['o/r']['defer_n'] == 1 and d.active == 0))
+        rec = self.q.load(os.path.join(self.q.new, sid))
+        self.assertEqual(rec['deferN'], 1)
+        self.assertIsInstance(rec['deferredMs'], int)
+        # The receiver restarts; the consumer has room again.
+        path, ok = self.recorder('after-restart')
+        d2 = self.mod.Dispatcher(ok, 2, 60, 30, spool=self.q)
+        self.assertEqual(d2.recover(), 1)
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        with open(path, encoding='utf-8') as f:
+            self.assertIn('held at capacity', f.read())
+        self.assertTrue(self.wait_for(lambda: d2.active == 0))
+        self.assertEqual(self.q.names(), [])
+        self.assertEqual(self.q.leases(), [])
+
+    def test_a_restart_keeps_the_age_bound_running(self):
+        # Declined 10 minutes ago with a 5 minute bound: recovery offers it
+        # once more, and the next decline drops it rather than starting a new
+        # five minutes.
+        text, meta, env, sid = self.put('github~old-1', 'stale')
+        rec = self.q.load(os.path.join(self.q.new, sid))
+        rec.update(deferredMs=int(self.mod.now_ms() - 600000), deferN=10)
+        os.unlink(os.path.join(self.q.new, sid))
+        self.q.publish(sid, json.dumps(rec).encode())
+        d = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q, defer_max_s=300)
+        d.recover()
+        self.assertTrue(self.wait_for(lambda: 'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S' in self.err.getvalue()))
+        self.assertIn('declined them 11 time(s)', self.err.getvalue())
+        self.assertTrue(self.wait_for(lambda: d.active == 0 and not self.q.names() and not self.q.leases()))
+
+    def test_a_clock_step_backwards_cannot_wedge_a_recovered_key(self):
+        text, meta, env, sid = self.put('github~future-1', 'from the future')
+        rec = self.q.load(os.path.join(self.q.new, sid))
+        rec.update(deferredMs=int(self.mod.now_ms() + 3600 * 1000), deferN=1)
+        os.unlink(os.path.join(self.q.new, sid))
+        self.q.publish(sid, json.dumps(rec).encode())
+        d = self.mod.Dispatcher('exit 75', 2, 60, 30, spool=self.q)
+        t0 = d.clock()
+        # Pump nothing yet: inspect the recovered streak before it runs.
+        d.max = 0
+        d.recover()
+        st = d.keys['o/r']
+        self.assertLessEqual(abs(st['defer_since'] - t0), 1.0)
+
+    def test_a_recovered_batch_is_re_checked_for_ownership(self):
+        path, ok = self.recorder('owned-after-restart')
+        self.put('github~owned-1', 'claimed while we were down', event='workflow_run')
+        d = self.mod.Dispatcher(ok, 2, 60, 30, spool=self.q, owner_of=lambda env: 'sess-x')
+        self.assertEqual(d.recover(), 1)
+        self.assertTrue(self.wait_for(lambda: not self.q.names()))
+        time.sleep(0.5)
+        self.assertEqual(self.runs(path), [])
+        self.assertIn('session sess-x claimed it while the batch waited', self.err.getvalue())
+
+    def test_a_record_running_when_the_receiver_died_is_offered_again(self):
+        path, ok = self.recorder('orphan')
+        text, meta, env, sid = self.put('github~running-1', 'was mid-spawn')
+        p = subprocess.Popen([PYTHON, '-c', 'pass'])
+        p.wait()
+        self.q.claim(sid, owner=p.pid)
+        d = self.mod.Dispatcher(ok, 2, 60, 30, spool=self.q)
+        self.assertEqual(d.recover(), 1)
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+
+    def test_every_other_ending_retires_the_record(self):
+        # accepted
+        path, ok = self.recorder('ends')
+        d = self.mod.Dispatcher(ok, 2, 0, 30, spool=self.q)
+        d.add('o/r', *self.put('github~ok-1', 'accepted'))
+        self.assertTrue(self.wait_for(lambda: d.active == 0 and len(self.runs(path)) == 1))
+        # broken spawner — dropped, as the exit-code contract says
+        d.cmd = 'exit 3'
+        d.add('a/b', *self.put('github~broken-1', 'broken', key='a/b'))
+        self.assertTrue(self.wait_for(lambda: d.active == 0 and not self.q.names() and not self.q.leases()))
+        # trimmed by the per-key cap
+        d2 = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q, pending_max=1)
+        d2.add('c/d', *self.put('github~t-1', 'first', key='c/d'))
+        self.assertTrue(self.wait_for(lambda: d2.active == 0 and d2.keys['c/d']['defer_n'] == 1))
+        d2.add('c/d', *self.put('github~t-2', 'second', key='c/d'))
+        self.assertEqual(self.q.names(), ['github~t-2'])
+
+    def test_status_lists_the_queue_with_positions(self):
+        self.put('github~p-1', 'one', at=self.mod.now_ms() - 2000)
+        self.put('github~p-2', 'two', at=self.mod.now_ms() - 1000)
+        self.put('github~p-3', 'three', key='x/y')
+        st = self.mod.spool_status()['dispatch']
+        self.assertEqual(st['pending'], 3)
+        by_id = {i['id']: i for i in st['items']}
+        self.assertEqual(by_id['github~p-1']['position'], 1)
+        self.assertEqual(by_id['github~p-2']['position'], 2)
+        self.assertEqual(by_id['github~p-3']['position'], 1)     # its own key's line
+        self.assertEqual(by_id['github~p-1']['key'], 'o/r')
+        self.assertGreaterEqual(by_id['github~p-1']['ageS'], 1)
+
+
 class CodexFake:
     """A stand-in `codex` binary that records how it was called.
 
@@ -2495,6 +3100,22 @@ class CodexFake:
 class TestCodexDelivery(StateDirCase):
     """The codex last inch (0.26.0): thread resolution, `codex queue`, and the
     peer bookkeeping around it."""
+
+    def test_retries_of_one_spooled_event_count_as_one_failure(self):
+        fake = CodexFake(self.state, exit_code=1, message='app-server down')
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path, LOCAL_WEBHOOK_CODEX_THREAD='thr-x')
+        mod.CODEX_PEER_THREAD = 'thr-x'
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        self.addCleanup(setattr, sys, 'stderr', real)
+        for _ in range(5):
+            self.assertFalse(mod.codex_deliver('t', {}, 'github~same'))
+        self.assertEqual(mod.CODEX_STATS['consecutiveFailures'], 1)
+        self.assertEqual(mod.CODEX_STATS['failed'], 5)
+        mod.codex_deliver('t', {}, 'github~other')
+        mod.codex_deliver('t', {})            # not spooled: every attempt is an event
+        self.assertEqual(mod.CODEX_STATS['consecutiveFailures'], 3)
 
     def test_thread_resolution_precedence(self):
         f = self.mod.codex_thread_from_env
@@ -2690,8 +3311,9 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = s
 
 
-class TestEndToEnd(unittest.TestCase):
-    """Real processes: receiver daemon + session peer + CLI, signed deliveries."""
+class EndToEndCase(unittest.TestCase):
+    """Real processes: receiver daemon + session peer + CLI, signed deliveries.
+    Harness only; the tests live in subclasses."""
 
     SECRET = 'shh'
 
@@ -2785,7 +3407,7 @@ class TestEndToEnd(unittest.TestCase):
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(sources, f)
 
-    def post(self, body, event='issues', source='github', sig=None, method='POST'):
+    def post(self, body, event='issues', source='github', sig=None, method='POST', delivery=None):
         import hashlib
         import hmac as hmac_mod
         raw = json.dumps(body).encode('utf-8') if isinstance(body, dict) else body
@@ -2793,7 +3415,7 @@ class TestEndToEnd(unittest.TestCase):
             sig = 'sha256=' + hmac_mod.new(self.SECRET.encode(), raw, hashlib.sha256).hexdigest()
         conn = UnixHTTPConnection(self.http_sock)
         headers = {'content-type': 'application/json', 'x-github-event': event,
-                   'x-github-delivery': 'test-%f' % time.time()}
+                   'x-github-delivery': delivery if delivery is not None else 'test-%f' % time.time()}
         if sig != '':
             headers['x-hub-signature-256'] = sig
         conn.request(method, '/' + source, raw, headers)
@@ -2840,6 +3462,35 @@ class TestEndToEnd(unittest.TestCase):
         self.assertTrue(line[0], 'peer never emitted a channel message')
         return json.loads(line[0].decode())
 
+    def codex_peer_record(self, session):
+        path = os.path.join(self.state, 'codex', '%s.json' % session)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+
+    def reap_codex_peer(self, session):
+        # The peer is deliberately detached (it outlives the subscribe that
+        # started it), so it is not in self.procs and teardown must find it.
+        rec = self.codex_peer_record(session)
+        if rec and isinstance(rec.get('pid'), int):
+            try:
+                os.kill(rec['pid'], 9)
+            except OSError:
+                pass
+
+    def wait_gone(self, pid, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            time.sleep(0.05)
+        return False
+
+
+class TestEndToEnd(EndToEndCase):
     def test_http_status_codes(self):
         self.start_daemon()
         self.assertEqual(self.post(self.ISSUE)[0], 200)
@@ -3420,33 +4071,6 @@ class TestEndToEnd(unittest.TestCase):
 
 
     # -- codex delivery (0.26.0) ---------------------------------------------
-    def codex_peer_record(self, session):
-        path = os.path.join(self.state, 'codex', '%s.json' % session)
-        if not os.path.exists(path):
-            return None
-        with open(path, encoding='utf-8') as f:
-            return json.load(f)
-
-    def reap_codex_peer(self, session):
-        # The peer is deliberately detached (it outlives the subscribe that
-        # started it), so it is not in self.procs and teardown must find it.
-        rec = self.codex_peer_record(session)
-        if rec and isinstance(rec.get('pid'), int):
-            try:
-                os.kill(rec['pid'], 9)
-            except OSError:
-                pass
-
-    def wait_gone(self, pid, timeout=15):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                return True
-            time.sleep(0.05)
-        return False
-
     def test_codex_session_peer_end_to_end(self):
         """A real signed delivery reaching a codex session: subscribe starts the
         peer, the peer hands the rendered event to `codex queue`, unsubscribe
@@ -3546,6 +4170,266 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn(b'codex', r.stdout.lower())
         self.assertFalse(os.path.exists(os.path.join(self.state, 'codex')))
+
+
+class TestSpoolEndToEnd(EndToEndCase):
+    """#60 end to end: real receiver, real peers, real signed deliveries — and
+    the failures that used to lose an accepted event: a peer that is down, a
+    receiver that dies, a consumer at capacity, a redelivery, a full disk."""
+
+    INITIALIZED = b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+
+    def handshake(self, peer):
+        peer.stdin.write(self.INITIALIZED)
+        peer.stdin.flush()
+
+    def no_line(self, peer, seconds):
+        # select() on the raw pipe, not a reader thread: a thread left blocked
+        # in readline() would swallow the NEXT line a later assertion wants.
+        import select
+        ready, _, _ = select.select([peer.stdout], [], [], seconds)
+        return not ready
+
+    def status(self, session='testsess'):
+        r = self.cli('status', session=session)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)['spool']
+
+    def stop_daemon(self, d):
+        d.kill()
+        d.wait()
+        err = d.stderr.read().decode()
+        try:
+            os.unlink(self.http_sock)    # a SIGKILLed daemon leaves its socket file
+        except OSError:
+            pass
+        return err
+
+    def test_a_session_that_was_down_gets_what_it_missed(self):
+        r = self.cli('subscribe', 'o/r', '--note', 'PR 5: waiting on review', session='downsess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.start_daemon()
+        # No peer for this session exists: before 0.33.0 this event was gone
+        # the moment broadcast() found no socket.
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-down-1'), (200, 'ok'))
+        self.assertEqual(self.status('downsess')['sessions']['downsess']['pending'], 1)
+        # ...and the receiver itself goes away before the session is back.
+        self.stop_daemon(d)
+        peer = self.start_peer('downsess')
+        # The backlog waits for the client's MCP handshake.
+        self.assertTrue(self.no_line(peer, 1.5), 'backlog delivered before notifications/initialized')
+        self.handshake(peer)
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['method'], 'notifications/claude/channel')
+        self.assertIn('title here', msg['params']['content'])
+        self.assertIn('PR 5: waiting on review', msg['params']['content'])
+        self.assertEqual(msg['params']['meta']['delivery'], 'gh-down-1')
+        deadline = time.time() + 5
+        while time.time() < deadline and self.status('downsess')['sessions']['downsess']['pending']:
+            time.sleep(0.1)
+        self.assertEqual(self.status('downsess')['sessions']['downsess'],
+                         {'pending': 0, 'leased': 0, 'oldestAgeS': None})
+        self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+
+    def test_a_peer_that_dies_and_comes_back_gets_the_event_it_missed(self):
+        r = self.cli('subscribe', 'o/r', '--note', 'flaky', session='flaky')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.start_daemon()
+        first = self.start_peer('flaky')
+        self.handshake(first)
+        first.kill()
+        first.wait()                       # its socket file stays behind
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-flaky-1'), (200, 'ok'))
+        second = self.start_peer('flaky')
+        self.handshake(second)
+        msg = self.read_peer_line(second)
+        self.assertIn('title here', msg['params']['content'])
+        err = self.stop_daemon(d)
+        self.assertIn('unreachable', err)              # the dead socket said out loud
+        self.assertIn('its copy stays spooled until it reconnects', err)
+
+    def test_a_live_peer_gets_each_delivery_once(self):
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',
+                     '--include', self.ANY_EVENT_JSON)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'o/r', '--note', 'live', session='live')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Window 0: a second spawn for the same key would start at once, so its
+        # absence below means something.
+        self.start_daemon(LOCAL_WEBHOOK_SPAWN_WINDOW='0')
+        peer = self.start_peer('live')
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-same'), (200, 'ok'))
+        self.assertIn('title here', self.read_peer_line(peer)['params']['content'])
+        self.assertTrue(self.wait_file(self.spawn_log, contains='issue #5 opened'))
+        # GitHub redelivers it (a backfill sweep, a manual redeliver).
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-same'), (200, 'ok (duplicate)'))
+        self.assertTrue(self.no_line(peer, 1.5), 'a redelivery reached the session twice')
+        time.sleep(1)
+        with open(self.spawn_log, encoding='utf-8') as f:
+            self.assertEqual(f.read().count('issue #5 opened'), 1, 'a redelivery spawned twice')
+        st = self.status('live')
+        self.assertEqual(st['sessions']['live']['pending'], 0)
+        self.assertEqual(st['dispatch']['pending'], 0)
+
+    def test_a_declined_batch_survives_a_receiver_crash(self):
+        script = os.path.join(self.state, 'spawn.sh')
+        allow = os.path.join(self.state, 'capacity.free')
+        declined = os.path.join(self.state, 'declined')
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write('if [ -f %s ]; then cat >> %s; exit 0; fi\n'
+                    'cat > /dev/null; : > %s; echo "at the hook-session cap"; exit 75\n'
+                    % (allow, self.spawn_log, declined))
+        r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',
+                     '--include', self.ANY_EVENT_JSON)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A 60s window paces the retry past the end of this daemon's life.
+        d = self.start_daemon(spawn_cmd='sh %s' % script)
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-capacity-1'), (200, 'ok'))
+        self.assertTrue(self.wait_file(declined), 'the spawn command never ran')
+        deadline = time.time() + 10
+        items = []
+        while time.time() < deadline:
+            items = self.status()['dispatch']['items']
+            if items and items[0]['state'] == 'pending' and items[0]['deferN'] == 1:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(items), 1, items)
+        self.assertEqual(items[0]['deferN'], 1)
+        self.assertEqual(items[0]['position'], 1)
+        self.assertIn('deferredSince', items[0])
+        self.stop_daemon(d)                       # SIGKILL: no shutdown path runs
+        open(allow, 'w').close()                  # capacity frees while it is down
+        d2 = self.start_daemon(spawn_cmd='sh %s' % script)
+        self.assertTrue(self.wait_file(self.spawn_log, contains='issue #5 opened on o/r'),
+                        'the declined batch did not survive the restart')
+        with open(self.spawn_log, encoding='utf-8') as f:
+            self.assertIn('standing watch', f.read())
+        deadline = time.time() + 10
+        while time.time() < deadline and self.status()['dispatch']['items']:
+            time.sleep(0.1)
+        self.assertEqual(self.status()['dispatch']['items'], [])
+        self.assertIn('re-queued 1 standing-watch event(s)', self.stop_daemon(d2))
+
+    def test_an_unwritable_spool_is_not_acknowledged(self):
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions')
+        r = self.cli('subscribe', 'o/r', '--note', 'disk', session='disk')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        inbox = os.path.join(self.state, 'spool', 'inbox')
+        os.makedirs(inbox)
+        os.chmod(inbox, 0o500)
+        self.addCleanup(os.chmod, inbox, 0o700)
+        # 500, not 200: the sender records a failed delivery that backfill can
+        # re-request, instead of an acknowledgement nothing here still holds.
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-disk-1'), (500, 'spool unavailable'))
+        os.chmod(inbox, 0o700)
+        # The redelivery is NOT a duplicate: the first one was never accepted.
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-disk-1'), (200, 'ok'))
+        peer = self.start_peer('disk')
+        self.handshake(peer)
+        self.assertIn('title here', self.read_peer_line(peer)['params']['content'])
+
+    def test_a_codex_delivery_that_fails_is_offered_again(self):
+        bindir = os.path.join(self.state, 'fake-bin')
+        os.makedirs(bindir)
+        fake = os.path.join(bindir, 'codex')
+        failing = os.path.join(self.state, 'codex.down')
+        calls = os.path.join(self.state, 'codex-calls.log')
+        queued = os.path.join(self.state, 'codex-queued.log')
+        with open(fake, 'w', encoding='utf-8') as f:
+            f.write('#!%s\nimport os, sys\n' % PYTHON)
+            f.write('open(%r, "a").write("call\\n")\n' % calls)
+            f.write('if os.path.exists(%r): sys.exit(1)\n' % failing)
+            f.write('open(%r, "a").write(sys.argv[sys.argv.index("--message") + 1] + "\\n")\n' % queued)
+        os.chmod(fake, 0o755)
+        open(failing, 'w').close()
+        # The DEFAULT give-up limit (3): retries of one event must not count
+        # as three failures, or a brief app-server outage would make the peer
+        # exit and strand everything after it (CodeRabbit on #100).
+        env = {'LOCAL_WEBHOOK_CODEX_BIN': fake, 'CODEX_THREAD_ID': 'thr-retry',
+               'LOCAL_WEBHOOK_SPOOL_POLL_S': '1'}
+        self.addCleanup(self.reap_codex_peer, 'codexretry')
+        r = self.cli('subscribe', 'o/r', '--note', 'codex retry', session='codexretry', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-codex-1'), (200, 'ok'))
+        self.assertTrue(self.wait_file(calls, contains='call'), 'codex queue was never tried')
+        # The app-server is down: the event went back in line, not away.
+        self.assertFalse(os.path.exists(queued))
+        st = self.status('codexretry')['sessions']['codexretry']
+        self.assertEqual(st['pending'] + st['leased'], 1)
+
+        def attempts():
+            with open(calls, encoding='utf-8') as f:
+                return f.read().count('call')
+        deadline = time.time() + 20
+        while time.time() < deadline and attempts() < 7:
+            time.sleep(0.2)
+        # Past the peer's 5s give-up check, with more failed attempts than
+        # CODEX_FAIL_MAX — and the peer is still there to deliver.
+        self.assertGreaterEqual(attempts(), 7)
+        rec = self.codex_peer_record('codexretry')
+        self.assertIsNotNone(rec)
+        os.kill(rec['pid'], 0)
+        os.unlink(failing)
+        self.assertTrue(self.wait_file(queued, contains='title here'),
+                        'the failed codex delivery was never offered again')
+        time.sleep(1.5)
+        with open(queued, encoding='utf-8') as f:
+            self.assertEqual(f.read().count('title here'), 1)
+
+    def test_an_older_peer_is_handed_its_copy_on_the_socket(self):
+        # A pre-0.33.0 peer cannot claim from the spool: it acts on the
+        # envelope and never unlinks anything. Without a marker beside its
+        # socket, the write itself is the handoff — the copy must not linger
+        # to be delivered a second time by whoever drains that box next.
+        r = self.cli('subscribe', 'o/r', '--note', 'old peer', session='legacy')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = os.path.join(self.state, 'legacy.out')
+        script = os.path.join(self.state, 'legacy_peer.py')
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write('import os, socket, sys\n'
+                    'p = os.path.join(sys.argv[1], "legacy.%d.sock" % os.getpid())\n'
+                    's = socket.socket(socket.AF_UNIX); s.bind(p); s.listen(4)\n'
+                    'while True:\n'
+                    '    c, _ = s.accept(); data = b""\n'
+                    '    while True:\n'
+                    '        b = c.recv(65536)\n'
+                    '        if not b: break\n'
+                    '        data += b\n'
+                    '    open(sys.argv[2], "ab").write(data); c.close()\n')
+        inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
+        p = subprocess.Popen([PYTHON, script, inst, got])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        self.assertTrue(self.wait_file(os.path.join(inst, 'legacy.%d.sock' % p.pid)))
+        self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-legacy-1'), (200, 'ok'))
+        self.assertTrue(self.wait_file(got, contains='title here'))
+        with open(got, encoding='utf-8') as f:
+            env = json.loads(f.read().splitlines()[0])
+        self.assertEqual(env['spool']['keys'], ['legacy'])   # additive; ignored by it
+        self.assertEqual(self.status('legacy')['sessions']['legacy']['pending'], 0)
+
+    def test_an_unsafe_delivery_id_stays_inside_the_spool(self):
+        r = self.cli('subscribe', 'o/r', '--note', 'paths', session='paths')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        hostile = '../../../../escape'
+        self.assertEqual(self.post(self.ISSUE, delivery=hostile), (200, 'ok'))
+        self.assertEqual(self.post(self.ISSUE, delivery=hostile), (200, 'ok (duplicate)'))
+        self.assertEqual(self.post(self.ISSUE, delivery='x' * 199), (200, 'ok'))
+        parent = os.path.dirname(self.state)
+        self.assertFalse(os.path.exists(os.path.join(parent, 'escape')))
+        for dirpath, _, files in os.walk(os.path.join(self.state, 'spool')):
+            for f in files:
+                self.assertNotIn('escape', f)
+        box = os.path.join(self.state, 'spool', 'peers', 'paths', 'new')
+        names = sorted(os.listdir(box))
+        self.assertEqual(len(names), 2)
+        for n in names:
+            self.assertRegex(n, r'^[0-9a-f]{40}$')
 
 
 class TestVersionConsistency(unittest.TestCase):

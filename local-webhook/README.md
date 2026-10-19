@@ -37,6 +37,9 @@ GitHub / Stripe / anything ──HTTPS──> reverse proxy (Caddy, TLS)
                             receiver.json          (daemon advertisement)
                             codex/<session>.json   (codex delivery peer: pid +
                                                     thread, 0.26.0)
+                            spool/                 (durable inbox: accepted
+                                                    events not yet delivered,
+                                                    0.33.0)
 ```
 
 - The **ingress owner** verifies the HMAC once and re-broadcasts each event to
@@ -460,8 +463,8 @@ Differences from session routing, all deliberate:
 - **The spawn command can say "not now" (0.16.0).** Its exit code is a
   three-way answer: `0` accepted the batch; **`75`** (`EX_TEMPFAIL`) means the
   command understood the request and declines it *for now*; any other non-zero
-  means a broken spawner, whose batch is logged and dropped (the same events
-  already reached session peers). A declined batch is **kept** — put back at
+  means a broken spawner, whose batch is logged and dropped (retrying a broken
+  spawner would loop). A declined batch is **kept** — put back at
   the head of its key's pending queue, re-checked against live ownership like
   any other waiting batch, and re-offered when the rate window opens or a
   concurrency slot frees. This is how a consumer at a session ceiling stops
@@ -473,7 +476,9 @@ Differences from session routing, all deliberate:
   `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` (200) lines wait per key, oldest dropped
   first. The HTTP response is unaffected: `deliver()` still answers `200 ok`,
   because the dispatch verdict is asynchronous and the HMAC and the peer
-  fan-out really did succeed.
+  fan-out really did succeed. Since 0.33.0 a kept batch is also kept **on
+  disk**, deferral streak included, so a receiver restart no longer forgets
+  it — see [The durable inbox](#the-durable-inbox-spool-0330).
 - **A waiting batch is re-checked before it spawns (0.11.1).** Every line in a
   follow-up batch is put to the live-peer question again the moment the batch
   starts, and dropped if a session now claims it. One failing run emits both
@@ -703,6 +708,96 @@ concurrent sessions acting as different GitHub users can then subscribe to the
 same repo with different ignore lists — each mutes only its own echoes, while
 fan-out delivers the event to both.
 
+## The durable inbox (spool, 0.33.0)
+
+Once a delivery's signature checks out, the sender is done with it and will
+not retry. Until 0.33.0 everything after that point lived in RAM, and two
+things could lose an accepted event without a word (#60):
+
+- **a session that was not listening** — respawning, restarting, stopped, or
+  not up yet — had no peer socket when the event was fanned out, so its copy
+  was never made;
+- **a receiver restart** forgot every standing-watch batch, including ones the
+  spawn command had declined (`75`) precisely so they would be kept.
+
+`backfill` cannot reach either: it re-requests what the sender failed to hand
+over, and these were handed over fine. Now every accepted event is written to
+a Maildir-style spool under `<state>/spool/` **before** anything consumes it
+and before the `200`:
+
+```
+spool/inbox/{tmp,new,fanned,dispatched}/<id>
+                                    accepted; new/<id> is the commit point
+spool/peers/<session>/{tmp,new,cur} that session's mail (hard links: one copy)
+spool/dispatch/{tmp,new,cur}/       the standing-watch queue
+spool/seen/<id>                     dedup memory (empty-ish files, mtime = when)
+```
+
+- **Atomic:** written to `tmp/`, then linked/renamed into `new/`; a crash
+  leaves a whole file or none. Taking an item is `rename(new/<id>,
+  cur/<id>:<pid>)` — atomic, so exactly one claimant wins — and the `<pid>` is
+  the lease: a lease whose process is dead goes back to `new/`. Done is
+  unlink. Delivery is **at-least-once**: a process that dies after delivering
+  and before unlinking delivers again. An accepted record then moves
+  `new → fanned → dispatched` as its session copies and its standing-watch
+  record are written, so recovery (at start, or the reaper after 60 s)
+  resumes the step a crash or a full disk interrupted and never redoes one
+  that finished; a record that still cannot be finished after
+  `LOCAL_WEBHOOK_SPOOL_PEER_MAX_S` is discarded with a log line.
+- **Deduplicated:** `<id>` is `<source>~<delivery id>` (or a sha256 of the
+  pair when either part is not plainly filename-safe — the delivery header is
+  sender-supplied and not covered by the signature). A delivery whose id and
+  body both match one already accepted — a `backfill` redelivery — answers
+  `200 ok (duplicate)` and is not fanned out again. A reused id with a
+  *different* body is a new event, so a sender with a constant delivery header
+  never has its traffic swallowed. Deliveries with no id are not deduplicated.
+- **Per-session mail:** the receiver links a copy into the box of every session
+  whose filter accepts the event, whether or not that session is running. A
+  live peer is rung over its socket (the envelope gains one additive field,
+  `spool: {id, keys}`) and claims its copy; a peer that was down drains its box
+  when it comes back — a claude peer once the client's MCP
+  `notifications/initialized` arrives, a codex peer at once — and polls every
+  `LOCAL_WEBHOOK_SPOOL_POLL_S`. A backlog event is routed against the
+  session's filter **as of when it was accepted**: a TTL that lapsed during the
+  outage still delivers what arrived while it was live, while an unsubscribe
+  discards it. A `codex queue` that fails puts the event back in line instead
+  of dropping it. A pre-0.33.0 peer (no `instances/<key>.<pid>.inbox` marker)
+  cannot claim, so for it the socket write is the handoff, as before. Each
+  copy is claimed by exactly ONE peer: the model is one peer per session key
+  (one `LOCAL_WEBHOOK_SESSION` per session, which agent-box guarantees). Two
+  processes sharing a key — say, a stray second `claude` started with the
+  same environment — no longer each receive every event; whichever claims
+  first delivers it.
+- **Standing watches:** each matched event is a record in `spool/dispatch/`,
+  leased while its batch runs, rewritten with its deferral streak on exit
+  `75`, and removed on every other ending (accepted, broken spawner, claimed by
+  a live session, past `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S`, over
+  `LOCAL_WEBHOOK_SPAWN_PENDING_MAX`). After a restart the queue is reloaded in
+  accept order and **every recovered batch is re-checked for ownership** before
+  it spawns; a batch still within its bounds does spawn — a red trunk that went
+  unhandled across a reboot is the case worth replaying. The record's name is
+  the delivery's identity only; the coalescing bucket (routing key, spawn
+  config, window) is derived when it is read.
+- **Expiry, said out loud:** a session's mail goes when its filter file does
+  (agent-box's `session rm` deletes it — a later session reusing the name must
+  not inherit it), when it is older than `LOCAL_WEBHOOK_SPOOL_PEER_MAX_S` (8 h,
+  the longest a session subscription lives unrenewed), or past
+  `LOCAL_WEBHOOK_SPOOL_PEER_MAX` (500) per session, oldest first. Dedup memory
+  lasts `LOCAL_WEBHOOK_SPOOL_SEEN_S` (72 h, about GitHub's delivery-log
+  retention). The ingress owner reaps every `LOCAL_WEBHOOK_SPOOL_REAP_S`, and
+  finishes any fan-out a crash interrupted.
+- **Fails closed:** if the spool cannot be written the delivery is answered
+  **`500 spool unavailable`** and nothing is fanned out, so the sender records
+  a failure that `backfill` can re-request — rather than a `200` for an event
+  nothing on the box still holds.
+- **Visible:** `webhook.py status` carries a top-level `spool` object — inbox
+  depth, every session's `pending`/`leased`/`oldestAgeS`, and the dispatch queue
+  item by item (`key`, `event`, `state`, `position` within its key, `deferN`,
+  `deferredSince`, `ageS`). It reads the directories, so it answers the same
+  whether or not the daemon is up; `ls spool/*/new` answers it too.
+
+`LOCAL_WEBHOOK_SPOOL=off` restores the in-memory behaviour wholesale.
+
 ## CLI
 
 The MCP tools only exist inside a Claude Code session that loaded the plugin. A
@@ -718,7 +813,8 @@ the two paths can't drift on TTL/renew semantics:
         --note "standing watch: new issues/PRs and failing CI spawn a fresh session"
     python3 webhook.py ls
     python3 webhook.py unsubscribe owner/repo
-    python3 webhook.py status        # state dir, session, sources (no secrets)
+    python3 webhook.py status        # state dir, session, sources (no secrets),
+                                     # and what is waiting in the spool
     python3 webhook.py emit budget '{"used_pct":92,"window":"5h"}' \
         --event budget_warning       # put a box-local event on the bus
 
@@ -885,6 +981,12 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_CODEX_IDLE` | `300` | seconds with no live subscription before a codex peer exits (min 30) |
 | `LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT` | `30` | seconds before one `codex queue` call is abandoned |
 | `LOCAL_WEBHOOK_CODEX_FAIL_MAX` | `3` | consecutive `codex queue` failures before the peer gives up |
+| `LOCAL_WEBHOOK_SPOOL` | on | `off`/`0`/`false`/`no` = keep accepted events in memory only, as before 0.33.0 |
+| `LOCAL_WEBHOOK_SPOOL_PEER_MAX_S` | `28800` | seconds an undelivered event waits for its session before it is discarded |
+| `LOCAL_WEBHOOK_SPOOL_PEER_MAX` | `500` | max undelivered events per session; past it the oldest are discarded |
+| `LOCAL_WEBHOOK_SPOOL_SEEN_S` | `259200` | seconds a delivery id (and body digest) is remembered for deduplication |
+| `LOCAL_WEBHOOK_SPOOL_REAP_S` | `60` | ingress owner: seconds between expiry passes over the spool |
+| `LOCAL_WEBHOOK_SPOOL_POLL_S` | `5` | session peer: seconds between looks at its own box (the socket doorbell is the fast path) |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source if `sources.json` is absent |
 
 When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress

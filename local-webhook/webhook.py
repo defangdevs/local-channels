@@ -36,6 +36,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import sys
 import threading
@@ -44,7 +45,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.32.0'
+VERSION = '0.33.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1110,7 +1111,16 @@ def predicate_error(pred, where='predicate'):
 #                   {path: "sender.login", notIn: ["me"]}]}
 # which also says more than the carve-out could: that sender's GREEN runs stay
 # quiet. See #16 for the whole retirement.
-def entry_forwards(e, sender, event, payload=None):
+# self_login is who "@self" means. The default is this process's own SELF; the
+# receiver's spool probe (filter_accepts) passes None, because it judges a
+# session's filter from OUTSIDE that session and cannot know the login the
+# session resolves "@self" to — so it lets "@self" mute nothing and spools a
+# superset, and the session peer's own route_event, which does know, has the
+# last word when the event is drained.
+_SELF_DEFAULT = object()
+
+
+def entry_forwards(e, sender, event, payload=None, self_login=_SELF_DEFAULT):
     if e['include'] is not None or e['exclude'] is not None:
         # Most GitHub payloads carry no field of their own named "event" (the
         # X-GitHub-Event header is passed to us separately), so a predicate
@@ -1131,8 +1141,9 @@ def entry_forwards(e, sender, event, payload=None):
     if not e['ignoreSenders'] or not sender:
         return True
     sl = sender.lower()
+    me = SELF if self_login is _SELF_DEFAULT else self_login
     for x in e['ignoreSenders']:
-        name = SELF if x == '@self' else x
+        name = me if x == '@self' else x
         if name and name.lower() == sl:
             return False
     return True
@@ -1174,14 +1185,23 @@ def entry_forwards(e, sender, event, payload=None):
 # like a broken one otherwise (agent-box#170). Session delivery never passes
 # it: there a rule-less entry means "everything on this topic", which is the
 # whole point of subscribing to a repo you are working in.
-def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, require_rules=False):
+#
+# `at` (#60) routes an event AS OF the moment it was accepted rather than now:
+# a spooled event drained after an outage — a respawn, a reboot, a peer that
+# was simply not up yet — reaches a subscription that was live when it
+# arrived, even if the TTL ran out while nobody could deliver it, and an
+# unsubscribe in the meantime still discards it. A stamp never moves a
+# timestamp backwards, so replaying an old event cannot shorten a
+# subscription that has since been renewed.
+def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, require_rules=False,
+                at=None):
     with FILTER_LOCK, filter_file_lock(path):
         f = read_filter(path)
         if not f['enabled']:
             return {'forward': False, 'entry': None, 'refused': False, 'ruleless': False}
         if not f['topicsConfigured']:
             return {'forward': False, 'entry': None, 'refused': False, 'ruleless': False}
-        now = now_ms()
+        now = now_ms() if at is None else at
         live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
         pruned = len(live) != len(f['topics'])
         forward = False
@@ -1216,9 +1236,10 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, requ
                 matched = e
                 prev = parse_ms(e['lastActivityAt'])
                 warm = prev is not None and now - prev < WARM_WINDOW_MS
-                if e['renewOnEvent'] or warm:
+                if (e['renewOnEvent'] or warm) and not (parse_ms(e['subscribedAt']) or 0) > now:
                     e['subscribedAt'] = iso_at(now)
-                e['lastActivityAt'] = iso_at(now)
+                if not (prev or 0) > now:
+                    e['lastActivityAt'] = iso_at(now)
                 # First accepting entry wins (file order) and is the only one
                 # this event affects. Without the break, a later entry that
                 # ALSO accepts the same event — never selected, since it is
@@ -1346,9 +1367,15 @@ CODEX_PEER_IDLE_S = max(30, _int_env('LOCAL_WEBHOOK_CODEX_IDLE', default=300))
 CODEX_QUEUE_TIMEOUT_S = max(5, _int_env('LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT', default=30))
 # Consecutive `codex queue` failures before the peer stops trying. A thread
 # that has been deleted, or a codex install that has gone away, fails every
-# time, and a peer that keeps retrying it just fills its log; the events are
-# gone either way (like a failed spawn, there is nothing to retry into). One
-# failure is not enough — the app-server daemon can be restarting.
+# time, and a peer that keeps retrying it just fills its log. One failure is
+# not enough — the app-server daemon can be restarting. Counted per EVENT,
+# not per attempt (0.33.0): a spooled delivery that fails goes back into the
+# session's inbox and is retried every LOCAL_WEBHOOK_SPOOL_POLL_S, and if each
+# retry counted, one event during a brief app-server outage would make the
+# peer give up within seconds — stranding every later delivery to that
+# session until it subscribes again. So it takes this many DIFFERENT events
+# failing in a row, as it always did; what the peer leaves behind when it
+# does give up is kept in the spool rather than lost.
 CODEX_FAIL_MAX = max(1, _int_env('LOCAL_WEBHOOK_CODEX_FAIL_MAX', default=3))
 # Bound on the text handed to `codex queue`. The message is one argv element
 # and no shell is involved, so nothing in it is parsed — this is about ARG_MAX
@@ -1487,22 +1514,34 @@ if CODEX_PEER:
 # Delivery counters, read by the peer's own idle loop. Written from the IPC
 # thread, read from the main one; both are single assignments of ints, and the
 # only consumer is a log line and a give-up test, so no lock earns its keep.
-CODEX_STATS = {'delivered': 0, 'failed': 0, 'consecutiveFailures': 0, 'lastAt': 0, 'lastError': ''}
+CODEX_STATS = {'delivered': 0, 'failed': 0, 'consecutiveFailures': 0, 'lastAt': 0, 'lastError': '',
+               'lastFailedId': None}
 
 
-def codex_deliver(text, meta):
+# Returns whether the message was handed over. Since 0.33.0 a False is not the
+# end of the event: a spooled delivery goes back into this session's inbox and
+# is offered again (see "spool"), where it used to be gone.
+#
+# event_id is the spool id when this is a spooled delivery: a retry of the
+# event that failed last does not count as another consecutive failure (see
+# CODEX_FAIL_MAX).
+def codex_deliver(text, meta, event_id=None):
     ok, detail = codex_queue(CODEX_PEER_THREAD, text)
     CODEX_STATS['lastAt'] = now_ms()
     if ok:
         CODEX_STATS['delivered'] += 1
         CODEX_STATS['consecutiveFailures'] = 0
+        CODEX_STATS['lastFailedId'] = None
         print('local-webhook: queued %s delivery for codex thread %s'
               % (meta.get('source', '?'), CODEX_PEER_THREAD), file=sys.stderr)
     else:
         CODEX_STATS['failed'] += 1
-        CODEX_STATS['consecutiveFailures'] += 1
+        if event_id is None or event_id != CODEX_STATS['lastFailedId']:
+            CODEX_STATS['consecutiveFailures'] += 1
+        CODEX_STATS['lastFailedId'] = event_id
         CODEX_STATS['lastError'] = detail
         print('local-webhook: codex delivery failed (%s)' % detail, file=sys.stderr)
+    return ok
 
 
 def live_topic_count(path=None, now=None):
@@ -1638,6 +1677,9 @@ def run_codex_peer():
             pass
     print('local-webhook %s: codex peer up for thread %s (filter %s, socket %s)'
           % (VERSION, CODEX_PEER_THREAD, FILTER_FILE, IPC_SOCK), file=sys.stderr)
+    # No handshake to wait for: whatever waited in this session's inbox while
+    # no peer was running (#60) can be queued into the thread right away.
+    INBOX_READY.set()
     empty_since = None
     while True:
         time.sleep(5)
@@ -1752,25 +1794,999 @@ def format_delivery(env, entry):
     return text, meta
 
 
-def handle_event(env):
-    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''), env.get('event', ''),
-                    env.get('payload'))
-    if not r['forward']:
+# ------------------------------------------------------------------ spool ---
+# The durable inbox (issue #60). Until 0.33.0 an accepted delivery — signature
+# verified, 200 about to go back to a sender that will never retry — lived
+# only in RAM from that point on, and two consumers could lose it:
+#   - broadcast() wrote it to whichever peer sockets existed at that instant.
+#     A session that was respawning, restarting, stopped, or not up yet had no
+#     socket, and its copy was simply never made. Nothing logged it.
+#   - the Dispatcher held a standing watch's batch in memory, including one
+#     the spawn command had DECLINED (exit 75, #28) precisely so it would not
+#     be lost — and a receiver restart forgot it, silently.
+# `backfill` cannot reach either case: it re-requests what the SENDER failed
+# to hand over, and these were handed over fine.
+#
+# The fix is a spool on the filesystem, Maildir-style (decided 2026-10-03 on
+# #60), written BEFORE anything consumes the event:
+#
+#   spool/inbox/{tmp,new,fanned,dispatched}/<id>
+#                                       every accepted event; new/<id> is the
+#                                       commit point that makes "accepted"
+#                                       true, the later steps say how far its
+#                                       fan-out got (see INBOX_PHASES)
+#   spool/peers/<box>/{tmp,new,cur}/    one inbox per session filter key: hard
+#                                       links to the inbox record, so N
+#                                       sessions cost one copy of the payload
+#   spool/dispatch/{tmp,new,cur}/       the standing-watch queue, one record
+#                                       per event a watch matched
+#   spool/seen/<id>                     empty dedup markers, mtime = accepted
+#
+# Write = tmp/ then link()/rename() into new/, so a crash leaves a whole file
+# or none. Take = rename new/<id> to cur/<id>:<pid>, which is atomic, so of
+# two claimants exactly one wins; the <pid> is the LEASE — a lease whose
+# process is dead goes back to new/, which is how a crash mid-delivery turns
+# into a redelivery instead of a loss. Done = unlink. Ages come from mtime,
+# which survives a restart where the monotonic clock does not.
+#
+# Delivery is at-least-once, not exactly-once: a process that dies after
+# delivering and before unlinking delivers again. That is the trade every
+# such spool makes, and the opposite failure is the bug this replaces.
+#
+# The file NAME is the delivery's identity and nothing else (#60's Oct 19
+# comment): which standing watch, which coalescing bucket, which spawnConfig
+# are attributes inside a record, derived again when it is read. A later work
+# queue — jobs that are not webhooks, job classes with their own concurrency,
+# per-key locks, heartbeat leases (the cur/ file's mtime), a queue position —
+# can sit on the same primitive (SpoolQueue) without a rewrite.
+#
+# Everything here stays on the closed side: an unparseable record is dropped
+# loudly, a name that does not match the grammar below is never opened, and
+# a spool that cannot be written makes the delivery fail (500) rather than be
+# acknowledged without a durable copy. LOCAL_WEBHOOK_SPOOL=off restores the
+# in-memory behaviour wholesale, as an operator's escape hatch.
+SPOOL_ENABLED = not re.match(r'^(0|false|no|off)$',
+                             (os.environ.get('LOCAL_WEBHOOK_SPOOL') or '').strip(), re.I)
+SPOOL_DIR = os.path.join(STATE_DIR, 'spool')
+# Expiry. A session's mail is bounded twice: by its subscription (an event is
+# drained only if the session's filter accepted it as of the moment it
+# arrived, and a session whose filter file is gone loses its box at the next
+# reap) and, as a backstop for a filter left behind by a dead session, by age
+# and count. 8h is MAX_SESSION_TTL_HOURS — the longest a session subscription
+# can live without being renewed — so mail older than that is addressed to a
+# conversation that has moved on, and delivering it would be exactly the
+# ambush the codex peer's idle exit exists to avoid.
+SPOOL_PEER_MAX_S = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_PEER_MAX_S', default=8 * 3600))
+SPOOL_PEER_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_PEER_MAX', default=500))
+# How long a delivery id is remembered once it is fully handed off: GitHub
+# keeps its delivery log about three days, which is as far back as a
+# `backfill` sweep can re-request anything.
+SPOOL_SEEN_S = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_SEEN_S', default=72 * 3600))
+SPOOL_REAP_S = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_REAP_S', default=60))
+# How often a session peer looks at its own box without being told to. The
+# doorbell (an IPC envelope naming the spooled id) is the fast path; this only
+# catches what arrived while the peer was not listening, and retries a codex
+# delivery that failed.
+SPOOL_POLL_S = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_POLL_S', default=5))
+# A fan-out the receiver started but did not finish (a crash, a full disk) is
+# retried by the reaper once the record is this old, so a live handler that
+# is merely slow is never raced.
+SPOOL_INBOX_RETRY_S = 60
+SPOOL_TMP_MAX_S = 3600
+# A claude peer may not emit a channel notification before the client says
+# MCP initialization is done, so its backlog waits for that — or for this long,
+# for a client that never sends it.
+SPOOL_READY_GRACE_S = 30
+
+# Names. A delivery id is sender-supplied and, unlike the body, NOT covered by
+# the signature, so it never reaches a path as written unless it is plainly
+# safe: `<source>~<delivery>` when both parts match SPOOL_PART, otherwise a
+# 40-hex sha256 of the pair — which has no "~" and so can never collide with a
+# readable name. An event with no delivery id gets a generated `~@` name and
+# no dedup marker (there is nothing to deduplicate it against).
+SPOOL_PART = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+SPOOL_NAME = re.compile(r'^(?:(?:[A-Za-z0-9][A-Za-z0-9._-]{0,99}|_)~@?[A-Za-z0-9][A-Za-z0-9._-]{0,99}'
+                        r'|[0-9a-f]{40})$')
+SPOOL_LEASE = re.compile(r'^(.+):([0-9]{1,10})$')
+SPOOL_BOX = re.compile(r'^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,99}|@shared|@[0-9a-f]{32})$')
+SESSION_KEY = re.compile(r'^[A-Za-z0-9._-]*$')
+
+
+def spool_id(source, delivery):
+    """The spool name for a delivery id, or None when there is no id."""
+    if not delivery:
+        return None
+    if SPOOL_PART.match(source or '') and SPOOL_PART.match(delivery):
+        return '%s~%s' % (source, delivery)
+    raw = ('%s\x00%s' % (source, delivery)).encode('utf-8', 'surrogateescape')
+    return hashlib.sha256(raw).hexdigest()[:40]
+
+
+def spool_dedupable(sid):
+    return '~@' not in sid
+
+
+def spool_box(key):
+    """Directory name of a session key's inbox. SESSION is already reduced to
+    [A-Za-z0-9._-], which still admits ".", ".." and dotfiles — so anything
+    that is not a plain SPOOL_PART is hashed rather than joined into a path."""
+    if key == '':
+        return '@shared'
+    if SPOOL_PART.match(key):
+        return key
+    return '@' + hashlib.sha256(key.encode('utf-8', 'surrogateescape')).hexdigest()[:32]
+
+
+def spool_path(directory, name):
+    """The one way a spool name becomes a path. Every name has already been
+    reduced to SPOOL_NAME (or a lease of one) by whoever made it, so this
+    never refuses in practice; it exists so that no sender-supplied string —
+    a delivery id is one — can reach the filesystem except through a check
+    that it names a plain entry directly inside `directory`."""
+    if not isinstance(name, str):
+        raise ValueError('spool name must be a string')
+    m = SPOOL_LEASE.match(name)
+    if not SPOOL_NAME.match(m.group(1) if m else name):
+        raise ValueError('not a spool name: %r' % name[:120])
+    base = os.path.abspath(directory)
+    path = os.path.normpath(os.path.join(base, name))
+    if not path.startswith(base + os.sep) or os.path.dirname(path) != base:
+        raise ValueError('spool name escapes its directory: %r' % name[:120])
+    return path
+
+
+def _spool_regular(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st if stat.S_ISREG(st.st_mode) else None
+
+
+class SpoolQueue:
+    """One Maildir-style queue: tmp/, new/ and cur/ under `root`.
+
+    The primitive both consumers share, and deliberately nothing more: it
+    knows names, atomic publication, leases and ages, and nothing about
+    webhooks, routing keys or batches. A record is a JSON object with at least
+    {v, kind, id, acceptedMs}; what else it carries is its consumer's business.
+    """
+
+    def __init__(self, root):
+        self.root = root
+        self.tmp = os.path.join(root, 'tmp')
+        self.new = os.path.join(root, 'new')
+        self.cur = os.path.join(root, 'cur')
+
+    def ensure(self):
+        for d in (self.root, self.tmp, self.new, self.cur):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+
+    def _stage(self, data, mtime_ms=None):
+        self.ensure()
+        tmp = os.path.join(self.tmp, '%d.%s' % (os.getpid(), os.urandom(8).hex()))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if mtime_ms is not None:
+                ns = int(mtime_ms) * 1000000
+                os.utime(tmp, ns=(ns, ns))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return tmp
+
+    def publish(self, name, data, mtime_ms=None):
+        """Atomically create new/<name>. False when <name> is already queued
+        here (in new/ or leased in cur/) — the caller's dedup answer."""
+        if self.leases(name):
+            return False
+        tmp = self._stage(data, mtime_ms)
+        try:
+            os.link(tmp, spool_path(self.new, name))
+            return True
+        except FileExistsError:
+            return False
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def link_in(self, src, name):
+        """Queue an existing record (a hard link, no copy) as new/<name>."""
+        self.ensure()
+        if self.leases(name):
+            return False
+        for attempt in (0, 1):
+            try:
+                os.link(src, spool_path(self.new, name))
+                return True
+            except FileExistsError:
+                return False
+            except FileNotFoundError:
+                # The reaper removed an emptied box between ensure() and
+                # link(); make it again, once.
+                if attempt:
+                    raise
+                self.ensure()
+        return False
+
+    def names(self):
+        """Queued (not leased) names, oldest first: accept order is mtime,
+        then name. This order is also what a queue position means."""
+        try:
+            found = os.listdir(self.new)
+        except OSError:
+            return []
+        rows = []
+        for n in found:
+            if not SPOOL_NAME.match(n):
+                continue
+            st = _spool_regular(spool_path(self.new, n))
+            if st is not None:
+                rows.append((st.st_mtime_ns, n))
+        rows.sort()
+        return [n for _, n in rows]
+
+    def aged(self):
+        """[(name, mtime seconds, 'new'|'cur', owner pid or None)], oldest first."""
+        rows = []
+        for n in self.names():
+            st = _spool_regular(spool_path(self.new, n))
+            if st is not None:
+                rows.append((n, st.st_mtime, 'new', None))
+        for n, pid in self.leases():
+            st = _spool_regular(spool_path(self.cur, '%s:%d' % (n, pid)))
+            if st is not None:
+                rows.append((n, st.st_mtime, 'cur', pid))
+        rows.sort(key=lambda r: (r[1], r[0]))
+        return rows
+
+    def leases(self, name=None):
+        """[(name, owner pid)] of everything in cur/, or of one name."""
+        try:
+            found = os.listdir(self.cur)
+        except OSError:
+            return []
+        out = []
+        for f in found:
+            m = SPOOL_LEASE.match(f)
+            if not m or not SPOOL_NAME.match(m.group(1)):
+                continue
+            if name is not None and m.group(1) != name:
+                continue
+            out.append((m.group(1), int(m.group(2))))
+        return out
+
+    def lease_path(self, name, owner=None):
+        return spool_path(self.cur, '%s:%d' % (name, os.getpid() if owner is None else owner))
+
+    def claim(self, name, owner=None):
+        """Take new/<name>; the lease path, or None when someone else has it
+        (or it is gone). rename() is the whole of the mutual exclusion."""
+        if not SPOOL_NAME.match(name):
+            return None
+        try:
+            os.makedirs(self.cur, mode=0o700, exist_ok=True)
+            dst = self.lease_path(name, owner)
+            os.rename(spool_path(self.new, name), dst)
+            return dst
+        except OSError:
+            return None
+
+    def release(self, name, owner=None, data=None):
+        """Give a lease back to new/ — optionally rewritten (a dispatch
+        record's deferral streak), keeping its accept-time mtime either way."""
+        src = self.lease_path(name, owner)
+        st = _spool_regular(src)
+        if st is None:
+            return False
+        if data is not None:
+            tmp = self._stage(data, st.st_mtime_ns // 1000000)
+            os.replace(tmp, spool_path(self.new, name))
+            try:
+                os.unlink(src)
+            except OSError:
+                pass
+            return True
+        try:
+            os.rename(src, spool_path(self.new, name))
+            return True
+        except OSError:
+            return False
+
+    def done(self, name, owner=None):
+        try:
+            os.unlink(self.lease_path(name, owner))
+        except OSError:
+            pass
+
+    def drop(self, name):
+        """Remove <name> wherever it is in this queue."""
+        n = 0
+        try:
+            os.unlink(spool_path(self.new, name))
+            n += 1
+        except OSError:
+            pass
+        for _, pid in self.leases(name):
+            try:
+                os.unlink(self.lease_path(name, pid))
+                n += 1
+            except OSError:
+                pass
+        return n
+
+    def recover(self, alive=None):
+        """Leases whose owner is dead go back to new/. Returns how many."""
+        alive = alive or pid_alive
+        n = 0
+        for name, pid in self.leases():
+            if alive(pid):
+                continue
+            src = self.lease_path(name, pid)
+            if os.path.exists(spool_path(self.new, name)):
+                try:
+                    os.unlink(src)   # a second copy of something already queued
+                except OSError:
+                    pass
+                continue
+            try:
+                os.rename(src, spool_path(self.new, name))
+                n += 1
+            except OSError:
+                pass
+        return n
+
+    def reap_tmp(self, now_s, max_age_s=SPOOL_TMP_MAX_S):
+        try:
+            found = os.listdir(self.tmp)
+        except OSError:
+            return 0
+        n = 0
+        for f in found:
+            st = _spool_regular(os.path.join(self.tmp, f))
+            if st is not None and now_s - st.st_mtime > max_age_s:
+                try:
+                    os.unlink(os.path.join(self.tmp, f))
+                    n += 1
+                except OSError:
+                    pass
+        return n
+
+    @staticmethod
+    def load(path):
+        """A record as a dict, or None for anything that is not one. Opened
+        O_NOFOLLOW: a symlink planted in a queue is never followed."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, 'rb') as fh:
+                rec = json.loads(fh.read().decode('utf-8'))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(rec, dict) or not isinstance(rec.get('id'), str):
+            return None
+        if not isinstance(rec.get('acceptedMs'), (int, float)) or isinstance(rec.get('acceptedMs'), bool):
+            return None
+        return rec
+
+
+SPOOL_INBOX = SpoolQueue(os.path.join(SPOOL_DIR, 'inbox'))
+SPOOL_DISPATCH = SpoolQueue(os.path.join(SPOOL_DIR, 'dispatch'))
+SPOOL_PEERS = os.path.join(SPOOL_DIR, 'peers')
+SPOOL_SEEN = os.path.join(SPOOL_DIR, 'seen')
+# Ids a live HTTP handler is still fanning out — the reaper's inbox retry must
+# not race one. Only the ingress owner writes the inbox, so in-process is
+# enough.
+SPOOL_INFLIGHT = set()
+SPOOL_INFLIGHT_LOCK = threading.Lock()
+
+
+def peer_queue(key):
+    return SpoolQueue(os.path.join(SPOOL_PEERS, spool_box(key)))
+
+
+def _peer_queue_for_key(key):
+    """peer_queue(), with the box created and labelled with its key — the
+    label is how the reaper finds the filter a hashed box belongs to."""
+    q = peer_queue(key)
+    q.ensure()
+    label = os.path.join(q.root, 'key')
+    if not os.path.exists(label):
+        try:
+            with open(label + '.tmp', 'w', encoding='utf-8') as fh:
+                fh.write(key)
+            os.replace(label + '.tmp', label)
+        except OSError:
+            pass
+    return q
+
+
+def _box_key(box):
+    """The session key a box belongs to, or None when it cannot be told."""
+    try:
+        with open(os.path.join(SPOOL_PEERS, box, 'key'), encoding='utf-8') as fh:
+            key = fh.read()
+        if SESSION_KEY.match(key) and spool_box(key) == box:
+            return key
+    except OSError:
+        pass
+    if box == '@shared':
+        return ''
+    if not box.startswith('@'):
+        return box
+    return None
+
+
+def filter_keys():
+    """Every session key with a filter file in the state dir — live or not,
+    since mail for a session that is down is the point of the spool."""
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return []
+    keys = []
+    for n in names:
+        if n == 'filter.json':
+            keys.append('')
+        elif n.startswith('filter.') and n.endswith('.json'):
+            k = n[len('filter.'):-len('.json')]
+            if k and k != 'dispatch' and SESSION_KEY.match(k):
+                keys.append(k)
+    return sorted(keys)
+
+
+def filter_accepts(path, env, at=None):
+    """Would the session behind this filter receive `env` (as of `at`)?
+
+    Read-only, like filter_claims: the receiver asks this about OTHER
+    sessions' filters to decide whose inbox gets a copy, and asking must not
+    stamp, renew or prune anything. "@self" mutes nothing here (see
+    entry_forwards), so this is a superset of what the session's own
+    route_event will forward when it drains — an extra copy is discarded
+    there; a missing one could never be recovered.
+    """
+    f = read_filter(path)
+    if not f['enabled'] or not f['topicsConfigured']:
+        return False
+    key = env.get('key', '')
+    if not key:
+        return False
+    now = now_ms() if at is None else at
+    for e in f['topics']:
+        if entry_expired(e, f['ttlHours'], now):
+            continue
+        if match_topic(env.get('source', ''), key, e['topic']) and entry_forwards(
+                e, env.get('sender', ''), env.get('event', ''), env.get('payload'), self_login=None):
+            return True
+    return False
+
+
+def _seen_digest(sid):
+    """The body digest a seen marker recorded, '' for none, None if unseen."""
+    try:
+        fd = os.open(spool_path(SPOOL_SEEN, sid), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, 'rb') as fh:
+            return fh.read(128).decode('ascii', 'replace').strip()
+    except OSError:
+        return ''
+
+
+# An accepted record moves through the inbox in three steps, each ended by a
+# rename, so recovery redoes only the step a crash (or a full disk) actually
+# interrupted:
+#   new/        accepted; per-session copies not yet (all) linked
+#   fanned/     copies linked; the standing-watch record not yet written
+#   dispatched/ both done; only the seen marker and the unlink remain
+# Without the steps, a retry re-linked copies sessions had already drained
+# and re-queued watches that had already spawned — every reaper pass, for as
+# long as the failure lasted.
+INBOX_PHASES = ('new', 'fanned', 'dispatched')
+
+
+def _inbox_path(phase, sid):
+    return spool_path(os.path.join(SPOOL_INBOX.root, phase), sid)
+
+
+def _inbox_advance(sid, frm, to):
+    os.makedirs(os.path.join(SPOOL_INBOX.root, to), mode=0o700, exist_ok=True)
+    os.rename(_inbox_path(frm, sid), _inbox_path(to, sid))
+
+
+def _inbox_records():
+    """[(phase, sid, mtime seconds)] of every record still in the inbox."""
+    rows = []
+    for phase in INBOX_PHASES:
+        d = os.path.join(SPOOL_INBOX.root, phase)
+        try:
+            found = os.listdir(d)
+        except OSError:
+            continue
+        for n in found:
+            if not SPOOL_NAME.match(n):
+                continue
+            st = _spool_regular(spool_path(d, n))
+            if st is not None:
+                rows.append((phase, n, st.st_mtime))
+    rows.sort(key=lambda r: (r[2], r[1]))
+    return rows
+
+
+# A duplicate is the same delivery id AND the same body (digest = sha256 of
+# the raw, verified body). GitHub keeps both on a redelivery, so that is what
+# a backfill sweep sends. The body half is there for the sender that does
+# NOT: a generic source whose deliveryHeader names something constant per
+# hook would otherwise have every later event dropped as a "duplicate" for
+# SPOOL_SEEN_S — losing events in the name of not repeating them. A reused id
+# with a different body is a new event, under a generated name.
+def spool_accept(env, digest=''):
+    """Make an accepted delivery durable. (sid, accepted ms), or None when it
+    is a duplicate of one already accepted. Raises OSError when it cannot be
+    written — the caller must then NOT acknowledge it."""
+    at = int(now_ms())
+    src = env.get('source', '')
+
+    def fresh():
+        return '%s~@%d.%d.%s' % (src if SPOOL_PART.match(src) else '_', at, os.getpid(),
+                                os.urandom(4).hex())
+
+    sid = spool_id(src, env.get('delivery', ''))
+    if sid is not None:
+        prior = _seen_digest(sid)
+        if prior is not None:
+            if prior == digest:
+                return None
+            print('local-webhook: %s delivery id %s was already used for a different body — '
+                  'accepting this one as a new event' % (src, env.get('delivery', '')), file=sys.stderr)
+            sid = fresh()
+    else:
+        sid = fresh()
+    rec = {'v': 1, 'kind': 'webhook', 'id': sid, 'acceptedMs': at, 'acceptedAt': iso_at(at),
+           'digest': digest, 'env': env}
+    def rename_fresh():
+        rec['id'] = fresh()
+        if not SPOOL_INBOX.publish(rec['id'], compact(rec).encode('utf-8'), mtime_ms=at):
+            raise OSError('could not publish %s' % rec['id'])
+        return rec['id']
+
+    if not SPOOL_INBOX.publish(sid, compact(rec).encode('utf-8'), mtime_ms=at):
+        other = SpoolQueue.load(_inbox_path('new', sid))
+        if other is None or other.get('digest') == digest:
+            return None   # the same delivery is being fanned out right now
+        sid = rename_fresh()
+    elif spool_dedupable(sid):
+        # The same id may already be further along: an original moves
+        # forward by rename, and the checks below follow it in the same
+        # direction (fanned, dispatched, then the seen marker it writes
+        # BEFORE its last unlink), so a record moving on is caught at a
+        # later step instead of slipping between two.
+        for phase in INBOX_PHASES[1:]:
+            if os.path.exists(_inbox_path(phase, sid)):
+                other = SpoolQueue.load(_inbox_path(phase, sid))
+                SPOOL_INBOX.drop(sid)
+                if other is None or other.get('digest') == digest:
+                    return None
+                sid = rename_fresh()
+                break
+        else:
+            if _seen_digest(sid) == digest:
+                SPOOL_INBOX.drop(sid)
+                return None
+    return sid, at
+
+
+def spool_fanout(sid, env, at, src):
+    """Link the committed inbox record into every session inbox whose filter
+    accepts it. Idempotent per box. Returns the keys it is queued for."""
+    keys = []
+    for key in filter_keys():
+        if not filter_accepts(filter_path_of(key), env, at):
+            continue
+        _peer_queue_for_key(key).link_in(src, sid)
+        keys.append(key)
+    return keys
+
+
+def spool_commit(sid, digest=''):
+    """Fan-out finished: remember the id (and its body), retire the record."""
+    if spool_dedupable(sid):
+        os.makedirs(SPOOL_SEEN, mode=0o700, exist_ok=True)
+        fd = os.open(spool_path(SPOOL_SEEN, sid),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='ascii') as fh:
+            fh.write(digest)
+    try:
+        os.unlink(_inbox_path('dispatched', sid))
+    except FileNotFoundError:
+        pass
+
+
+def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
+    """Everything after the commit point, for one accepted event: per-session
+    copies, the live doorbell, the standing-watch record, then the commit —
+    starting from `phase`, so recovery resumes a record where it stopped."""
+    keys = []
+    if phase == 'new':
+        keys = spool_fanout(sid, env, at, _inbox_path('new', sid))
+        _inbox_advance(sid, 'new', 'fanned')
+        phase = 'fanned'
+    if live:
+        if not RECEIVER_ONLY:
+            # legacy: the ingress-owning session gets it too
+            if FILTER_KEY in keys:
+                inbox_take(sid)
+            else:
+                handle_event(env)
+        broadcast(env, (sid, keys))
+    if phase == 'fanned':
+        dispatch_event(env, sid=sid, at=at, enqueue=enqueue)  # standing watches (issue #1)
+        _inbox_advance(sid, 'fanned', 'dispatched')
+    spool_commit(sid, digest)
+
+
+# ---- the session side: one peer drains its own box ----
+MY_INBOX = peer_queue(FILTER_KEY)
+INBOX_READY = threading.Event()
+INBOX_WAKE = threading.Event()
+
+
+def inbox_take(sid, q=None):
+    """Claim this session's copy of one spooled event and deliver it.
+
+    Returns handle_event's answer, or None when the copy was not there to
+    take — a sibling or the drain loop already has it, which is the
+    at-most-one-claimant property the rename gives for free. A delivery that
+    FAILED (codex queue said no) goes back to new/ to be offered again.
+    """
+    q = q or MY_INBOX
+    path = q.claim(sid)
+    if path is None:
+        return None
+    rec = SpoolQueue.load(path)
+    if rec is None or not isinstance(rec.get('env'), dict):
+        print('local-webhook: discarding unreadable spooled event %s' % sid, file=sys.stderr)
+        q.done(sid)
+        return 'filtered'
+    # The same bound the reaper applies, checked here too: with the receiver
+    # down nothing reaps, and a peer coming back after a long outage must not
+    # deliver a backlog the reaper would have discarded.
+    age_s = (now_ms() - rec['acceptedMs']) / 1000.0
+    if age_s > SPOOL_PEER_MAX_S:
+        print('local-webhook: discarded spooled event %s — %ds old, past '
+              'LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d' % (sid, age_s, SPOOL_PEER_MAX_S), file=sys.stderr)
+        q.done(sid)
+        return 'expired'
+    try:
+        res = handle_event(rec['env'], at=rec['acceptedMs'], sid=sid)
+    except Exception:
+        q.release(sid)
+        raise
+    if res == 'failed':
+        q.release(sid)
+    else:
+        q.done(sid)
+    return res
+
+
+def inbox_drain(q=None):
+    """Deliver everything waiting in this session's box, oldest first."""
+    q = q or MY_INBOX
+    q.recover()
+    n = 0
+    for sid in q.names():
+        res = inbox_take(sid, q)
+        if res == 'failed':
+            break   # the last inch is down; the poll offers it again
+        if res == 'delivered':
+            n += 1
+    return n
+
+
+def _inbox_loop():
+    INBOX_READY.wait()
+    while True:
+        try:
+            n = inbox_drain()
+            if n:
+                print('local-webhook: delivered %d spooled event(s) from this session\'s inbox' % n,
+                      file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — the drain must outlive one bad record
+            print('local-webhook: inbox drain failed: %s' % e, file=sys.stderr)
+        INBOX_WAKE.wait(SPOOL_POLL_S)
+        INBOX_WAKE.clear()
+
+
+# ---- the ingress owner: recovery at start, a reaper afterwards ----
+def spool_recover():
+    """After a (re)start: finish any fan-out a crash interrupted, then reload
+    the dispatch queue. Peers drain their own boxes; nothing to do for them."""
+    redone = sum(1 for phase, sid, _ in _inbox_records() if _inbox_resume(phase, sid, enqueue=False))
+    requeued = 0
+    if DISPATCHER is not None:
+        # Unconditionally, and on its own: one bad inbox record must not keep
+        # the whole standing-watch queue — declined batches included — from
+        # coming back.
+        try:
+            requeued = DISPATCHER.recover()
+        except Exception as e:  # noqa: BLE001
+            print('local-webhook: could not reload the dispatch queue: %s' % e, file=sys.stderr)
+    if redone or requeued:
+        print('local-webhook: spool recovery — finished the fan-out of %d accepted event(s), '
+              're-queued %d standing-watch event(s)' % (redone, requeued), file=sys.stderr)
+    return redone, requeued
+
+
+def _inbox_resume(phase, sid, enqueue, now_s=None):
+    """Finish one inbox record from the step it stopped at. True if it was
+    finished; a failure is logged and leaves it for the next pass, until it is
+    older than the age bound — then it is discarded, out loud, rather than
+    retried for ever."""
+    path = _inbox_path(phase, sid)
+    rec = SpoolQueue.load(path)
+    if rec is None or not isinstance(rec.get('env'), dict):
+        print('local-webhook: discarding unreadable inbox record %s' % sid, file=sys.stderr)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    now_s = time.time() if now_s is None else now_s
+    if now_s - rec['acceptedMs'] / 1000.0 > SPOOL_PEER_MAX_S:
+        print('local-webhook: discarding accepted event %s — its fan-out has failed since %s, past '
+              'LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d' % (sid, rec.get('acceptedAt', '?'), SPOOL_PEER_MAX_S),
+              file=sys.stderr)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    try:
+        spool_process(sid, rec['env'], rec['acceptedMs'], live=False, enqueue=enqueue,
+                      digest=rec.get('digest') or '', phase=phase)
+        return True
+    except Exception as e:  # noqa: BLE001 — one record must not stop the rest
+        print('local-webhook: could not finish the fan-out of %s (%s step): %s — retrying later'
+              % (sid, phase, e), file=sys.stderr)
+        return False
+
+
+def _drop_logged(q, rows, why, label):
+    n = sum(1 for r in rows if q.drop(r[0]))
+    if n:
+        print('local-webhook: discarded %d spooled event(s) for %s — %s' % (n, label, why), file=sys.stderr)
+    return n
+
+
+def spool_reap(now_s=None):
+    """One pass of expiry. Every discard is said out loud."""
+    now_s = time.time() if now_s is None else now_s
+    # Dedup memory.
+    try:
+        found = os.listdir(SPOOL_SEEN)
+    except OSError:
+        found = []
+    for n in found:
+        if not SPOOL_NAME.match(n):
+            continue
+        st = _spool_regular(spool_path(SPOOL_SEEN, n))
+        if st is not None and now_s - st.st_mtime > SPOOL_SEEN_S:
+            try:
+                os.unlink(spool_path(SPOOL_SEEN, n))
+            except OSError:
+                pass
+    # A fan-out that did not finish and is not running: finish it, from the
+    # step it reached.
+    for phase, sid, mtime in _inbox_records():
+        with SPOOL_INFLIGHT_LOCK:
+            if sid in SPOOL_INFLIGHT:
+                continue
+        if now_s - mtime < SPOOL_INBOX_RETRY_S:
+            continue
+        print('local-webhook: finishing the interrupted fan-out of %s (%s step)' % (sid, phase),
+              file=sys.stderr)
+        _inbox_resume(phase, sid, enqueue=True, now_s=now_s)
+    for q in (SPOOL_INBOX, SPOOL_DISPATCH):
+        q.reap_tmp(now_s)
+    if DISPATCHER is None:
+        # Records a receiver WITH a spawn command left behind, read by one
+        # without: nothing here will ever run them, so they age out on the
+        # same bound a declined batch would have.
+        stale = [r for r in SPOOL_DISPATCH.aged() if r[2] == 'new' and now_s - r[1] > SPAWN_DEFER_MAX_S]
+        _drop_logged(SPOOL_DISPATCH, stale, 'no LOCAL_WEBHOOK_SPAWN_CMD is configured to run them, '
+                     'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=%d' % SPAWN_DEFER_MAX_S, 'standing watches')
+    # Session inboxes.
+    try:
+        boxes = os.listdir(SPOOL_PEERS)
+    except OSError:
+        boxes = []
+    for box in sorted(boxes):
+        if not SPOOL_BOX.match(box):
+            continue
+        try:
+            _reap_box(box, now_s)
+        except Exception as e:  # noqa: BLE001 — one box must not stop the others
+            print('local-webhook: could not reap spool box %s: %s' % (box, e), file=sys.stderr)
+
+
+def _reap_box(box, now_s):
+    q = SpoolQueue(os.path.join(SPOOL_PEERS, box))
+    q.recover()
+    q.reap_tmp(now_s)
+    key = _box_key(box)
+    label = 'session %s' % (key if key else '(unscoped)' if key == '' else box)
+    rows = [r for r in q.aged() if r[2] == 'new']
+    state = read_filter(filter_path_of(key))['state'] if key is not None else 'absent'
+    if state == 'absent':
+        # agent-box's `session rm` deletes the filter file; with it goes the
+        # reason to keep mail — and a later session reusing the name must not
+        # inherit it (the #61 hazard, inbox edition).
+        _drop_logged(q, rows, 'it has no filter file any more (removed or never subscribed)', label)
+        if not q.leases():
+            for d in (q.new, q.cur, q.tmp):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+            try:
+                os.unlink(os.path.join(q.root, 'key'))
+            except OSError:
+                pass
+            try:
+                os.rmdir(q.root)
+            except OSError:
+                pass
         return
+    # A lease on mail this old outlived any delivery attempt by hours: its
+    # holder is gone even if its pid has since been reused by a live process.
+    stuck = [r for r in q.aged() if r[2] == 'cur' and now_s - r[1] > SPOOL_PEER_MAX_S]
+    _drop_logged(q, stuck, 'leased by pid(s) %s past LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d and never '
+                 'finished' % (','.join(sorted({str(r[3]) for r in stuck})), SPOOL_PEER_MAX_S), label)
+    old = [r for r in rows if now_s - r[1] > SPOOL_PEER_MAX_S]
+    _drop_logged(q, old, 'older than LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d and still undelivered'
+                 % SPOOL_PEER_MAX_S, label)
+    rows = [r for r in rows if r not in old]
+    over = len(rows) - SPOOL_PEER_MAX_N
+    if over > 0:
+        _drop_logged(q, rows[:over], 'the oldest past the LOCAL_WEBHOOK_SPOOL_PEER_MAX=%d cap; '
+                     'nothing is draining it' % SPOOL_PEER_MAX_N, label)
+
+def _spool_reaper_loop():
+    while True:
+        time.sleep(SPOOL_REAP_S)
+        try:
+            spool_reap()
+        except Exception as e:  # noqa: BLE001 — expiry must keep running
+            print('local-webhook: spool reaper failed: %s' % e, file=sys.stderr)
+
+
+def spool_start_owner():
+    """Run by whichever process owns the ingress, once it does."""
+    if not SPOOL_ENABLED:
+        return
+    try:
+        spool_recover()
+        spool_reap()
+    except Exception as e:  # noqa: BLE001 — a bad spool must not keep the ingress down
+        print('local-webhook: spool recovery failed: %s' % e, file=sys.stderr)
+    threading.Thread(target=_spool_reaper_loop, daemon=True).start()
+
+
+def spool_status(now_s=None):
+    """What is waiting right now — read off the directories, so any process
+    (the CLI's `status`) can answer without asking the daemon."""
+    now_s = time.time() if now_s is None else now_s
+    out = {'enabled': SPOOL_ENABLED, 'dir': SPOOL_DIR}
+    if not os.path.isdir(SPOOL_DIR):
+        out.update({'inbox': 0, 'dispatch': {'pending': 0, 'running': 0, 'items': []},
+                    'sessions': {}, 'seen': 0})
+        return out
+    out['inbox'] = len(_inbox_records())
+    items = []
+    for name, mtime, where, pid in SPOOL_DISPATCH.aged():
+        path = spool_path(SPOOL_DISPATCH.new, name) if where == 'new' else \
+            SPOOL_DISPATCH.lease_path(name, pid)
+        rec = SpoolQueue.load(path) or {}
+        meta = rec.get('meta') if isinstance(rec.get('meta'), dict) else {}
+        item = {'id': name, 'key': rec.get('routingKey', ''), 'event': meta.get('event', ''),
+                'topic': meta.get('topic', ''), 'acceptedAt': iso_at(mtime * 1000),
+                'ageS': max(0, int(now_s - mtime)),
+                'state': 'pending' if where == 'new' else
+                         'running' if pid_alive(pid) else 'orphaned',
+                'deferN': rec.get('deferN') or 0}
+        if rec.get('deferredMs'):
+            item['deferredSince'] = iso_at(rec['deferredMs'])
+        bucket = Dispatcher._bucket(rec.get('routingKey', ''), meta)
+        item['_bucket'] = bucket
+        items.append(item)
+    pos = {}
+    for item in items:
+        b = item.pop('_bucket')
+        if item['state'] == 'pending':
+            pos[b] = pos.get(b, 0) + 1
+            item['position'] = pos[b]
+    out['dispatch'] = {'pending': sum(1 for i in items if i['state'] == 'pending'),
+                       'running': sum(1 for i in items if i['state'] == 'running'),
+                       'oldestAgeS': items[0]['ageS'] if items else None,
+                       'items': items[:100]}
+    if len(items) > 100:
+        out['dispatch']['truncated'] = True
+    sessions = {}
+    try:
+        boxes = os.listdir(SPOOL_PEERS)
+    except OSError:
+        boxes = []
+    for box in sorted(boxes):
+        if not SPOOL_BOX.match(box):
+            continue
+        q = SpoolQueue(os.path.join(SPOOL_PEERS, box))
+        rows = q.aged()
+        key = _box_key(box)
+        sessions[box if key is None else key] = {
+            'pending': sum(1 for r in rows if r[2] == 'new'),
+            'leased': sum(1 for r in rows if r[2] == 'cur'),
+            'oldestAgeS': max(0, int(now_s - rows[0][1])) if rows else None,
+        }
+    out['sessions'] = sessions
+    try:
+        out['seen'] = len(os.listdir(SPOOL_SEEN))
+    except OSError:
+        out['seen'] = 0
+    return out
+
+
+def handle_event(env, at=None, sid=None):
+    """Route one envelope through THIS session's filter and deliver it.
+    'delivered', 'filtered' (the filter declined it) or 'failed' (the last
+    inch — codex queue — did not take it)."""
+    r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''), env.get('event', ''),
+                    env.get('payload'), at=at)
+    if not r['forward']:
+        return 'filtered'
     text, meta = format_delivery(env, r['entry'])
     if CODEX_PEER:
         # Same text, same meta, same UNTRUSTED framing — a codex session just
         # has to be handed it rather than notified.
-        codex_deliver(text, meta)
-        return
+        return 'delivered' if codex_deliver(text, meta, sid) else 'failed'
     out({
         'jsonrpc': '2.0',
         'method': 'notifications/claude/channel',
         'params': {'content': text, 'meta': meta},
     })
+    return 'delivered'
 
 
-def broadcast(env):
+def _peer_takes_spool(key, pid):
+    """Does this live peer claim its own spooled copy (0.33.0+)? It says so
+    with an instances/<key>.<pid>.inbox marker beside its socket. One that
+    does not is an older peer: it delivers whatever it is sent and never
+    unlinks anything, so for it the socket write IS the handoff."""
+    return os.path.exists(os.path.join(INSTANCE_DIR, '%s.%d.inbox' % (key, pid)))
+
+
+# spool = (sid, keys) when the event was spooled: the envelope then carries
+# `spool: {id, keys}` — an ADDITIVE field (older peers ignore it) telling a
+# peer whose key is listed to claim its own durable copy rather than act on
+# the envelope, so the copy is consumed exactly once whichever of the live
+# doorbell and the drain loop gets there first.
+def broadcast(env, spool=None):
+    if spool is not None:
+        sid, keys = spool
+        env = dict(env, spool={'id': sid, 'keys': keys})
+    else:
+        sid, keys = None, []
     line = (compact(env) + '\n').encode('utf-8')
     try:
         names = os.listdir(INSTANCE_DIR)
@@ -1782,17 +2798,44 @@ def broadcast(env):
         p = os.path.join(INSTANCE_DIR, f)
         if p == IPC_SOCK:
             continue
+        parsed = peer_scope(f)
         try:
             c = socket.socket(socket.AF_UNIX)
             c.settimeout(5)
             c.connect(p)
             c.sendall(line)
             c.close()
-        except OSError:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        except OSError as e:
+            for dead in (p, p[:-len('.sock')] + '.inbox'):
+                try:
+                    os.unlink(dead)
+                except OSError:
+                    pass
+            # Said out loud (#60): this used to be the silent end of the
+            # event for that session.
+            held = parsed is not None and parsed[0] in keys
+            print('local-webhook: session peer %s unreachable (%s) — removed its socket; %s'
+                  % (f, e, 'its copy stays spooled until it reconnects' if held else
+                     'nothing was queued for it' if sid else 'the event is lost for it (spool off)'),
+                  file=sys.stderr)
+            continue
+        if parsed is not None and parsed[0] in keys and not _peer_takes_spool(*parsed):
+            peer_queue(parsed[0]).drop(sid)
+
+
+def handle_ipc_envelope(env):
+    sp = env.pop('spool', None) if isinstance(env, dict) else None
+    # Claim mode only while this peer's marker exists: without it the
+    # receiver takes this peer for a pre-0.33.0 one and drops the copy after
+    # the socket write, so there would be nothing to claim — the envelope
+    # itself has to be the delivery. A failed claim needs no wake-up: the
+    # poll offers it again, paced, rather than in a tight retry loop.
+    if (SPOOL_ENABLED and isinstance(sp, dict) and isinstance(sp.get('id'), str)
+            and SPOOL_NAME.match(sp['id']) and isinstance(sp.get('keys'), list)
+            and FILTER_KEY in sp['keys'] and os.path.exists(IPC_INBOX_MARKER)):
+        inbox_take(sp['id'])
+        return
+    handle_event(env)
 
 
 def _ipc_conn(conn):
@@ -1812,7 +2855,7 @@ def _ipc_conn(conn):
                 if not line:
                     continue
                 try:
-                    handle_event(json.loads(line.decode('utf-8')))
+                    handle_ipc_envelope(json.loads(line.decode('utf-8')))
                 except Exception as e:  # noqa: BLE001 — a bad line must not kill the peer
                     print('local-webhook: bad ipc line: %s' % e, file=sys.stderr)
     except OSError:
@@ -1833,11 +2876,32 @@ def _ipc_serve(srv):
 # Only a session peer opens an inbound socket; the daemon merely broadcasts,
 # and a CLI invocation is not a peer at all (it would claim — then unlink — the
 # socket of whatever PID it happens to reuse).
+IPC_INBOX_MARKER = IPC_SOCK[:-len('.sock')] + '.inbox'
 if not RECEIVER_ONLY and not CLI:
     try:
         os.unlink(IPC_SOCK)  # PID reuse after a crash: reclaim our own path
     except OSError:
         pass
+    if SPOOL_ENABLED:
+        # The marker goes up BEFORE the socket can accept anything: between
+        # the two, the receiver would take this peer for a pre-0.33.0 one,
+        # count the socket write as the handoff and drop the spooled copy —
+        # while this peer, seeing its key in the envelope, would go to claim
+        # that copy and find nothing. A marker without a socket is harmless.
+        try:
+            open(IPC_INBOX_MARKER, 'w').close()
+        except OSError as e:
+            # Not fatal: without the marker this peer is treated exactly like
+            # a pre-0.33.0 one (handoff on the socket write), which still works.
+            print('local-webhook: cannot create inbox marker %s (%s) — this session gets live '
+                  'deliveries only' % (IPC_INBOX_MARKER, e), file=sys.stderr)
+        # Leases under OUR pid can only be a dead predecessor's (pid reuse
+        # after a reboot or in a container): nothing in this process has
+        # claimed anything yet. Later passes cannot tell them from our own.
+        try:
+            MY_INBOX.recover(alive=lambda pid: pid != os.getpid() and pid_alive(pid))
+        except OSError:
+            pass
     try:
         _ipc_srv = socket.socket(socket.AF_UNIX)
         _ipc_srv.bind(IPC_SOCK)
@@ -1845,11 +2909,19 @@ if not RECEIVER_ONLY and not CLI:
         threading.Thread(target=_ipc_serve, args=(_ipc_srv,), daemon=True).start()
 
         def _cleanup():
-            try:
-                os.unlink(IPC_SOCK)
-            except OSError:
-                pass
+            for _p in (IPC_SOCK, IPC_INBOX_MARKER):
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
         atexit.register(_cleanup)
+        if SPOOL_ENABLED:
+            # Socket before drain: an event spooled before the socket existed
+            # is found by the drain, one spooled after it gets a doorbell.
+            threading.Thread(target=_inbox_loop, daemon=True).start()
+            _grace = threading.Timer(SPOOL_READY_GRACE_S, INBOX_READY.set)
+            _grace.daemon = True
+            _grace.start()
     except OSError as e:
         print('local-webhook: ipc listener failed (%s)' % e, file=sys.stderr)
 
@@ -1897,9 +2969,10 @@ if not RECEIVER_ONLY and not CLI:
 #     waiting batches get re-checked whenever a spawn finishes.
 # A spawn that fails (an unexpected non-zero exit, unlaunchable, >
 # SPAWN_TIMEOUT_S) is logged to stderr and its batch is DROPPED — retrying a
-# broken spawner would loop; the same events already reached session peers via
-# the normal fan-out. The one exit code that does NOT mean failure is
-# SPAWN_DEFER_EXIT, below.
+# broken spawner would loop. (This used to add "the same events already reached
+# session peers", which is not true of a standing watch's events — #60 — and
+# is why the drop is logged with the command's own output.) The one exit code
+# that does NOT mean failure is SPAWN_DEFER_EXIT, below.
 SPAWN_CMD = (os.environ.get('LOCAL_WEBHOOK_SPAWN_CMD') or '').strip()
 SPAWN_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_MAX', default=2))
 SPAWN_WINDOW_S = max(0, _int_env('LOCAL_WEBHOOK_SPAWN_WINDOW', default=60))
@@ -1933,11 +3006,31 @@ SPAWN_PENDING_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_PENDING_MAX', default=2
 
 
 class Dispatcher:
-    # State is in-memory only: an ingress-owner restart forgets pending
-    # batches. Acceptable — the same deliveries reached session peers, and a
-    # standing watch cares about the next event, not a replay of the last one.
+    # Until 0.33.0 this state was in-memory only, on the reasoning that "the
+    # same deliveries reached session peers". They did not: a standing watch
+    # exists for events NO session owns, so a dispatch batch is by
+    # construction events no peer received (#60), and a restart forgot every
+    # one of them — including batches the spawn command had declined (exit
+    # 75) precisely so they would be kept.
+    #
+    # Now every queued line can carry its spool id (`sid`): the record in
+    # spool/dispatch/ is written BEFORE add() is called, leased when its batch
+    # starts, released (rewritten with the deferral streak) on exit 75, and
+    # unlinked on every other end — accepted, broken spawner, dropped as owned,
+    # past the age bound, trimmed by the cap — each of which is already said
+    # out loud. recover() rebuilds the queue from those records after a
+    # restart.
+    #
+    # What is persisted is the LINES; the per-key machinery (coalescing
+    # bucket, rate window, timers, the running flag) is rebuilt in memory and
+    # keeps the monotonic clock, so a clock step still cannot wedge a key. The
+    # one piece of timing that must outlive the process — when the current
+    # deferral streak began — is stored as wall-clock ms (deferredMs) and
+    # mapped back onto the monotonic clock on recovery, clamped so a backwards
+    # step reads as "just started" rather than "never ends".
     def __init__(self, cmd, max_concurrent, window_s, timeout_s, clock=time.monotonic,
-                 owner_of=None, defer_max_s=SPAWN_DEFER_MAX_S, pending_max=SPAWN_PENDING_MAX):
+                 owner_of=None, defer_max_s=SPAWN_DEFER_MAX_S, pending_max=SPAWN_PENDING_MAX,
+                 spool=None):
         self.cmd = cmd
         self.max = max_concurrent
         self.window = window_s
@@ -1950,9 +3043,13 @@ class Dispatcher:
         self.owner_of = owner_of
         self.lock = threading.Lock()
         self.active = 0
-        # key -> {pending: [(text, meta, env)], running: bool,
+        # The durable side (a SpoolQueue), or None for a purely in-memory
+        # dispatcher (LOCAL_WEBHOOK_SPOOL=off, and unit tests).
+        self.spool = spool
+        # key -> {pending: [(text, meta, env, sid)], running: bool,
         #         last_start: float|None, timer: Timer|None,
-        #         defer_since: float|None, defer_n: int}
+        #         defer_since: float|None, defer_wall: ms|None, defer_n: int,
+        #         recheck: bool}
         self.keys = {}
 
     # What COALESCES together. Not the routing key alone: a coalesced batch
@@ -1994,17 +3091,83 @@ class Dispatcher:
     # env is the routing envelope the line came from, kept per line so a
     # coalesced batch can be re-examined line by line before it spawns;
     # callers with nothing to re-check (tests, non-github paths) may omit it.
-    def add(self, key, text, meta, env=None):
+    # sid names the line's durable record in self.spool, when it has one.
+    def add(self, key, text, meta, env=None, sid=None):
         with self.lock:
             key = self._bucket(key, meta)
-            st = self.keys.setdefault(key, {'pending': [], 'running': False,
-                                            'last_start': None, 'timer': None,
-                                            'defer_since': None, 'defer_n': 0})
-            st['pending'].append((text, meta, env))
+            st = self._state(key)
+            st['pending'].append((text, meta, env, sid))
             win = (meta or {}).get('spawnWindowS')
             st['window'] = self.window if win is None else win
             self._trim(key, st)
             self._pump(key)
+
+    def _state(self, key):
+        return self.keys.setdefault(key, {'pending': [], 'running': False,
+                                          'last_start': None, 'timer': None,
+                                          'defer_since': None, 'defer_wall': None,
+                                          'defer_n': 0, 'recheck': False})
+
+    # Rebuild the queue from spool/dispatch after a restart. Records come back
+    # in accept order, into the bucket their own meta derives (never one
+    # written on disk), and the first batch of every recovered key goes
+    # through _still_unowned like any follow-up: minutes or hours may have
+    # passed, and the session that now owns the event is exactly what that
+    # re-check is for. A batch younger than its bounds still spawns — a red
+    # trunk that went unhandled across a reboot is the case worth replaying
+    # (agent-box#510/#511) — and one already past SPAWN_DEFER_MAX_S gets the
+    # one more attempt every declined batch gets before the bound drops it.
+    def recover(self):
+        if self.spool is None:
+            return 0
+        # Only the ingress owner ever leases a dispatch record, and there is
+        # one of it: whatever lease is on disk when it starts belonged to a
+        # predecessor — even under a pid that happens to be alive again.
+        self.spool.recover(alive=lambda pid: False)
+        recs = []
+        for sid in self.spool.names():
+            rec = SpoolQueue.load(spool_path(self.spool.new, sid))
+            if (rec is None or rec.get('kind') != 'dispatch' or not isinstance(rec.get('text'), str)
+                    or not isinstance(rec.get('meta'), dict)):
+                print('local-webhook: discarding unreadable dispatch record %s' % sid, file=sys.stderr)
+                self.spool.drop(sid)
+                continue
+            recs.append(rec)
+        wall = now_ms()
+        with self.lock:
+            touched = []
+            for rec in recs:
+                meta = rec['meta']
+                key = self._bucket(rec.get('routingKey') or '(none)', meta)
+                st = self._state(key)
+                st['pending'].append((rec['text'], meta, rec.get('env') if isinstance(rec.get('env'), dict)
+                                      else None, rec['id']))
+                win = meta.get('spawnWindowS')
+                st['window'] = self.window if win is None else win
+                st['recheck'] = True
+                dms = rec.get('deferredMs')
+                if isinstance(dms, (int, float)) and not isinstance(dms, bool):
+                    since = self.clock() - max(0.0, wall - dms) / 1000.0
+                    if st['defer_since'] is None or since < st['defer_since']:
+                        st['defer_since'] = since
+                        st['defer_wall'] = min(dms, wall)
+                    st['defer_n'] = max(st['defer_n'], int(rec.get('deferN') or 0))
+                if key not in touched:
+                    touched.append(key)
+            for key in touched:
+                self._trim(key, self.keys[key])
+            for key in touched:
+                self._pump(key)
+        return len(recs)
+
+    # Call with self.lock held. The durable record of a line is finished
+    # with: whatever ended it has already been logged by the caller.
+    def _forget(self, items):
+        if self.spool is None:
+            return
+        for item in items:
+            if item[3]:
+                self.spool.drop(item[3])
 
     # Call with self.lock held. Starts a spawn for the key when allowed;
     # otherwise arms a timer for the moment the rate window opens. Being at
@@ -2031,21 +3194,32 @@ class Dispatcher:
             st['timer'].cancel()
             st['timer'] = None
         batch, st['pending'] = st['pending'], []
-        if st['last_start'] is not None:
+        recheck, st['recheck'] = st.get('recheck'), False
+        if st['last_start'] is not None or recheck:
             # A follow-up batch only: the first event on an idle key was
             # checked microseconds ago in dispatch_event and must never be
-            # gated a second time, or an unowned key could never start.
+            # gated a second time, or an unowned key could never start. A
+            # batch recovered from the spool is a follow-up of a sort (its
+            # arrival-time answer is stale), so it is re-checked too.
             batch = self._still_unowned(key, batch)
             if not batch:
                 # Nothing survived, so whatever deferral streak this batch was
                 # keeping alive is over with it: the next event on this key
                 # starts a fresh one.
                 st['defer_since'] = None
+                st['defer_wall'] = None
                 st['defer_n'] = 0
                 return
         st['running'] = True
         st['last_start'] = self.clock()
         self.active += 1
+        if self.spool is not None:
+            # Lease the records for the length of the spawn: a crash now
+            # leaves them in cur/ under a dead pid, which recovery reads as
+            # "not known to have been accepted" and offers again.
+            for item in batch:
+                if item[3]:
+                    self.spool.claim(item[3])
         # The newest SURVIVING event's context labels the batch — labelling it
         # with a line that was just dropped would name a run nobody is here for.
         meta = dict(batch[-1][1] or {})
@@ -2063,7 +3237,7 @@ class Dispatcher:
         probe = self.owner_of or owner_now
         kept = []
         for item in batch:
-            text, meta, env = item
+            text, meta, env = item[:3]
             if (meta or {}).get('ownership') == 'none':
                 # #69: this item's watch opted out of the brake entirely — the
                 # entry it matched is long gone, so meta is the only thing
@@ -2083,6 +3257,7 @@ class Dispatcher:
                       % ((env or {}).get('event', '') or '(none)',
                          self._label(key) or '(none)', owner),
                       file=sys.stderr)
+                self._forget([item])
                 continue
             kept.append(item)
         return kept
@@ -2105,12 +3280,31 @@ class Dispatcher:
                   % (len(items), self._label(key) or '(none)', st['defer_n'] + 1, round(waited),
                      self.defer_max), file=sys.stderr)
             st['defer_since'] = None
+            st['defer_wall'] = None
             st['defer_n'] = 0
+            self._forget(items)
             return
         if st['defer_since'] is None:
             st['defer_since'] = now
+            st['defer_wall'] = now_ms()
         st['defer_n'] += 1
         st['pending'][:0] = items
+        if self.spool is not None:
+            # Back to new/, carrying the streak, so a restart resumes the age
+            # bound instead of starting it over.
+            for item in items:
+                if not item[3]:
+                    continue
+                rec = SpoolQueue.load(self.spool.lease_path(item[3]))
+                if rec is None:
+                    continue
+                rec['deferredMs'] = int(st['defer_wall'])
+                rec['deferN'] = st['defer_n']
+                try:
+                    self.spool.release(item[3], data=compact(rec).encode('utf-8'))
+                except OSError as e:
+                    print('local-webhook: could not re-spool declined event %s (%s); it is kept '
+                          'in memory only' % (item[3], e), file=sys.stderr)
         self._trim(key, st)
 
     # Call with self.lock held. A consumer that keeps declining — or one key
@@ -2121,6 +3315,7 @@ class Dispatcher:
         over = len(st['pending']) - self.pending_max
         if over <= 0:
             return
+        self._forget(st['pending'][:over])
         del st['pending'][:over]
         print('local-webhook: pending batch for %s hit the %d-line cap — dropped %d '
               'oldest event(s); the spawn command is not keeping up'
@@ -2134,7 +3329,7 @@ class Dispatcher:
                 self._pump(key)
 
     def _run(self, key, items, meta):
-        batch = [t for t, _, _ in items]
+        batch = [item[0] for item in items]
         label = self._label(key) or '(none)'
         defer = False
         try:
@@ -2189,12 +3384,17 @@ class Dispatcher:
                         # Accepted, or dropped as broken — either way this key
                         # is no longer waiting on anything.
                         st['defer_since'] = None
+                        st['defer_wall'] = None
                         st['defer_n'] = 0
+                        self._forget(items)
+                elif not defer:
+                    self._forget(items)
                 for k in list(self.keys):  # a freed slot may unblock any key
                     self._pump(k)
 
 
-DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S) if SPAWN_CMD else None
+DISPATCHER = Dispatcher(SPAWN_CMD, SPAWN_MAX, SPAWN_WINDOW_S, SPAWN_TIMEOUT_S,
+                        spool=SPOOL_DISPATCH if SPOOL_ENABLED else None) if SPAWN_CMD else None
 
 
 # A standing watch is for events NOBODY owns. A live session peer whose own
@@ -2245,7 +3445,13 @@ def owner_now(env):
     return owned_by_live_session(env)
 
 
-def dispatch_event(env):
+# sid/at (#60): the event's spool id and accept time. With a sid, the line is
+# written to spool/dispatch BEFORE the dispatcher sees it; a sid already
+# queued there (a recovery re-running a fan-out the crash interrupted) is not
+# queued twice. enqueue=False persists without handing it to the dispatcher —
+# startup recovery does that, because Dispatcher.recover() loads the whole
+# queue from disk right afterwards.
+def dispatch_event(env, sid=None, at=None, enqueue=True):
     # Ingress owner only: called from deliver(), never on the peer IPC path,
     # so one delivery can only ever dispatch once however many peers exist.
     if DISPATCHER is None:
@@ -2260,7 +3466,7 @@ def dispatch_event(env):
     # so in practice this catches a hand-edited file or one written before
     # 0.23.0.
     r = route_event(env.get('source', ''), env.get('key', ''), env.get('sender', ''),
-                    event, env.get('payload'), path=DISPATCH_FILE, require_rules=True)
+                    event, env.get('payload'), path=DISPATCH_FILE, require_rules=True, at=at)
     if not r['forward']:
         if r['ruleless']:
             print('local-webhook: not spawning for %s on %s — the watch on this topic declares no '
@@ -2300,7 +3506,7 @@ def dispatch_event(env):
                   file=sys.stderr)
             return
     text, payload_meta = format_delivery(env, entry)
-    DISPATCHER.add(env.get('key', '') or '(none)', text, {
+    meta = {
         'source': env.get('source', ''),
         'key': env.get('key', ''),
         'event': env.get('event', ''),
@@ -2320,7 +3526,19 @@ def dispatch_event(env):
         # gets. Kept nested so it can ride to LOCAL_WEBHOOK_SPAWN_META as one
         # JSON blob without colliding with the six fixed keys above.
         'payload': payload_meta,
-    }, env)
+    }
+    routing_key = env.get('key', '') or '(none)'
+    if sid is not None and DISPATCHER.spool is not None:
+        at = int(now_ms() if at is None else at)
+        rec = {'v': 1, 'kind': 'dispatch', 'id': sid, 'acceptedMs': at, 'acceptedAt': iso_at(at),
+               'routingKey': routing_key, 'text': text, 'meta': meta, 'env': env,
+               'deferN': 0, 'deferredMs': None}
+        if not DISPATCHER.spool.publish(sid, compact(rec).encode('utf-8'), mtime_ms=at):
+            return   # already queued: this is a recovery re-running a finished step
+    else:
+        sid = None
+    if enqueue:
+        DISPATCHER.add(routing_key, text, meta, env, sid=sid)
 
 
 # Written by the receiver daemon at startup so sessions can tell whether
@@ -2570,6 +3788,10 @@ INSTRUCTIONS = (
     'Pass ownership:"none" on a standing watch that only reads and comments — never pushes, merges, or '
     'touches a worktree — to opt it OUT of the live-peer brake above: such a watch never collides with a '
     'worker session, so a peer\'s own claim is not a reason to suppress its spawn. '
+    'An event accepted while this session was not listening (a respawn, a restart, a stopped session) is '
+    'kept on disk and delivered when it is back, if the subscription was live when the event arrived — so '
+    'a burst of older deliveries right after a restart is a backlog, not new activity; meta.delivery '
+    'identifies each one. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -3301,7 +4523,12 @@ def stdin_loop():
 
 def handle_rpc(msg):
     if not isinstance(msg, dict) or msg.get('id') is None:
-        return  # notification — nothing to do
+        # The one notification that matters: the client has finished MCP
+        # initialization, so a backlog drained from the spool now has
+        # somewhere to land.
+        if isinstance(msg, dict) and msg.get('method') == 'notifications/initialized':
+            INBOX_READY.set()
+        return
 
     def reply(result):
         out({'jsonrpc': '2.0', 'id': msg['id'], 'result': result})
@@ -3381,10 +4608,41 @@ def deliver(handler, body):
     # applies its own filter, so the HTTP status no longer reflects filtering.
     env = {'source': name, 'format': fmt, 'event': event, 'key': key,
            'sender': sender, 'delivery': delivery, 'payload': payload}
-    if not RECEIVER_ONLY:
-        handle_event(env)  # legacy: the ingress-owning session gets it too
-    broadcast(env)
-    dispatch_event(env)  # standing watches: spawn fresh sessions (issue #1)
+    if not SPOOL_ENABLED:
+        if not RECEIVER_ONLY:
+            handle_event(env)  # legacy: the ingress-owning session gets it too
+        broadcast(env)
+        dispatch_event(env)  # standing watches: spawn fresh sessions (issue #1)
+        return done(200, 'ok')
+    # #60: durable first, acknowledged after. Only a written inbox record
+    # makes the event "accepted"; failing that, a 500 makes the SENDER record
+    # a failed delivery, which `backfill` can ask for again — where a 200
+    # would have promised a delivery nothing on this box still held.
+    digest = hashlib.sha256(body).hexdigest()
+    try:
+        accepted = spool_accept(env, digest)
+    except OSError as e:
+        print('local-webhook: could not spool %s delivery %s (%s) — answering 500 so the sender '
+              'records it as failed (backfill can re-request it)'
+              % (name, delivery or '(no id)', e), file=sys.stderr)
+        return done(500, 'spool unavailable')
+    if accepted is None:
+        # Same delivery id as one already accepted: a backfill redelivery, a
+        # retrying sender. 200, because it IS accepted — once.
+        print('local-webhook: duplicate %s delivery %s — already accepted, not fanned out again'
+              % (name, delivery), file=sys.stderr)
+        return done(200, 'ok (duplicate)')
+    sid, at = accepted
+    with SPOOL_INFLIGHT_LOCK:
+        SPOOL_INFLIGHT.add(sid)
+    try:
+        spool_process(sid, env, at, live=True, enqueue=True, digest=digest)
+    except Exception as e:  # noqa: BLE001 — accepted is accepted; the reaper finishes it
+        print('local-webhook: fan-out of %s stopped part-way (%s); it is spooled and the receiver '
+              'will finish it' % (sid, e), file=sys.stderr)
+    finally:
+        with SPOOL_INFLIGHT_LOCK:
+            SPOOL_INFLIGHT.discard(sid)
     return done(200, 'ok')
 
 
@@ -3647,7 +4905,14 @@ daemon's receiver.json advertisement, or loopback LOCAL_WEBHOOK_PORT.
                        "event"/"type" field applies, per normal normalization
 
 Subscriptions are per session (LOCAL_WEBHOOK_SESSION) and hot-reloaded, so this
-takes effect on the next delivery with no session restart.''' % (VERSION, DEFAULT_TTL_HOURS)
+takes effect on the next delivery with no session restart.
+
+status also reports the durable inbox (spool, 0.33.0): every accepted event is
+written to disk before it is delivered, so a session that was down receives
+what it missed when it comes back, and a standing-watch batch survives a
+receiver restart. Its "spool" object lists each session's undelivered count and
+oldest age, and the standing-watch queue item by item (state, position,
+deferrals).''' % (VERSION, DEFAULT_TTL_HOURS)
 
 
 # `emit` is the local producer path onto the bus: box-local signals (a token
@@ -3811,6 +5076,11 @@ def run_cli(argv):
             'topicCount': len(f['topics']),
             'dispatchTopicCount': len(read_filter(DISPATCH_FILE)['topics']),
             'receiver': receiver_info(),
+            # #60: what is waiting right now, read off the spool directories —
+            # this session's inbox, every other session's, and the
+            # standing-watch queue with each item's position and deferral.
+            # Top level, not under "dispatch", which agent-box replaces.
+            'spool': spool_status(),
             'defaultSource': cfg['defaultSource'],
             'sources': {n: {'hasSecret': bool(source_secret(src))}
                         for n, src in cfg['sources'].items() if isinstance(src, dict)},
@@ -4011,10 +5281,12 @@ def main():
                                  'spawn': bool(SPAWN_CMD), 'startedAt': iso_at(now_ms())}) + '\n')
         except OSError:
             pass
+        spool_start_owner()
         httpd.serve_forever()
     else:
         httpd = listen_ingress()
         if httpd is not None:
+            spool_start_owner()
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
         stdin_loop()
 
