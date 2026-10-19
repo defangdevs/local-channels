@@ -5,12 +5,36 @@ Single file (`slack.py`), stdlib only, python ≥ 3.9. Design: the spec in that 
 
 **0.1.0 is the core.** It covers event shaping, the settle timer, the send
 guardrails, a Socket Mode client and a small CLI, in *plain mode* (tokens in the
-agent user's env). Not yet built: socket-service mode (own Linux user, Unix
-socket, `SO_PEERCRED` grants), MCP tools, the classifier command runner, `dm`
-and `upload`, the HTTP Events API transport, the settings card and the agent-box
-supervisor unit. Until socket-service mode exists, an agent that can read the
-bot token can bypass the guardrails — use it only where the agent user is the
-only author of its input.
+agent user's env) or *socket-service mode* (below). Not yet built: grants, MCP
+tools, the classifier command runner, `dm` and `upload`, the HTTP Events API
+transport, the settings card and the agent-box supervisor unit. In plain mode an
+agent that can read the bot token can bypass the guardrails — use it only where
+the agent user is the only author of its input, or use socket-service mode.
+
+## Socket-service mode
+
+The daemon alone holds the tokens and serves `reply`, `post`, `status`, `react`
+and `thread` on a Unix socket, through the same `Writer` checks and audit as the
+CLI. Mechanism only: which user runs the daemon, where the socket lives and who
+may reach it are the deployment's choice.
+
+- Daemon: `LOCAL_SLACK_SOCKET=/path/slack.sock` and
+  `LOCAL_SLACK_ALLOWED_UIDS=1000,alice` (numbers or user names; empty refuses to
+  start). The kernel's `SO_PEERCRED` uid of each caller is checked against that
+  list; others get an error before anything runs. `LOCAL_SLACK_SOCKET_MODE`
+  (octal, default `660`) sets the socket's permissions; the parent directory is
+  yours to create.
+- Tokens: `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` from the environment, else a file
+  of that name (lower- or upper-case) in `$CREDENTIALS_DIRECTORY` (systemd
+  `LoadCredential=`) or `LOCAL_SLACK_CREDENTIALS_DIR`. The daemon then needs no
+  token in its environment.
+- CLI: with `LOCAL_SLACK_SOCKET` set, `slack.py reply|post|status|react|thread`
+  talk to the socket, read no token and never call Slack. `doctor` warns when a
+  token is in the caller's environment or a credential file is readable by it.
+- Audit: the `session` column is `uid<N>/<session name>`: the uid is verified,
+  the name (from `AGENT_BOX_SESSION_ID`) is the caller's own claim. The
+  per-session write cap counts per that pair.
+- `thread` through the socket only reads configured channels.
 
 ## Setup
 
@@ -137,7 +161,7 @@ cap off).
 Not done yet, deliberately: emitting the bot's own messages and reactions with
 `self: true` so a consumer can seed an exclude (the way local-webhook seeds its
 GitHub echo exclude). The settle timer already ignores them. When grants land
-(socket-service mode) they take the scope as given, with no built-in rule that a
+(a later step of socket-service mode) they take the scope as given, with no built-in rule that a
 watch-started session is limited to its thread: deciding that is agent-box's
 spawn path.
 

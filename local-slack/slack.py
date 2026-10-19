@@ -16,8 +16,9 @@
 #   7. daemon    — wires 4 + 5 + 6 together and emits onto the bus
 #   8. cli       — doctor / channels / thread / reply / post / status / react
 #
-# Scope of this first cut: PLAIN mode only (tokens in the agent user's env).
-# Socket-service mode (own Linux user, Unix socket, SO_PEERCRED grants), the
+# Two modes: PLAIN (tokens in the agent user's env) and socket-service (the
+# daemon alone holds the tokens and serves writes on a Unix socket, callers
+# checked by SO_PEERCRED). Grants, the
 # HTTP Events API transport, files, the settings card and classifier
 # isolation hardening are follow-ups; the spec's guardrails that do not depend
 # on grants are all enforced here, in the code path every write passes.
@@ -279,6 +280,30 @@ def state_dir():
         os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state'), 'local-slack')
     os.makedirs(d, mode=0o700, exist_ok=True)
     return d
+
+
+def credential(name):
+    """A token from the environment, else from a credentials file: systemd's
+    $CREDENTIALS_DIRECTORY (LoadCredential=) or LOCAL_SLACK_CREDENTIALS_DIR. The
+    file is named for the variable, lower- or upper-case. Socket-service mode
+    needs only the file, so the daemon's environment holds no token."""
+    v = os.environ.get(name)
+    if v:
+        return v
+    for f in credential_files(name):
+        try:
+            with open(f) as fh:
+                v = fh.read().strip()
+        except OSError:
+            continue
+        if v:
+            return v
+    return None
+
+
+def credential_files(name):
+    d = os.environ.get('LOCAL_SLACK_CREDENTIALS_DIR') or os.environ.get('CREDENTIALS_DIRECTORY')
+    return [os.path.join(d, n) for n in (name.lower(), name)] if d else []
 
 
 def config_path():
@@ -1172,14 +1197,19 @@ def write_connection_status(state, **info):
 
 
 def run_daemon():
-    bot_token, app_token = os.environ.get('SLACK_BOT_TOKEN'), os.environ.get('SLACK_APP_TOKEN')
+    bot_token, app_token = credential('SLACK_BOT_TOKEN'), credential('SLACK_APP_TOKEN')
     if not bot_token or not app_token:
-        sys.exit('local-slack: SLACK_BOT_TOKEN and SLACK_APP_TOKEN must both be set')
+        sys.exit('local-slack: SLACK_BOT_TOKEN and SLACK_APP_TOKEN must both be set '
+                 '(environment or a credentials file)')
+    sock_path = os.environ.get('LOCAL_SLACK_SOCKET')
+    allowed = parse_uids(os.environ.get('LOCAL_SLACK_ALLOWED_UIDS', '')) if sock_path else None
+    if sock_path and not allowed:
+        sys.exit('local-slack: LOCAL_SLACK_SOCKET is set but LOCAL_SLACK_ALLOWED_UIDS names no user')
     web = Web(bot_token, app_token)
     me = web.call('auth.test')
     # auth.test's `url` is this workspace's own host, which permalinks should use.
     wurl = me.get('url') or ''
-    bot = {'user_id': me['user_id'], 'bot_id': me.get('bot_id'),
+    bot = {'user_id': me['user_id'], 'bot_id': me.get('bot_id'), 'team': me.get('team_id') or '',
            'url': wurl if wurl.endswith('/') else wurl + '/' if wurl else ''}
     store = Store(os.path.join(state_dir(), 'slack.db'))
     channels, defaults = load_config()
@@ -1250,6 +1280,10 @@ def run_daemon():
                 print('local-slack: tick failed: %s' % e, file=sys.stderr)
     threading.Thread(target=ticker, daemon=True).start()
 
+    if sock_path:
+        ctx = Ctx(web, store, lambda: tracker.channels, lambda: tracker.defaults, bot)
+        serve_socket(sock_path, allowed, ctx)
+
     backoff = 1
     while True:
         ws, t0 = None, time.time()
@@ -1313,8 +1347,10 @@ USAGE = '''local-slack %s
   slack.py react CHANNEL TS EMOJI
   slack.py purge
 
-Tokens come from SLACK_BOT_TOKEN / SLACK_APP_TOKEN. Writes go through the
-guardrails in compose() and the per-channel write settings.''' % VERSION
+Tokens come from SLACK_BOT_TOKEN / SLACK_APP_TOKEN, or a credentials file
+($CREDENTIALS_DIRECTORY). With LOCAL_SLACK_SOCKET set, the commands go through
+the daemon's Unix socket instead and this process holds no token. Writes go
+through the guardrails in compose() and the per-channel write settings.''' % VERSION
 
 
 _TS_RE = re.compile(r'\d{9,}\.\d{1,9}')
@@ -1514,6 +1550,198 @@ class Writer:
         self.audit('react', channel, ts, ts, ':%s:' % emoji)
 
 
+# --------------------------------------------------------------------------
+# 7b. socket-service mode: the daemon alone holds the tokens
+# --------------------------------------------------------------------------
+#
+# MECHANISM, NOT POLICY: the daemon listens on LOCAL_SLACK_SOCKET and serves the
+# write commands through the same Writer as the CLI. WHO may connect is a uid
+# allowlist (LOCAL_SLACK_ALLOWED_UIDS, numbers or user names) checked against
+# SO_PEERCRED, which the kernel fills in and the client cannot forge. Which
+# user runs the daemon, where the socket lives and who gets its group are the
+# deployment's choice. The session name in a request is the caller's own claim:
+# it is audited, and rate-limited, next to the verified uid.
+
+MAX_REQUEST = 64 * 1024
+SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread')
+
+
+def parse_uids(spec):
+    import pwd
+    uids = set()
+    for item in re.split(r'[,\s]+', spec or ''):
+        if not item:
+            continue
+        try:
+            uids.add(int(item))
+        except ValueError:
+            try:
+                uids.add(pwd.getpwnam(item).pw_uid)
+            except KeyError:
+                print('local-slack: unknown user %r in LOCAL_SLACK_ALLOWED_UIDS' % item, file=sys.stderr)
+    return uids
+
+
+class Ctx:
+    """What a request handler needs; channels and defaults are callables because
+    the ticker hot-reloads them."""
+
+    def __init__(self, web, store, channels, defaults, bot):
+        self.web, self.store, self.channels, self.defaults, self.bot = web, store, channels, defaults, bot
+
+
+def execute(w, cmd, rest):
+    """One write or read command against a Writer; shared by the CLI (plain
+    mode) and the socket, so a guardrail cannot differ between them."""
+    if cmd == 'reply' and len(rest) == 3:
+        r = w.reply(*rest)
+    elif cmd == 'post' and len(rest) == 2:
+        r = w.post(*rest)
+    elif cmd == 'status' and len(rest) >= 3:
+        args = rest[3:]
+        r = w.status(rest[0], rest[1], rest[2], 'done' if '--done' in args else 'failed' if '--failed' in args else None)
+    elif cmd == 'react' and len(rest) == 3:
+        w.react(*rest)
+        r = {}
+    else:
+        raise Refused('usage: %s' % cmd)
+    out = {'ts': r.get('ts')}
+    if r.get('unresolved'):
+        out['unresolved'] = r['unresolved']
+    return out
+
+
+def read_thread(web, channel, ts):
+    r = web.call('conversations.replies', {'channel': channel, 'ts': ts, 'limit': 200})
+    return [{'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')} for m in r.get('messages', [])]
+
+
+def handle_request(ctx, uid, req):
+    """A decoded request from a peer whose uid was already checked. Returns the
+    response dict; Refused and SlackError become ok=false, never a crash."""
+    try:
+        cmd, args = req.get('cmd'), req.get('args')
+        if cmd not in SOCKET_COMMANDS:
+            raise Refused('unknown command %r' % (cmd,))
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise Refused('args must be a list of strings')
+        name = req.get('session')
+        session = 'uid%d/%s' % (uid, name[:64] if isinstance(name, str) else '')
+        channels = ctx.channels()
+        if cmd == 'thread':
+            if len(args) != 2:
+                raise Refused('usage: thread CHANNEL TS')
+            if args[0] not in channels:
+                raise Refused('channel %s is not configured' % args[0])
+            return {'ok': True, 'messages': read_thread(ctx.web, *args)}
+        w = Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot, session=session)
+        w.team = ctx.bot.get('team') or ''
+        return dict(execute(w, cmd, args), ok=True)
+    except (Refused, SlackError) as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def peer_uid(conn):
+    pid, uid, gid = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                       struct.calcsize('3i')))
+    return uid
+
+
+def _read_line(conn):
+    buf = b''
+    while b'\n' not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > MAX_REQUEST:
+            raise Refused('request too large')
+    return buf.split(b'\n', 1)[0]
+
+
+def serve_connection(conn, allowed, ctx):
+    with conn:
+        conn.settimeout(10)
+        try:
+            uid = peer_uid(conn)
+            if uid not in allowed:
+                print('local-slack: refused a connection from uid %d (not in the allowlist)' % uid,
+                      file=sys.stderr)
+                resp = {'ok': False, 'error': 'uid %d is not allowed' % uid}
+            else:
+                try:
+                    req = json.loads(_read_line(conn).decode())
+                    if not isinstance(req, dict):
+                        raise ValueError
+                except (ValueError, UnicodeDecodeError):
+                    resp = {'ok': False, 'error': 'bad request'}
+                else:
+                    resp = handle_request(ctx, uid, req)
+            conn.sendall(json.dumps(resp).encode() + b'\n')
+        except Refused as e:
+            conn.sendall(json.dumps({'ok': False, 'error': str(e)}).encode() + b'\n')
+        except Exception as e:   # one bad peer must not stop the listener
+            print('local-slack: socket request failed: %s' % e, file=sys.stderr)
+
+
+def bind_socket(path):
+    """Bind PATH, replacing a stale socket but never another kind of file."""
+    import stat
+    try:
+        if stat.S_ISSOCK(os.lstat(path).st_mode):
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o777)   # no window where the socket is more open than asked
+    try:
+        srv.bind(path)
+    finally:
+        os.umask(old)
+    os.chmod(path, int(os.environ.get('LOCAL_SLACK_SOCKET_MODE') or '660', 8))
+    srv.listen(16)
+    return srv
+
+
+def serve_socket(path, allowed, ctx):
+    srv = bind_socket(path)
+    print('local-slack: serving writes on %s for uid(s) %s' % (path, ','.join(map(str, sorted(allowed)))),
+          file=sys.stderr, flush=True)
+
+    def loop():
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=serve_connection, args=(conn, allowed, ctx), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def socket_call(path, cmd, args, session=None):
+    """The CLI side: one request, one answer. Holds no token."""
+    session = session or os.environ.get('AGENT_BOX_SESSION_ID') or os.environ.get('AGENT_BOX_SESSION', '')
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(30)
+    try:
+        c.connect(path)
+        c.sendall(json.dumps({'cmd': cmd, 'args': args, 'session': session}).encode() + b'\n')
+        buf = b''
+        while not buf.endswith(b'\n'):
+            chunk = c.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError as e:
+        raise Refused('cannot reach the local-slack daemon at %s: %s' % (path, e))
+    finally:
+        c.close()
+    try:
+        resp = json.loads(buf.decode())
+    except ValueError:
+        raise Refused('bad answer from the local-slack daemon')
+    if not resp.get('ok'):
+        raise Refused(resp.get('error') or 'refused')
+    return resp
+
+
 def _opt(args, name, default=None, flag=False):
     if name in args:
         i = args.index(name)
@@ -1595,7 +1823,7 @@ def _main(cmd, rest):
                 c['allow_external']))
         return 0
     if cmd == 'channel' and rest[:1] == ['add'] and len(rest) >= 2:
-        token = os.environ.get('SLACK_BOT_TOKEN')
+        token = None if os.environ.get('LOCAL_SLACK_SOCKET') else credential('SLACK_BOT_TOKEN')
         channel_add(rest[1], rest[2:], Web(token) if token else None)
         print('saved %s' % rest[1])
         return 0
@@ -1610,7 +1838,10 @@ def _main(cmd, rest):
         Store(os.path.join(state_dir(), 'slack.db')).purge_all()
         print('purged')
         return 0
-    bot_token = os.environ.get('SLACK_BOT_TOKEN')
+    sock = os.environ.get('LOCAL_SLACK_SOCKET')
+    if sock:
+        return _socket_main(sock, cmd, rest)
+    bot_token = credential('SLACK_BOT_TOKEN')
     if not bot_token:
         sys.exit('local-slack: SLACK_BOT_TOKEN is not set')
     web = Web(bot_token)
@@ -1631,33 +1862,58 @@ def _main(cmd, rest):
             print('daemon: no status file (never started)')
         return 0
     if cmd == 'thread' and len(rest) == 2:
-        r = web.call('conversations.replies', {'channel': rest[0], 'ts': rest[1], 'limit': 200})
-        for m in r.get('messages', []):
-            print(json.dumps({'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')}))
+        for m in read_thread(web, *rest):
+            print(json.dumps(m))
         return 0
+    if cmd not in SOCKET_COMMANDS:
+        print(USAGE, file=sys.stderr)
+        return 2
     me = web.call('auth.test')
     store = Store(os.path.join(state_dir(), 'slack.db'))
     w = Writer(web, store, channels, defaults, {'user_id': me['user_id']})
     w.team = me.get('team_id') or ''
-    if cmd == 'reply' and len(rest) == 3:
-        r = w.reply(*rest)
-    elif cmd == 'post' and len(rest) == 2:
-        r = w.post(*rest)
-    elif cmd == 'status' and len(rest) >= 3:
-        args = rest[3:]
-        r = w.status(rest[0], rest[1], rest[2], 'done' if '--done' in args else 'failed' if '--failed' in args else None)
-    elif cmd == 'react' and len(rest) == 3:
-        w.react(*rest)
-        r = {}
-    else:
-        print(USAGE, file=sys.stderr)
-        return 2
-    out = {'ts': r.get('ts')}
-    if r.get('unresolved'):
-        out['unresolved'] = r['unresolved']
+    try:
+        out = execute(w, cmd, rest)
+    except Refused as e:
+        if str(e).startswith('usage: '):
+            print(USAGE, file=sys.stderr)
+            return 2
+        raise
     print(json.dumps(out))
     return 0
 
+
+def _socket_main(sock, cmd, rest):
+    """Socket-service mode: the daemon holds the tokens and runs the guardrails;
+    this process neither reads a token nor calls Slack."""
+    if cmd == 'doctor':
+        for name in ('SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'):
+            if os.environ.get(name):
+                print('WARNING: %s is in this process\'s environment; in socket mode only the daemon '
+                      'should hold it' % name)
+            for f in credential_files(name):
+                if os.access(f, os.R_OK):
+                    print('WARNING: credential file %s is readable by this user' % f)
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(5)
+            c.connect(sock)
+            c.close()
+            print('socket: %s reachable' % sock)
+        except OSError as e:
+            print('socket: %s NOT reachable: %s' % (sock, e))
+            return 1
+        return 0
+    if cmd == 'thread' and len(rest) == 2:
+        for m in socket_call(sock, 'thread', rest)['messages']:
+            print(json.dumps(m))
+        return 0
+    if cmd not in SOCKET_COMMANDS:
+        print(USAGE, file=sys.stderr)
+        return 2
+    r = socket_call(sock, cmd, rest)
+    print(json.dumps({k: v for k, v in r.items() if k != 'ok'}))
+    return 0
 
 if __name__ == '__main__':
     sys.exit(main())

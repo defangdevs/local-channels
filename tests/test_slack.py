@@ -971,5 +971,183 @@ class TestCliSmoke(unittest.TestCase):
                 del os.environ['LOCAL_SLACK_CONFIG'], os.environ['LOCAL_SLACK_STATE_DIR']
 
 
+class TestSocketMode(unittest.TestCase):
+    """The daemon's Unix socket: uid allowlist, shared guardrails, no token in the
+    CLI, tokens from a credentials file."""
+
+    def setUp(self):
+        self.calls = []
+
+        class W:
+            def call(s, method, params=None, **kw):
+                self.calls.append((method, params))
+                return {'ok': True, 'ts': '1700000009.000900', 'members': [], 'channels': [],
+                        'messages': [{'ts': '1', 'user': 'U1', 'text': 'hi'}]}
+        self.store = slack.Store(':memory:')
+        self.cfg = slack._merge(slack.DEFAULT_CHANNEL, {'write': {'allowed': True, 'mode': 'always'}})
+        self.defaults = slack._merge(slack.DEFAULT_DEFAULTS, {})
+        self.ctx = slack.Ctx(W(), self.store, lambda: {'C1': self.cfg}, lambda: self.defaults,
+                             dict(BOT, team='T1'))
+        self.dir = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, 's.sock')
+        self.saved = dict(os.environ)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.environ.clear()
+        os.environ.update(self.saved)
+
+    def serve(self, allowed):
+        slack.serve_socket(self.path, allowed, self.ctx)
+
+    def test_unlisted_uid_is_refused_before_anything_runs(self):
+        self.serve({os.getuid() + 1})
+        with self.assertRaises(slack.Refused) as cm:
+            slack.socket_call(self.path, 'post', ['C1', 'hi'])
+        self.assertIn('not allowed', str(cm.exception))
+        self.assertEqual(self.calls, [])
+
+    def test_listed_uid_writes_through_the_writer_and_is_audited(self):
+        self.cfg['write']['top_level'] = True
+        self.serve({os.getuid()})
+        r = slack.socket_call(self.path, 'post', ['C1', 'hello'], session='sess-a')
+        self.assertEqual(r['ts'], '1700000009.000900')
+        self.assertEqual(self.calls[-1][0], 'chat.postMessage')
+        row = self.store.q('SELECT session, kind FROM audit')[0]
+        self.assertEqual((row['session'], row['kind']), ('uid%d/sess-a' % os.getuid(), 'post'))
+
+    def test_guardrails_hold_through_the_socket(self):
+        self.serve({os.getuid()})
+        for cmd, args in (('post', ['C1', 'hi']),                       # top_level not allowed
+                          ('react', ['C9', '1700000009.000900', 'eyes']),  # unconfigured channel
+                          ('thread', ['C9', '1700000009.000900'])):
+            with self.assertRaises(slack.Refused):
+                slack.socket_call(self.path, cmd, args)
+        self.cfg['write']['top_level'] = True
+        with self.assertRaises(slack.Refused):                           # broadcast refused
+            slack.socket_call(self.path, 'post', ['C1', 'hey @channel'])
+        self.assertEqual(self.calls, [])
+
+    def test_rate_limit_is_per_uid_and_session(self):
+        self.cfg['write']['top_level'] = True
+        self.defaults['limits'] = {'session_writes': 1, 'session_window_s': 600, 'top_level_per_hour': 0}
+        self.serve({os.getuid()})
+        slack.socket_call(self.path, 'post', ['C1', 'one'], session='a')
+        with self.assertRaises(slack.Refused):
+            slack.socket_call(self.path, 'post', ['C1', 'two'], session='a')
+        slack.socket_call(self.path, 'post', ['C1', 'three'], session='b')
+
+    def test_bad_requests(self):
+        for req in ({'cmd': 'grant', 'args': []}, {'cmd': 'post', 'args': 'C1'},
+                    {'cmd': 'post', 'args': ['C1', 3]}):
+            self.assertFalse(slack.handle_request(self.ctx, 1, req)['ok'])
+
+    def test_thread_reads_a_configured_channel(self):
+        self.serve({os.getuid()})
+        r = slack.socket_call(self.path, 'thread', ['C1', '1700000009.000900'])
+        self.assertEqual(r['messages'][0]['text'], 'hi')
+
+    def test_cli_in_socket_mode_never_reads_a_token(self):
+        self.cfg['write']['top_level'] = True
+        self.serve({os.getuid()})
+        os.environ['LOCAL_SLACK_SOCKET'] = self.path
+        os.environ['SLACK_BOT_TOKEN'] = 'xoxb-must-not-be-used'
+        os.environ['LOCAL_SLACK_CONFIG'] = os.path.join(self.dir, 'channels.json')
+        with open(os.environ['LOCAL_SLACK_CONFIG'], 'w') as f:
+            json.dump({'C1': {'write': {'allowed': True, 'top_level': True, 'mode': 'always'}}}, f)
+        web_init = slack.Web.__init__
+
+        def boom(*a, **k):
+            raise AssertionError('CLI built a Web client in socket mode')
+        slack.Web.__init__ = boom
+        self.addCleanup(setattr, slack.Web, '__init__', web_init)
+        orig = slack.credential
+        slack.credential = lambda n: (_ for _ in ()).throw(AssertionError('CLI read a token'))
+        self.addCleanup(setattr, slack, 'credential', orig)
+        self.assertEqual(slack.main(['post', 'C1', 'hello']), 0)
+        self.assertEqual(slack.main(['thread', 'C1', '1700000009.000900']), 0)
+        self.assertEqual(slack.main(['channel', 'add', 'C2']), 0)
+
+    def test_cli_in_socket_mode_without_daemon_refuses(self):
+        os.environ['LOCAL_SLACK_SOCKET'] = os.path.join(self.dir, 'none.sock')
+        os.environ['LOCAL_SLACK_CONFIG'] = os.path.join(self.dir, 'channels.json')
+        self.assertEqual(slack.main(['post', 'C1', 'hi']), 1)
+
+    def test_stale_socket_replaced_but_regular_file_is_not(self):
+        slack.bind_socket(self.path).close()
+        slack.bind_socket(self.path).close()
+        other = os.path.join(self.dir, 'file')
+        open(other, 'w').close()
+        with self.assertRaises(OSError):
+            slack.bind_socket(other)
+
+    def test_socket_mode_bits(self):
+        os.environ['LOCAL_SLACK_SOCKET_MODE'] = '600'
+        slack.bind_socket(self.path).close()
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_parse_uids(self):
+        self.assertEqual(slack.parse_uids('1000, 1001 root'), {1000, 1001, 0})
+        self.assertEqual(slack.parse_uids(''), set())
+
+
+class TestCredentials(unittest.TestCase):
+    def test_env_wins_then_credentials_directory(self):
+        d = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, 'slack_bot_token'), 'w') as f:
+            f.write('xoxb-file\n')
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ.pop('SLACK_BOT_TOKEN', None)
+        os.environ['CREDENTIALS_DIRECTORY'] = d
+        self.assertEqual(slack.credential('SLACK_BOT_TOKEN'), 'xoxb-file')
+        os.environ['SLACK_BOT_TOKEN'] = 'xoxb-env'
+        self.assertEqual(slack.credential('SLACK_BOT_TOKEN'), 'xoxb-env')
+        os.environ.pop('SLACK_BOT_TOKEN')
+        self.assertIsNone(slack.credential('SLACK_APP_TOKEN'))
+
+    def test_daemon_starts_with_tokens_only_from_a_credentials_file(self):
+        d = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        for n in ('slack_bot_token', 'slack_app_token'):
+            with open(os.path.join(d, n), 'w') as f:
+                f.write('x-' + n)
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        for n in ('SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'):
+            os.environ.pop(n, None)
+        os.environ['CREDENTIALS_DIRECTORY'] = d
+        os.environ['LOCAL_SLACK_STATE_DIR'] = d
+
+        class Stop(Exception):
+            pass
+
+        seen = []
+
+        def fake_call(self_, method, *a, **k):
+            seen.append((self_.bot, self_.app))
+            raise Stop
+        orig = slack.Web.call
+        slack.Web.call = fake_call
+        self.addCleanup(setattr, slack.Web, 'call', orig)
+        with self.assertRaises(Stop):
+            slack.run_daemon()
+        self.assertEqual(seen, [('x-slack_bot_token', 'x-slack_app_token')])
+
+    def test_doctor_warns_about_a_visible_token_in_socket_mode(self):
+        import io
+        import contextlib
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ['LOCAL_SLACK_SOCKET'] = '/nonexistent/s.sock'
+        os.environ['SLACK_BOT_TOKEN'] = 'xoxb-visible'
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            slack._socket_main('/nonexistent/s.sock', 'doctor', [])
+        self.assertIn('WARNING: SLACK_BOT_TOKEN', buf.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()
