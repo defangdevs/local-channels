@@ -726,7 +726,8 @@ a Maildir-style spool under `<state>/spool/` **before** anything consumes it
 and before the `200`:
 
 ```
-spool/inbox/{tmp,new}/<id>          accepted; new/<id> is the commit point
+spool/inbox/{tmp,new,fanned,dispatched}/<id>
+                                    accepted; new/<id> is the commit point
 spool/peers/<session>/{tmp,new,cur} that session's mail (hard links: one copy)
 spool/dispatch/{tmp,new,cur}/       the standing-watch queue
 spool/seen/<id>                     dedup memory (empty-ish files, mtime = when)
@@ -737,7 +738,12 @@ spool/seen/<id>                     dedup memory (empty-ish files, mtime = when)
   cur/<id>:<pid>)` — atomic, so exactly one claimant wins — and the `<pid>` is
   the lease: a lease whose process is dead goes back to `new/`. Done is
   unlink. Delivery is **at-least-once**: a process that dies after delivering
-  and before unlinking delivers again.
+  and before unlinking delivers again. An accepted record then moves
+  `new → fanned → dispatched` as its session copies and its standing-watch
+  record are written, so recovery (at start, or the reaper after 60 s)
+  resumes the step a crash or a full disk interrupted and never redoes one
+  that finished; a record that still cannot be finished after
+  `LOCAL_WEBHOOK_SPOOL_PEER_MAX_S` is discarded with a log line.
 - **Deduplicated:** `<id>` is `<source>~<delivery id>` (or a sha256 of the
   pair when either part is not plainly filename-safe — the delivery header is
   sender-supplied and not covered by the signature). A delivery whose id and
@@ -756,7 +762,12 @@ spool/seen/<id>                     dedup memory (empty-ish files, mtime = when)
   outage still delivers what arrived while it was live, while an unsubscribe
   discards it. A `codex queue` that fails puts the event back in line instead
   of dropping it. A pre-0.33.0 peer (no `instances/<key>.<pid>.inbox` marker)
-  cannot claim, so for it the socket write is the handoff, as before.
+  cannot claim, so for it the socket write is the handoff, as before. Each
+  copy is claimed by exactly ONE peer: the model is one peer per session key
+  (one `LOCAL_WEBHOOK_SESSION` per session, which agent-box guarantees). Two
+  processes sharing a key — say, a stray second `claude` started with the
+  same environment — no longer each receive every event; whichever claims
+  first delivers it.
 - **Standing watches:** each matched event is a record in `spool/dispatch/`,
   leased while its batch runs, rewritten with its deferral streak on exit
   `75`, and removed on every other ending (accepted, broken spawner, claimed by

@@ -1796,8 +1796,11 @@ def format_delivery(env, entry):
 # The fix is a spool on the filesystem, Maildir-style (decided 2026-10-03 on
 # #60), written BEFORE anything consumes the event:
 #
-#   spool/inbox/{tmp,new}/<id>          every accepted event; new/<id> is the
-#                                       commit point that makes "accepted" true
+#   spool/inbox/{tmp,new,fanned,dispatched}/<id>
+#                                       every accepted event; new/<id> is the
+#                                       commit point that makes "accepted"
+#                                       true, the later steps say how far its
+#                                       fan-out got (see INBOX_PHASES)
 #   spool/peers/<box>/{tmp,new,cur}/    one inbox per session filter key: hard
 #                                       links to the inbox record, so N
 #                                       sessions cost one copy of the payload
@@ -1969,11 +1972,19 @@ class SpoolQueue:
         self.ensure()
         if self.leases(name):
             return False
-        try:
-            os.link(src, os.path.join(self.new, name))
-            return True
-        except FileExistsError:
-            return False
+        for attempt in (0, 1):
+            try:
+                os.link(src, os.path.join(self.new, name))
+                return True
+            except FileExistsError:
+                return False
+            except FileNotFoundError:
+                # The reaper removed an emptied box between ensure() and
+                # link(); make it again, once.
+                if attempt:
+                    raise
+                self.ensure()
+        return False
 
     def names(self):
         """Queued (not leased) names, oldest first: accept order is mtime,
@@ -2242,6 +2253,46 @@ def _seen_digest(sid):
         return ''
 
 
+# An accepted record moves through the inbox in three steps, each ended by a
+# rename, so recovery redoes only the step a crash (or a full disk) actually
+# interrupted:
+#   new/        accepted; per-session copies not yet (all) linked
+#   fanned/     copies linked; the standing-watch record not yet written
+#   dispatched/ both done; only the seen marker and the unlink remain
+# Without the steps, a retry re-linked copies sessions had already drained
+# and re-queued watches that had already spawned — every reaper pass, for as
+# long as the failure lasted.
+INBOX_PHASES = ('new', 'fanned', 'dispatched')
+
+
+def _inbox_path(phase, sid):
+    return os.path.join(SPOOL_INBOX.root, phase, sid)
+
+
+def _inbox_advance(sid, frm, to):
+    os.makedirs(os.path.join(SPOOL_INBOX.root, to), mode=0o700, exist_ok=True)
+    os.rename(_inbox_path(frm, sid), _inbox_path(to, sid))
+
+
+def _inbox_records():
+    """[(phase, sid, mtime seconds)] of every record still in the inbox."""
+    rows = []
+    for phase in INBOX_PHASES:
+        d = os.path.join(SPOOL_INBOX.root, phase)
+        try:
+            found = os.listdir(d)
+        except OSError:
+            continue
+        for n in found:
+            if not SPOOL_NAME.match(n):
+                continue
+            st = _spool_regular(os.path.join(d, n))
+            if st is not None:
+                rows.append((phase, n, st.st_mtime))
+    rows.sort(key=lambda r: (r[2], r[1]))
+    return rows
+
+
 # A duplicate is the same delivery id AND the same body (digest = sha256 of
 # the raw, verified body). GitHub keeps both on a redelivery, so that is what
 # a backfill sweep sends. The body half is there for the sender that does
@@ -2273,26 +2324,41 @@ def spool_accept(env, digest=''):
         sid = fresh()
     rec = {'v': 1, 'kind': 'webhook', 'id': sid, 'acceptedMs': at, 'acceptedAt': iso_at(at),
            'digest': digest, 'env': env}
+    def rename_fresh():
+        rec['id'] = fresh()
+        if not SPOOL_INBOX.publish(rec['id'], compact(rec).encode('utf-8'), mtime_ms=at):
+            raise OSError('could not publish %s' % rec['id'])
+        return rec['id']
+
     if not SPOOL_INBOX.publish(sid, compact(rec).encode('utf-8'), mtime_ms=at):
-        other = SpoolQueue.load(os.path.join(SPOOL_INBOX.new, sid))
+        other = SpoolQueue.load(_inbox_path('new', sid))
         if other is None or other.get('digest') == digest:
             return None   # the same delivery is being fanned out right now
-        sid = fresh()
-        rec['id'] = sid
-        if not SPOOL_INBOX.publish(sid, compact(rec).encode('utf-8'), mtime_ms=at):
-            raise OSError('could not publish %s' % sid)
-    # The original marks seen/ BEFORE it unlinks its inbox record, so a
-    # duplicate that slipped into new/ after that unlink sees the marker here.
-    if spool_dedupable(sid) and _seen_digest(sid) == digest:
-        SPOOL_INBOX.drop(sid)
-        return None
+        sid = rename_fresh()
+    elif spool_dedupable(sid):
+        # The same id may already be further along: an original moves
+        # forward by rename, and the checks below follow it in the same
+        # direction (fanned, dispatched, then the seen marker it writes
+        # BEFORE its last unlink), so a record moving on is caught at a
+        # later step instead of slipping between two.
+        for phase in INBOX_PHASES[1:]:
+            if os.path.exists(_inbox_path(phase, sid)):
+                other = SpoolQueue.load(_inbox_path(phase, sid))
+                SPOOL_INBOX.drop(sid)
+                if other is None or other.get('digest') == digest:
+                    return None
+                sid = rename_fresh()
+                break
+        else:
+            if _seen_digest(sid) == digest:
+                SPOOL_INBOX.drop(sid)
+                return None
     return sid, at
 
 
-def spool_fanout(sid, env, at):
+def spool_fanout(sid, env, at, src):
     """Link the committed inbox record into every session inbox whose filter
     accepts it. Idempotent per box. Returns the keys it is queued for."""
-    src = os.path.join(SPOOL_INBOX.new, sid)
     keys = []
     for key in filter_keys():
         if not filter_accepts(filter_path_of(key), env, at):
@@ -2310,15 +2376,21 @@ def spool_commit(sid, digest=''):
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='ascii') as fh:
             fh.write(digest)
-    SPOOL_INBOX.drop(sid)
+    try:
+        os.unlink(_inbox_path('dispatched', sid))
+    except FileNotFoundError:
+        pass
 
 
-def spool_process(sid, env, at, live, enqueue, digest=''):
+def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
     """Everything after the commit point, for one accepted event: per-session
-    copies, the live doorbell, the standing-watch record, then the commit.
-    Run by the HTTP handler (live) and again — idempotently — by recovery for
-    a record a crash left in inbox/new."""
-    keys = spool_fanout(sid, env, at)
+    copies, the live doorbell, the standing-watch record, then the commit —
+    starting from `phase`, so recovery resumes a record where it stopped."""
+    keys = []
+    if phase == 'new':
+        keys = spool_fanout(sid, env, at, _inbox_path('new', sid))
+        _inbox_advance(sid, 'new', 'fanned')
+        phase = 'fanned'
     if live:
         if not RECEIVER_ONLY:
             # legacy: the ingress-owning session gets it too
@@ -2327,7 +2399,9 @@ def spool_process(sid, env, at, live, enqueue, digest=''):
             else:
                 handle_event(env)
         broadcast(env, (sid, keys))
-    dispatch_event(env, sid=sid, at=at, enqueue=enqueue)  # standing watches (issue #1)
+    if phase == 'fanned':
+        dispatch_event(env, sid=sid, at=at, enqueue=enqueue)  # standing watches (issue #1)
+        _inbox_advance(sid, 'fanned', 'dispatched')
     spool_commit(sid, digest)
 
 
@@ -2407,21 +2481,54 @@ def _inbox_loop():
 def spool_recover():
     """After a (re)start: finish any fan-out a crash interrupted, then reload
     the dispatch queue. Peers drain their own boxes; nothing to do for them."""
-    redone = 0
-    for sid in SPOOL_INBOX.names():
-        rec = SpoolQueue.load(os.path.join(SPOOL_INBOX.new, sid))
-        if rec is None or not isinstance(rec.get('env'), dict):
-            print('local-webhook: discarding unreadable inbox record %s' % sid, file=sys.stderr)
-            SPOOL_INBOX.drop(sid)
-            continue
-        spool_process(sid, rec['env'], rec['acceptedMs'], live=False, enqueue=False,
-                      digest=rec.get('digest') or '')
-        redone += 1
-    requeued = DISPATCHER.recover() if DISPATCHER is not None else 0
+    redone = sum(1 for phase, sid, _ in _inbox_records() if _inbox_resume(phase, sid, enqueue=False))
+    requeued = 0
+    if DISPATCHER is not None:
+        # Unconditionally, and on its own: one bad inbox record must not keep
+        # the whole standing-watch queue — declined batches included — from
+        # coming back.
+        try:
+            requeued = DISPATCHER.recover()
+        except Exception as e:  # noqa: BLE001
+            print('local-webhook: could not reload the dispatch queue: %s' % e, file=sys.stderr)
     if redone or requeued:
         print('local-webhook: spool recovery — finished the fan-out of %d accepted event(s), '
               're-queued %d standing-watch event(s)' % (redone, requeued), file=sys.stderr)
     return redone, requeued
+
+
+def _inbox_resume(phase, sid, enqueue, now_s=None):
+    """Finish one inbox record from the step it stopped at. True if it was
+    finished; a failure is logged and leaves it for the next pass, until it is
+    older than the age bound — then it is discarded, out loud, rather than
+    retried for ever."""
+    path = _inbox_path(phase, sid)
+    rec = SpoolQueue.load(path)
+    if rec is None or not isinstance(rec.get('env'), dict):
+        print('local-webhook: discarding unreadable inbox record %s' % sid, file=sys.stderr)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    now_s = time.time() if now_s is None else now_s
+    if now_s - rec['acceptedMs'] / 1000.0 > SPOOL_PEER_MAX_S:
+        print('local-webhook: discarding accepted event %s — its fan-out has failed since %s, past '
+              'LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d' % (sid, rec.get('acceptedAt', '?'), SPOOL_PEER_MAX_S),
+              file=sys.stderr)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    try:
+        spool_process(sid, rec['env'], rec['acceptedMs'], live=False, enqueue=enqueue,
+                      digest=rec.get('digest') or '', phase=phase)
+        return True
+    except Exception as e:  # noqa: BLE001 — one record must not stop the rest
+        print('local-webhook: could not finish the fan-out of %s (%s step): %s — retrying later'
+              % (sid, phase, e), file=sys.stderr)
+        return False
 
 
 def _drop_logged(q, rows, why, label):
@@ -2446,21 +2553,17 @@ def spool_reap(now_s=None):
                 os.unlink(os.path.join(SPOOL_SEEN, n))
             except OSError:
                 pass
-    # A fan-out that did not finish and is not running: finish it.
-    for sid in SPOOL_INBOX.names():
+    # A fan-out that did not finish and is not running: finish it, from the
+    # step it reached.
+    for phase, sid, mtime in _inbox_records():
         with SPOOL_INFLIGHT_LOCK:
             if sid in SPOOL_INFLIGHT:
                 continue
-        st = _spool_regular(os.path.join(SPOOL_INBOX.new, sid))
-        if st is None or now_s - st.st_mtime < SPOOL_INBOX_RETRY_S:
+        if now_s - mtime < SPOOL_INBOX_RETRY_S:
             continue
-        rec = SpoolQueue.load(os.path.join(SPOOL_INBOX.new, sid))
-        if rec is None or not isinstance(rec.get('env'), dict):
-            SPOOL_INBOX.drop(sid)
-            continue
-        print('local-webhook: finishing the interrupted fan-out of %s' % sid, file=sys.stderr)
-        spool_process(sid, rec['env'], rec['acceptedMs'], live=False, enqueue=True,
-                      digest=rec.get('digest') or '')
+        print('local-webhook: finishing the interrupted fan-out of %s (%s step)' % (sid, phase),
+              file=sys.stderr)
+        _inbox_resume(phase, sid, enqueue=True, now_s=now_s)
     for q in (SPOOL_INBOX, SPOOL_DISPATCH):
         q.reap_tmp(now_s)
     if DISPATCHER is None:
@@ -2478,42 +2581,53 @@ def spool_reap(now_s=None):
     for box in sorted(boxes):
         if not SPOOL_BOX.match(box):
             continue
-        q = SpoolQueue(os.path.join(SPOOL_PEERS, box))
-        q.recover()
-        q.reap_tmp(now_s)
-        key = _box_key(box)
-        label = 'session %s' % (key if key else '(unscoped)' if key == '' else box)
-        rows = [r for r in q.aged() if r[2] == 'new']
-        state = read_filter(filter_path_of(key))['state'] if key is not None else 'absent'
-        if state == 'absent':
-            # agent-box's `session rm` deletes the filter file; with it goes
-            # the reason to keep mail — and a later session reusing the name
-            # must not inherit it (the #61 hazard, inbox edition).
-            _drop_logged(q, rows, 'it has no filter file any more (removed or never subscribed)', label)
-            if not q.leases():
-                for d in (q.new, q.cur, q.tmp):
-                    try:
-                        os.rmdir(d)
-                    except OSError:
-                        pass
-                try:
-                    os.unlink(os.path.join(q.root, 'key'))
-                except OSError:
-                    pass
-                try:
-                    os.rmdir(q.root)
-                except OSError:
-                    pass
-            continue
-        old = [r for r in rows if now_s - r[1] > SPOOL_PEER_MAX_S]
-        _drop_logged(q, old, 'older than LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d and still undelivered'
-                     % SPOOL_PEER_MAX_S, label)
-        rows = [r for r in rows if r not in old]
-        over = len(rows) - SPOOL_PEER_MAX_N
-        if over > 0:
-            _drop_logged(q, rows[:over], 'the oldest past the LOCAL_WEBHOOK_SPOOL_PEER_MAX=%d cap; '
-                         'nothing is draining it' % SPOOL_PEER_MAX_N, label)
+        try:
+            _reap_box(box, now_s)
+        except Exception as e:  # noqa: BLE001 — one box must not stop the others
+            print('local-webhook: could not reap spool box %s: %s' % (box, e), file=sys.stderr)
 
+
+def _reap_box(box, now_s):
+    q = SpoolQueue(os.path.join(SPOOL_PEERS, box))
+    q.recover()
+    q.reap_tmp(now_s)
+    key = _box_key(box)
+    label = 'session %s' % (key if key else '(unscoped)' if key == '' else box)
+    rows = [r for r in q.aged() if r[2] == 'new']
+    state = read_filter(filter_path_of(key))['state'] if key is not None else 'absent'
+    if state == 'absent':
+        # agent-box's `session rm` deletes the filter file; with it goes the
+        # reason to keep mail — and a later session reusing the name must not
+        # inherit it (the #61 hazard, inbox edition).
+        _drop_logged(q, rows, 'it has no filter file any more (removed or never subscribed)', label)
+        if not q.leases():
+            for d in (q.new, q.cur, q.tmp):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+            try:
+                os.unlink(os.path.join(q.root, 'key'))
+            except OSError:
+                pass
+            try:
+                os.rmdir(q.root)
+            except OSError:
+                pass
+        return
+    # A lease on mail this old outlived any delivery attempt by hours: its
+    # holder is gone even if its pid has since been reused by a live process.
+    stuck = [r for r in q.aged() if r[2] == 'cur' and now_s - r[1] > SPOOL_PEER_MAX_S]
+    _drop_logged(q, stuck, 'leased by pid(s) %s past LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d and never '
+                 'finished' % (','.join(sorted({str(r[3]) for r in stuck})), SPOOL_PEER_MAX_S), label)
+    old = [r for r in rows if now_s - r[1] > SPOOL_PEER_MAX_S]
+    _drop_logged(q, old, 'older than LOCAL_WEBHOOK_SPOOL_PEER_MAX_S=%d and still undelivered'
+                 % SPOOL_PEER_MAX_S, label)
+    rows = [r for r in rows if r not in old]
+    over = len(rows) - SPOOL_PEER_MAX_N
+    if over > 0:
+        _drop_logged(q, rows[:over], 'the oldest past the LOCAL_WEBHOOK_SPOOL_PEER_MAX=%d cap; '
+                     'nothing is draining it' % SPOOL_PEER_MAX_N, label)
 
 def _spool_reaper_loop():
     while True:
@@ -2545,7 +2659,7 @@ def spool_status(now_s=None):
         out.update({'inbox': 0, 'dispatch': {'pending': 0, 'running': 0, 'items': []},
                     'sessions': {}, 'seen': 0})
         return out
-    out['inbox'] = len(SPOOL_INBOX.names())
+    out['inbox'] = len(_inbox_records())
     items = []
     for name, mtime, where, pid in SPOOL_DISPATCH.aged():
         path = os.path.join(SPOOL_DISPATCH.new, name) if where == 'new' else \
@@ -2658,10 +2772,11 @@ def broadcast(env, spool=None):
             c.sendall(line)
             c.close()
         except OSError as e:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            for dead in (p, p[:-len('.sock')] + '.inbox'):
+                try:
+                    os.unlink(dead)
+                except OSError:
+                    pass
             # Said out loud (#60): this used to be the silent end of the
             # event for that session.
             held = parsed is not None and parsed[0] in keys
@@ -2729,6 +2844,23 @@ if not RECEIVER_ONLY and not CLI:
         os.unlink(IPC_SOCK)  # PID reuse after a crash: reclaim our own path
     except OSError:
         pass
+    if SPOOL_ENABLED:
+        # The marker goes up BEFORE the socket can accept anything: between
+        # the two, the receiver would take this peer for a pre-0.33.0 one,
+        # count the socket write as the handoff and drop the spooled copy —
+        # while this peer, seeing its key in the envelope, would go to claim
+        # that copy and find nothing. A marker without a socket is harmless.
+        try:
+            open(IPC_INBOX_MARKER, 'w').close()
+        except OSError:
+            pass
+        # Leases under OUR pid can only be a dead predecessor's (pid reuse
+        # after a reboot or in a container): nothing in this process has
+        # claimed anything yet. Later passes cannot tell them from our own.
+        try:
+            MY_INBOX.recover(alive=lambda pid: pid != os.getpid() and pid_alive(pid))
+        except OSError:
+            pass
     try:
         _ipc_srv = socket.socket(socket.AF_UNIX)
         _ipc_srv.bind(IPC_SOCK)
@@ -2743,13 +2875,8 @@ if not RECEIVER_ONLY and not CLI:
                     pass
         atexit.register(_cleanup)
         if SPOOL_ENABLED:
-            # Socket first, then the marker, then the drain: an event spooled
-            # before the socket existed is found by the drain, one spooled
-            # after it gets a doorbell — there is no gap between the two.
-            try:
-                open(IPC_INBOX_MARKER, 'w').close()
-            except OSError:
-                pass
+            # Socket before drain: an event spooled before the socket existed
+            # is found by the drain, one spooled after it gets a doorbell.
             threading.Thread(target=_inbox_loop, daemon=True).start()
             _grace = threading.Timer(SPOOL_READY_GRACE_S, INBOX_READY.set)
             _grace.daemon = True
@@ -2952,8 +3079,10 @@ class Dispatcher:
     def recover(self):
         if self.spool is None:
             return 0
-        me = os.getpid()
-        self.spool.recover(alive=lambda pid: pid != me and pid_alive(pid))
+        # Only the ingress owner ever leases a dispatch record, and there is
+        # one of it: whatever lease is on disk when it starts belonged to a
+        # predecessor — even under a pid that happens to be alive again.
+        self.spool.recover(alive=lambda pid: False)
         recs = []
         for sid in self.spool.names():
             rec = SpoolQueue.load(os.path.join(self.spool.new, sid))
@@ -3037,6 +3166,7 @@ class Dispatcher:
                 # keeping alive is over with it: the next event on this key
                 # starts a fresh one.
                 st['defer_since'] = None
+                st['defer_wall'] = None
                 st['defer_n'] = 0
                 return
         st['running'] = True

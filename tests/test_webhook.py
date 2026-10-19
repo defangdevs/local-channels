@@ -2778,6 +2778,132 @@ class TestSpoolReaper(SpoolCase):
         self.assertEqual(st['seen'], 1)
 
 
+class TestSpoolFailureModes(SpoolCase):
+    """Regressions from review: a fan-out that fails part-way, recovery that
+    meets a bad record, a peer racing its own marker, a lease under a reused
+    pid."""
+
+    def test_a_failing_commit_is_retried_without_redelivering(self):
+        # Before the inbox had steps, every reaper pass re-linked the copy a
+        # session had already drained and re-queued a watch that had already
+        # spawned — for as long as the failure lasted.
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions')
+        err = self.quiet()
+        log = os.path.join(self.state, 'spawns.log')
+        self.mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat; echo RUN; } >> %s' % log)
+        self.write_json('filter.dispatch.json', {'topics': [{'topic': 'github:o/r', 'include': ANY_EVENT}]})
+        self.subscribe('sessa')
+        seen = os.path.join(self.state, 'spool', 'seen')
+        os.makedirs(seen)
+        os.chmod(seen, 0o500)
+        self.addCleanup(os.chmod, seen, 0o700)
+        env = self.env('stuck-1')
+        sid, at = self.mod.spool_accept(env, 'dd')
+        with self.assertRaises(OSError):
+            self.mod.spool_process(sid, env, at, live=True, enqueue=True, digest='dd')
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'spool', 'inbox', 'dispatched', sid)))
+        self.box('sessa').drop(sid)                     # the session drained its copy
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(log):
+            time.sleep(0.05)
+        for i in range(3):                              # three reaper passes, still failing
+            self.mod.spool_reap(now_s=time.time() + 120 * (i + 1))
+        self.assertEqual(self.box('sessa').names(), [])
+        time.sleep(0.5)
+        with open(log, encoding='utf-8') as f:
+            self.assertEqual(f.read().count('RUN'), 1)
+        self.assertIn('could not finish the fan-out', err.getvalue())
+        os.chmod(seen, 0o700)                           # the disk recovers
+        self.mod.spool_reap(now_s=time.time() + 600)
+        self.assertEqual(self.mod.spool_status()['inbox'], 0)
+        self.assertIsNone(self.mod.spool_accept(env, 'dd'))   # and it is remembered
+
+    def test_a_fan_out_failing_for_ever_is_eventually_discarded(self):
+        err = self.quiet()
+        env = self.env('forever-1')
+        sid, at = self.mod.spool_accept(env, 'ee')
+        self.mod.spool_fanout = lambda *a: (_ for _ in ()).throw(OSError('disk on fire'))
+        self.mod.spool_reap(now_s=time.time() + 120)
+        self.assertEqual(self.mod.spool_status()['inbox'], 1)        # retried, kept
+        self.mod.spool_reap(now_s=time.time() + self.mod.SPOOL_PEER_MAX_S + 10)
+        self.assertEqual(self.mod.spool_status()['inbox'], 0)        # then let go, out loud
+        self.assertIn('discarding accepted event %s' % sid, err.getvalue())
+
+    def test_recovery_survives_a_bad_record_and_still_reloads_the_watch_queue(self):
+        err = self.quiet()
+        self.mod.spool_accept(self.env('bad-1'), 'aa')
+        self.mod.spool_accept(self.env('good-1'), 'bb')
+        calls = []
+        real = self.mod.spool_fanout
+
+        def flaky(sid, env, at, src):
+            if 'bad-1' in sid:
+                raise ValueError('payload the summarizer chokes on')
+            calls.append(sid)
+            return real(sid, env, at, src)
+        self.mod.spool_fanout = flaky
+
+        class FakeDispatcher:
+            recovered = 0
+
+            def recover(self):
+                FakeDispatcher.recovered += 1
+                return 0
+        self.mod.DISPATCHER = FakeDispatcher()
+        self.mod.dispatch_event = lambda *a, **k: None
+        self.assertEqual(self.mod.spool_recover(), (1, 0))
+        self.assertEqual(calls, ['github~good-1'])
+        self.assertEqual(FakeDispatcher.recovered, 1)
+        self.assertIn('could not finish the fan-out of github~bad-1', err.getvalue())
+
+    def test_a_lease_under_a_reused_live_pid_is_expired(self):
+        err = self.quiet()
+        self.subscribe('sessa')
+        sid = self.accept(self.env('reused-1'))
+        q = self.box('sessa')
+        lease = q.claim(sid, owner=os.getpid())     # "alive": the pid was reused
+        q.recover()
+        self.assertEqual(q.names(), [])             # recover() cannot tell
+        self.age(lease, self.mod.SPOOL_PEER_MAX_S + 10)
+        self.mod.spool_reap()
+        self.assertEqual(q.leases(), [])
+        self.assertIn('never finished', err.getvalue())
+
+    def age(self, path, seconds):
+        t = time.time() - seconds
+        os.utime(path, (t, t))
+
+    def test_a_peer_reclaims_leases_left_under_its_own_pid_and_marks_itself_first(self):
+        self.subscribe('peerkey')
+        sid = self.accept(self.env('mine-1'))
+        q = self.box('peerkey')
+        q.claim(sid, owner=os.getpid())   # a dead predecessor that had our pid
+        argv = sys.argv
+        sys.argv = argv[:1]     # any argv beyond the script makes the module a one-shot CLI
+        try:
+            peer = self.load(LOCAL_WEBHOOK_RECEIVER_ONLY='', LOCAL_WEBHOOK_SESSION='peerkey')
+        finally:
+            sys.argv = argv
+        self.addCleanup(lambda: [os.unlink(f) for f in (peer.IPC_SOCK, peer.IPC_INBOX_MARKER)
+                                 if os.path.exists(f)])
+        self.assertTrue(os.path.exists(peer.IPC_INBOX_MARKER))
+        self.assertTrue(os.path.exists(peer.IPC_SOCK))
+        self.assertEqual(q.names(), [sid])
+
+    def test_a_dead_peer_loses_its_marker_with_its_socket(self):
+        self.quiet()
+        inst = os.path.join(self.state, 'instances')
+        p = subprocess.Popen([PYTHON, '-c', 'pass'])
+        p.wait()
+        sock = os.path.join(inst, 'ghost.%d.sock' % p.pid)
+        open(sock, 'w').close()             # not a socket: connect fails like a dead one
+        open(sock[:-5] + '.inbox', 'w').close()
+        self.mod.broadcast(self.env('ghost-1'))
+        self.assertFalse(os.path.exists(sock))
+        self.assertFalse(os.path.exists(sock[:-5] + '.inbox'))
+
+
 class TestDispatchSpool(SpoolCase):
     """The standing-watch queue on disk: what a restart keeps, and what it
     still re-checks before it spends a session."""
