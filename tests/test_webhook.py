@@ -2517,6 +2517,14 @@ class TestSpoolNames(SpoolCase):
         self.assertEqual(self.mod.spool_box('plain-key'), 'plain-key')
         self.assertEqual(self.mod.spool_box(''), '@shared')
 
+    def test_no_name_reaches_a_path_outside_its_directory(self):
+        d = os.path.join(self.state, 'spool', 'x')
+        self.assertEqual(self.mod.spool_path(d, 'github~ok'), os.path.join(os.path.abspath(d), 'github~ok'))
+        self.assertTrue(self.mod.spool_path(d, 'github~ok:123').endswith('github~ok:123'))
+        for bad in ('../x', '..', '.', '', 'a/b', '/etc/passwd', 'github~ok:x', None, '~@'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.mod.spool_path(d, bad)
+
     def test_planted_entries_are_never_read(self):
         q = self.mod.SpoolQueue(os.path.join(self.state, 'spool', 'peers', 'testsess'))
         q.ensure()

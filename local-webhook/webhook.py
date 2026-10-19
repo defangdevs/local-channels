@@ -1903,6 +1903,24 @@ def spool_box(key):
     return '@' + hashlib.sha256(key.encode('utf-8', 'surrogateescape')).hexdigest()[:32]
 
 
+def spool_path(directory, name):
+    """The one way a spool name becomes a path. Every name has already been
+    reduced to SPOOL_NAME (or a lease of one) by whoever made it, so this
+    never refuses in practice; it exists so that no sender-supplied string —
+    a delivery id is one — can reach the filesystem except through a check
+    that it names a plain entry directly inside `directory`."""
+    if not isinstance(name, str):
+        raise ValueError('spool name must be a string')
+    m = SPOOL_LEASE.match(name)
+    if not SPOOL_NAME.match(m.group(1) if m else name):
+        raise ValueError('not a spool name: %r' % name[:120])
+    base = os.path.abspath(directory)
+    path = os.path.normpath(os.path.join(base, name))
+    if not path.startswith(base + os.sep) or os.path.dirname(path) != base:
+        raise ValueError('spool name escapes its directory: %r' % name[:120])
+    return path
+
+
 def _spool_regular(path):
     try:
         st = os.lstat(path)
@@ -1957,7 +1975,7 @@ class SpoolQueue:
             return False
         tmp = self._stage(data, mtime_ms)
         try:
-            os.link(tmp, os.path.join(self.new, name))
+            os.link(tmp, spool_path(self.new, name))
             return True
         except FileExistsError:
             return False
@@ -1974,7 +1992,7 @@ class SpoolQueue:
             return False
         for attempt in (0, 1):
             try:
-                os.link(src, os.path.join(self.new, name))
+                os.link(src, spool_path(self.new, name))
                 return True
             except FileExistsError:
                 return False
@@ -1997,7 +2015,7 @@ class SpoolQueue:
         for n in found:
             if not SPOOL_NAME.match(n):
                 continue
-            st = _spool_regular(os.path.join(self.new, n))
+            st = _spool_regular(spool_path(self.new, n))
             if st is not None:
                 rows.append((st.st_mtime_ns, n))
         rows.sort()
@@ -2007,11 +2025,11 @@ class SpoolQueue:
         """[(name, mtime seconds, 'new'|'cur', owner pid or None)], oldest first."""
         rows = []
         for n in self.names():
-            st = _spool_regular(os.path.join(self.new, n))
+            st = _spool_regular(spool_path(self.new, n))
             if st is not None:
                 rows.append((n, st.st_mtime, 'new', None))
         for n, pid in self.leases():
-            st = _spool_regular(os.path.join(self.cur, '%s:%d' % (n, pid)))
+            st = _spool_regular(spool_path(self.cur, '%s:%d' % (n, pid)))
             if st is not None:
                 rows.append((n, st.st_mtime, 'cur', pid))
         rows.sort(key=lambda r: (r[1], r[0]))
@@ -2034,7 +2052,7 @@ class SpoolQueue:
         return out
 
     def lease_path(self, name, owner=None):
-        return os.path.join(self.cur, '%s:%d' % (name, os.getpid() if owner is None else owner))
+        return spool_path(self.cur, '%s:%d' % (name, os.getpid() if owner is None else owner))
 
     def claim(self, name, owner=None):
         """Take new/<name>; the lease path, or None when someone else has it
@@ -2044,7 +2062,7 @@ class SpoolQueue:
         try:
             os.makedirs(self.cur, mode=0o700, exist_ok=True)
             dst = self.lease_path(name, owner)
-            os.rename(os.path.join(self.new, name), dst)
+            os.rename(spool_path(self.new, name), dst)
             return dst
         except OSError:
             return None
@@ -2058,14 +2076,14 @@ class SpoolQueue:
             return False
         if data is not None:
             tmp = self._stage(data, st.st_mtime_ns // 1000000)
-            os.replace(tmp, os.path.join(self.new, name))
+            os.replace(tmp, spool_path(self.new, name))
             try:
                 os.unlink(src)
             except OSError:
                 pass
             return True
         try:
-            os.rename(src, os.path.join(self.new, name))
+            os.rename(src, spool_path(self.new, name))
             return True
         except OSError:
             return False
@@ -2080,7 +2098,7 @@ class SpoolQueue:
         """Remove <name> wherever it is in this queue."""
         n = 0
         try:
-            os.unlink(os.path.join(self.new, name))
+            os.unlink(spool_path(self.new, name))
             n += 1
         except OSError:
             pass
@@ -2100,14 +2118,14 @@ class SpoolQueue:
             if alive(pid):
                 continue
             src = self.lease_path(name, pid)
-            if os.path.exists(os.path.join(self.new, name)):
+            if os.path.exists(spool_path(self.new, name)):
                 try:
                     os.unlink(src)   # a second copy of something already queued
                 except OSError:
                     pass
                 continue
             try:
-                os.rename(src, os.path.join(self.new, name))
+                os.rename(src, spool_path(self.new, name))
                 n += 1
             except OSError:
                 pass
@@ -2243,7 +2261,7 @@ def filter_accepts(path, env, at=None):
 def _seen_digest(sid):
     """The body digest a seen marker recorded, '' for none, None if unseen."""
     try:
-        fd = os.open(os.path.join(SPOOL_SEEN, sid), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(spool_path(SPOOL_SEEN, sid), os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return None
     try:
@@ -2266,7 +2284,7 @@ INBOX_PHASES = ('new', 'fanned', 'dispatched')
 
 
 def _inbox_path(phase, sid):
-    return os.path.join(SPOOL_INBOX.root, phase, sid)
+    return spool_path(os.path.join(SPOOL_INBOX.root, phase), sid)
 
 
 def _inbox_advance(sid, frm, to):
@@ -2286,7 +2304,7 @@ def _inbox_records():
         for n in found:
             if not SPOOL_NAME.match(n):
                 continue
-            st = _spool_regular(os.path.join(d, n))
+            st = _spool_regular(spool_path(d, n))
             if st is not None:
                 rows.append((phase, n, st.st_mtime))
     rows.sort(key=lambda r: (r[2], r[1]))
@@ -2372,7 +2390,7 @@ def spool_commit(sid, digest=''):
     """Fan-out finished: remember the id (and its body), retire the record."""
     if spool_dedupable(sid):
         os.makedirs(SPOOL_SEEN, mode=0o700, exist_ok=True)
-        fd = os.open(os.path.join(SPOOL_SEEN, sid),
+        fd = os.open(spool_path(SPOOL_SEEN, sid),
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='ascii') as fh:
             fh.write(digest)
@@ -2547,10 +2565,12 @@ def spool_reap(now_s=None):
     except OSError:
         found = []
     for n in found:
-        st = _spool_regular(os.path.join(SPOOL_SEEN, n))
+        if not SPOOL_NAME.match(n):
+            continue
+        st = _spool_regular(spool_path(SPOOL_SEEN, n))
         if st is not None and now_s - st.st_mtime > SPOOL_SEEN_S:
             try:
-                os.unlink(os.path.join(SPOOL_SEEN, n))
+                os.unlink(spool_path(SPOOL_SEEN, n))
             except OSError:
                 pass
     # A fan-out that did not finish and is not running: finish it, from the
@@ -2662,7 +2682,7 @@ def spool_status(now_s=None):
     out['inbox'] = len(_inbox_records())
     items = []
     for name, mtime, where, pid in SPOOL_DISPATCH.aged():
-        path = os.path.join(SPOOL_DISPATCH.new, name) if where == 'new' else \
+        path = spool_path(SPOOL_DISPATCH.new, name) if where == 'new' else \
             SPOOL_DISPATCH.lease_path(name, pid)
         rec = SpoolQueue.load(path) or {}
         meta = rec.get('meta') if isinstance(rec.get('meta'), dict) else {}
@@ -3085,7 +3105,7 @@ class Dispatcher:
         self.spool.recover(alive=lambda pid: False)
         recs = []
         for sid in self.spool.names():
-            rec = SpoolQueue.load(os.path.join(self.spool.new, sid))
+            rec = SpoolQueue.load(spool_path(self.spool.new, sid))
             if (rec is None or rec.get('kind') != 'dispatch' or not isinstance(rec.get('text'), str)
                     or not isinstance(rec.get('meta'), dict)):
                 print('local-webhook: discarding unreadable dispatch record %s' % sid, file=sys.stderr)
