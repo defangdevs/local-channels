@@ -1563,6 +1563,7 @@ class Writer:
 # it is audited, and rate-limited, next to the verified uid.
 
 MAX_REQUEST = 64 * 1024
+MAX_CONNECTIONS = 32
 SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread')
 
 
@@ -1588,6 +1589,9 @@ class Ctx:
 
     def __init__(self, web, store, channels, defaults, bot):
         self.web, self.store, self.channels, self.defaults, self.bot = web, store, channels, defaults, bot
+        # Writer._rate counts audit rows that Writer.audit adds only after the
+        # Slack round trip, so concurrent writes would all pass the caps.
+        self.write_lock = threading.Lock()
 
 
 def execute(w, cmd, rest):
@@ -1636,7 +1640,8 @@ def handle_request(ctx, uid, req):
             return {'ok': True, 'messages': read_thread(ctx.web, *args)}
         w = Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot, session=session)
         w.team = ctx.bot.get('team') or ''
-        return dict(execute(w, cmd, args), ok=True)
+        with ctx.write_lock:
+            return dict(execute(w, cmd, args), ok=True)
     except (Refused, SlackError) as e:
         return {'ok': False, 'error': str(e)}
 
@@ -1685,11 +1690,21 @@ def serve_connection(conn, allowed, ctx):
 
 
 def bind_socket(path):
-    """Bind PATH, replacing a stale socket but never another kind of file."""
+    """Bind PATH, replacing a stale socket but never a live one or another kind of file."""
     import stat
     try:
         if stat.S_ISSOCK(os.lstat(path).st_mode):
-            os.unlink(path)
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(path)
+            except ConnectionRefusedError:
+                os.unlink(path)   # nobody listens: stale
+            except OSError:
+                pass   # not ours to judge; bind below reports it
+            else:
+                raise OSError('a daemon is already serving %s' % path)
+            finally:
+                probe.close()
     except FileNotFoundError:
         pass
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1708,10 +1723,25 @@ def serve_socket(path, allowed, ctx):
     print('local-slack: serving writes on %s for uid(s) %s' % (path, ','.join(map(str, sorted(allowed)))),
           file=sys.stderr, flush=True)
 
+    slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def handle(conn):
+        try:
+            serve_connection(conn, allowed, ctx)
+        finally:
+            slots.release()
+
     def loop():
         while True:
             conn, _ = srv.accept()
-            threading.Thread(target=serve_connection, args=(conn, allowed, ctx), daemon=True).start()
+            if not slots.acquire(blocking=False):
+                conn.close()   # shed load rather than grow without bound
+                continue
+            try:
+                threading.Thread(target=handle, args=(conn,), daemon=True).start()
+            except RuntimeError:
+                slots.release()
+                conn.close()
     threading.Thread(target=loop, daemon=True).start()
 
 

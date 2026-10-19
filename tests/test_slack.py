@@ -1082,6 +1082,49 @@ class TestSocketMode(unittest.TestCase):
         with self.assertRaises(OSError):
             slack.bind_socket(other)
 
+    def test_live_socket_is_not_taken_over(self):
+        srv = slack.bind_socket(self.path)
+        self.addCleanup(srv.close)
+        with self.assertRaises(OSError):
+            slack.bind_socket(self.path)
+
+    def test_concurrent_writes_cannot_exceed_the_cap(self):
+        import threading
+        import time
+        self.cfg['write']['top_level'] = True
+        self.defaults['limits'] = {'session_writes': 1, 'session_window_s': 600, 'top_level_per_hour': 0}
+        inner = self.ctx.web.call
+
+        class Slow:
+            def call(s, *a, **k):
+                time.sleep(0.2)   # the round trip that used to open the race
+                return inner(*a, **k)
+        self.ctx.web = Slow()
+        self.serve({os.getuid()})
+        out = []
+
+        def go():
+            try:
+                slack.socket_call(self.path, 'post', ['C1', 'x'], session='a')
+                out.append('ok')
+            except slack.Refused:
+                out.append('refused')
+        ts = [threading.Thread(target=go) for _ in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(sorted(out), ['ok', 'refused', 'refused', 'refused'])
+
+    def test_connections_beyond_the_bound_are_shed(self):
+        slack.MAX_CONNECTIONS, old = 1, slack.MAX_CONNECTIONS
+        self.addCleanup(setattr, slack, 'MAX_CONNECTIONS', old)
+        self.serve({os.getuid()})
+        import socket as so
+        hold = so.socket(so.AF_UNIX)
+        hold.connect(self.path)   # takes the one slot, sends nothing
+        self.addCleanup(hold.close)
+        with self.assertRaises(slack.Refused):
+            slack.socket_call(self.path, 'thread', ['C1', '1700000009.000900'])
+
     def test_socket_mode_bits(self):
         os.environ['LOCAL_SLACK_SOCKET_MODE'] = '600'
         slack.bind_socket(self.path).close()
