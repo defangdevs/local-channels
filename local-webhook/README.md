@@ -408,6 +408,14 @@ session was started for; it is not identity, and a bare commit `status`
 carries only a `branches` list, which the predicate walker cannot index, so
 that shape gets a `sha` and no `branch`.
 
+Since **0.31.0** a generic (non-GitHub) sender that puts a short string
+`identifier` at the **top level** of its payload gets it in the meta as
+`identifier`, so a spawn command can claim the object with
+`{"path": "identifier", "in": ["<identifier>"]}`. It is 1-200 characters with
+no control characters; anything else is left out. Nested identifiers (Linear's
+`data.identifier`) are not carried, because the claim predicate addresses the
+same top-level path.
+
 Every one of those describes the **event**. `LOCAL_WEBHOOK_SPAWN_CONFIG`
 (0.25.0) describes the **watch** — see
 [Per-watch spawn config](#per-watch-spawn-config-0250) below.
