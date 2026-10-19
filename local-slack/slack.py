@@ -24,10 +24,12 @@
 # on grants are all enforced here, in the code path every write passes.
 import base64
 import hashlib
+import errno
 import http.client
 import json
 import os
 import re
+import select
 import socket
 import sqlite3
 import ssl
@@ -922,17 +924,19 @@ class Bucket:
         self.cap, self.now = float(per_min), now
         self.tokens, self.t = float(per_min), now()
         self.limited = 0
+        self.lock = threading.Lock()   # socket handler threads, the ticker and the WS thread all take
 
     def take(self, write):
-        t = self.now()
-        self.tokens = min(self.cap, self.tokens + (t - self.t) * self.cap / 60.0)
-        self.t = t
-        floor = self.cap * 0.4 if write else 0.0
-        if self.tokens - 1 < floor:
-            self.limited += 1
-            return False
-        self.tokens -= 1
-        return True
+        with self.lock:
+            t = self.now()
+            self.tokens = min(self.cap, self.tokens + (t - self.t) * self.cap / 60.0)
+            self.t = t
+            floor = self.cap * 0.4 if write else 0.0
+            if self.tokens - 1 < floor:
+                self.limited += 1
+                return False
+            self.tokens -= 1
+            return True
 
 
 class SlackError(Exception):
@@ -972,6 +976,8 @@ class Web:
                 self.retry_after = time.time() + int(e.headers.get('Retry-After', '5'))
                 raise SlackError('rate_limited: Retry-After %s' % e.headers.get('Retry-After'))
             raise SlackError('http %d' % e.code)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise SlackError('network_error: %s' % type(e).__name__)
         if not out.get('ok'):
             raise SlackError(out.get('error', 'unknown_error'))
         return out
@@ -1202,7 +1208,10 @@ def run_daemon():
         sys.exit('local-slack: SLACK_BOT_TOKEN and SLACK_APP_TOKEN must both be set '
                  '(environment or a credentials file)')
     sock_path = os.environ.get('LOCAL_SLACK_SOCKET')
-    allowed = parse_uids(os.environ.get('LOCAL_SLACK_ALLOWED_UIDS', '')) if sock_path else None
+    try:
+        allowed = parse_uids(os.environ.get('LOCAL_SLACK_ALLOWED_UIDS', '')) if sock_path else None
+    except ValueError as e:
+        sys.exit('local-slack: %s' % e)
     if sock_path and not allowed:
         sys.exit('local-slack: LOCAL_SLACK_SOCKET is set but LOCAL_SLACK_ALLOWED_UIDS names no user')
     web = Web(bot_token, app_token)
@@ -1562,8 +1571,14 @@ class Writer:
 # deployment's choice. The session name in a request is the caller's own claim:
 # it is audited, and rate-limited, next to the verified uid.
 
+
+
+# Protective bounds. Constants here; read when used, so they can be tuned.
 MAX_REQUEST = 64 * 1024
 MAX_CONNECTIONS = 32
+SERVER_TIMEOUT_S = 10    # a connected peer must send its request within this
+LOCK_WAIT_S = 10         # a write waits this long for the one write lock
+CLIENT_TIMEOUT_S = 90    # must exceed LOCK_WAIT_S plus a Slack round trip
 SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread')
 
 
@@ -1579,7 +1594,9 @@ def parse_uids(spec):
             try:
                 uids.add(pwd.getpwnam(item).pw_uid)
             except KeyError:
-                print('local-slack: unknown user %r in LOCAL_SLACK_ALLOWED_UIDS' % item, file=sys.stderr)
+                # The list was written deliberately: a typo must not start the
+                # daemon with a shorter one.
+                raise ValueError('unknown user %r in LOCAL_SLACK_ALLOWED_UIDS' % item)
     return uids
 
 
@@ -1620,9 +1637,24 @@ def read_thread(web, channel, ts):
     return [{'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')} for m in r.get('messages', [])]
 
 
-def handle_request(ctx, uid, req):
+def client_gone(conn):
+    """True when the peer has hung up (a peek returns EOF). A request nobody is
+    waiting for must not reach Slack, or the agent retries it and it posts twice."""
+    if conn is None:
+        return False
+    try:
+        # select first: a socket with a timeout would otherwise wait it out.
+        if not select.select([conn], [], [], 0)[0]:
+            return False
+        return conn.recv(1, socket.MSG_PEEK) == b''
+    except OSError:
+        return True
+
+
+def handle_request(ctx, uid, req, conn=None):
     """A decoded request from a peer whose uid was already checked. Returns the
-    response dict; Refused and SlackError become ok=false, never a crash."""
+    response dict; every failure becomes ok=false, never a crash and never
+    silence."""
     try:
         cmd, args = req.get('cmd'), req.get('args')
         if cmd not in SOCKET_COMMANDS:
@@ -1640,15 +1672,24 @@ def handle_request(ctx, uid, req):
             return {'ok': True, 'messages': read_thread(ctx.web, *args)}
         w = Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot, session=session)
         w.team = ctx.bot.get('team') or ''
-        with ctx.write_lock:
+        if not ctx.write_lock.acquire(timeout=LOCK_WAIT_S):
+            raise Refused('daemon is busy with another write; try again')
+        try:
+            if client_gone(conn):
+                return {'ok': False, 'error': 'client went away before the write started'}
             return dict(execute(w, cmd, args), ok=True)
+        finally:
+            ctx.write_lock.release()
     except (Refused, SlackError) as e:
         return {'ok': False, 'error': str(e)}
+    except Exception as e:
+        print('local-slack: request failed: %r' % e, file=sys.stderr)
+        return {'ok': False, 'error': 'internal error; see the daemon log'}
 
 
 def peer_uid(conn):
-    pid, uid, gid = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                                       struct.calcsize('3i')))
+    pid, uid, gid = struct.unpack('iII', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                       struct.calcsize('iII')))
     return uid
 
 
@@ -1666,7 +1707,7 @@ def _read_line(conn):
 
 def serve_connection(conn, allowed, ctx):
     with conn:
-        conn.settimeout(10)
+        conn.settimeout(SERVER_TIMEOUT_S)
         try:
             uid = peer_uid(conn)
             if uid not in allowed:
@@ -1681,7 +1722,7 @@ def serve_connection(conn, allowed, ctx):
                 except (ValueError, UnicodeDecodeError):
                     resp = {'ok': False, 'error': 'bad request'}
                 else:
-                    resp = handle_request(ctx, uid, req)
+                    resp = handle_request(ctx, uid, req, conn)
             conn.sendall(json.dumps(resp).encode() + b'\n')
         except Refused as e:
             conn.sendall(json.dumps({'ok': False, 'error': str(e)}).encode() + b'\n')
@@ -1690,30 +1731,59 @@ def serve_connection(conn, allowed, ctx):
 
 
 def bind_socket(path):
-    """Bind PATH, replacing a stale socket but never a live one or another kind of file."""
+    """Bind PATH, replacing a stale socket but never a live one or another kind
+    of file. The socket is bound under a temporary name in the same directory,
+    given its final mode, then renamed into place: no window exists in which it
+    is more open than asked, and a failure never leaves a mode-0 socket at PATH.
+    The directory must be writable only by the daemon's user, because this logic
+    unlinks and renames by path."""
     import stat
+    mode = os.environ.get('LOCAL_SLACK_SOCKET_MODE') or '660'
     try:
-        if stat.S_ISSOCK(os.lstat(path).st_mode):
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                probe.connect(path)
-            except ConnectionRefusedError:
-                os.unlink(path)   # nobody listens: stale
-            except OSError:
-                pass   # not ours to judge; bind below reports it
-            else:
-                raise OSError('a daemon is already serving %s' % path)
-            finally:
-                probe.close()
+        mode_bits = int(mode, 8)
+    except ValueError:
+        raise OSError('LOCAL_SLACK_SOCKET_MODE %r is not an octal mode' % mode)
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISSOCK(st.st_mode):
+            raise OSError('%s exists and is not a socket' % path)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+        except ConnectionRefusedError:
+            os.unlink(path)   # nobody listens: stale
+        except PermissionError:
+            if st.st_uid != os.getuid():
+                raise OSError('cannot judge the socket at %s (not ours)' % path)
+            os.unlink(path)   # ours, and closed to us: a leftover
+        except OSError:
+            pass   # not ours to judge; bind below reports it
+        else:
+            raise OSError('a daemon is already serving %s' % path)
+        finally:
+            probe.close()
     except FileNotFoundError:
         pass
+    tmp = '%s.%d.tmp' % (path, os.getpid())
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old = os.umask(0o777)   # no window where the socket is more open than asked
+    old = os.umask(0o777)
     try:
-        srv.bind(path)
+        srv.bind(tmp)
+    except BaseException:
+        srv.close()
+        raise
     finally:
         os.umask(old)
-    os.chmod(path, int(os.environ.get('LOCAL_SLACK_SOCKET_MODE') or '660', 8))
+    try:
+        os.chmod(tmp, mode_bits)
+        os.rename(tmp, path)
+    except BaseException:
+        srv.close()
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     srv.listen(16)
     return srv
 
@@ -1733,8 +1803,21 @@ def serve_socket(path, allowed, ctx):
 
     def loop():
         while True:
-            conn, _ = srv.accept()
+            try:
+                conn, _ = srv.accept()
+            except OSError as e:
+                # EMFILE and friends are transient; a closed listener is not.
+                print('local-slack: accept failed: %s' % e, file=sys.stderr)
+                if e.errno in (errno.EBADF, errno.ENOTSOCK, errno.EINVAL):
+                    return
+                time.sleep(0.5)
+                continue
             if not slots.acquire(blocking=False):
+                try:
+                    conn.settimeout(1)
+                    conn.sendall(json.dumps({'ok': False, 'error': 'busy'}).encode() + b'\n')
+                except OSError:
+                    pass
                 conn.close()   # shed load rather than grow without bound
                 continue
             try:
@@ -1749,7 +1832,7 @@ def socket_call(path, cmd, args, session=None):
     """The CLI side: one request, one answer. Holds no token."""
     session = session or os.environ.get('AGENT_BOX_SESSION_ID') or os.environ.get('AGENT_BOX_SESSION', '')
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.settimeout(30)
+    c.settimeout(CLIENT_TIMEOUT_S)
     try:
         c.connect(path)
         c.sendall(json.dumps({'cmd': cmd, 'args': args, 'session': session}).encode() + b'\n')
@@ -1760,7 +1843,8 @@ def socket_call(path, cmd, args, session=None):
                 break
             buf += chunk
     except OSError as e:
-        raise Refused('cannot reach the local-slack daemon at %s: %s' % (path, e))
+        raise Refused('no answer from the local-slack daemon at %s: %s (the request may still have '
+                      'been sent; check the thread before retrying)' % (path, e))
     finally:
         c.close()
     try:
@@ -1844,7 +1928,16 @@ def main(argv=None):
         return 1
 
 
+LOCAL_ONLY = ('channels', 'channel', 'purge')
+
+
 def _main(cmd, rest):
+    if os.environ.get('LOCAL_SLACK_SOCKET') and cmd in LOCAL_ONLY:
+        # These read and write THIS user's channels.json and slack.db, which a
+        # daemon running as another user never reads, and `channel add` would
+        # skip its membership and Slack Connect checks without a token.
+        raise Refused('`%s` is not available through the socket: run it as the daemon\'s user with '
+                      'LOCAL_SLACK_SOCKET unset' % cmd)
     channels, defaults = load_config()
     if cmd == 'channels':
         for cid, c in sorted(channels.items()):

@@ -22,15 +22,32 @@ may reach it are the deployment's choice.
   `LOCAL_SLACK_ALLOWED_UIDS=1000,alice` (numbers or user names; empty refuses to
   start). The kernel's `SO_PEERCRED` uid of each caller is checked against that
   list; others get an error before anything runs. `LOCAL_SLACK_SOCKET_MODE`
-  (octal, default `660`) sets the socket's permissions; the parent directory is
-  yours to create.
+  (octal, default `660`; an invalid value stops the daemon before it binds)
+  sets the socket's permissions. The parent directory is yours to create and
+  must be writable only by the daemon's user: the daemon unlinks a stale socket
+  and renames the new one into place by path. An unknown name in the uid list
+  also stops the daemon rather than starting with a shorter list.
 - Tokens: `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` from the environment, else a file
   of that name (lower- or upper-case) in `$CREDENTIALS_DIRECTORY` (systemd
   `LoadCredential=`) or `LOCAL_SLACK_CREDENTIALS_DIR`. The daemon then needs no
   token in its environment.
 - CLI: with `LOCAL_SLACK_SOCKET` set, `slack.py reply|post|status|react|thread`
   talk to the socket, read no token and never call Slack. `doctor` warns when a
-  token is in the caller's environment or a credential file is readable by it.
+  token is in the caller's environment; its credential-file warning only sees
+  `CREDENTIALS_DIRECTORY` / `LOCAL_SLACK_CREDENTIALS_DIR` in the caller's own
+  environment, so it cannot inspect files that belong to the daemon's unit.
+  `channels`, `channel add|rm` and `purge` are refused in socket mode: they
+  would touch the caller's own `channels.json` and `slack.db`, which the daemon
+  never reads. Run them as the daemon's user with `LOCAL_SLACK_SOCKET` unset.
+- Failures: a write waits at most 10 s for the daemon's one write lock, then
+  answers "busy"; a request whose client has already hung up is not sent. A
+  client that times out (90 s) says the request may still have been sent, so
+  check the thread before retrying. Other errors answer "internal error; see the
+  daemon log"; a shed connection answers "busy". The bounds (64 KiB request, 32
+  connections, 10 s read, 10 s lock wait, 90 s client) are constants in
+  `slack.py` (`MAX_REQUEST`, `MAX_CONNECTIONS`, `SERVER_TIMEOUT_S`,
+  `LOCK_WAIT_S`, `CLIENT_TIMEOUT_S`). A listed uid can hold all connection slots
+  for up to 10 s each: availability only, from a uid already trusted to write.
 - Audit: the `session` column is `uid<N>/<session name>`: the uid is verified,
   the name (from `AGENT_BOX_SESSION_ID`) is the caller's own claim. The
   per-session write cap counts per that pair.

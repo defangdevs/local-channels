@@ -1067,7 +1067,11 @@ class TestSocketMode(unittest.TestCase):
         self.addCleanup(setattr, slack, 'credential', orig)
         self.assertEqual(slack.main(['post', 'C1', 'hello']), 0)
         self.assertEqual(slack.main(['thread', 'C1', '1700000009.000900']), 0)
-        self.assertEqual(slack.main(['channel', 'add', 'C2']), 0)
+        # Config and state commands act on THIS user's files, not the daemon's.
+        for argv in (['channel', 'add', 'C2'], ['channel', 'rm', 'C1'], ['channels'], ['purge']):
+            self.assertEqual(slack.main(argv), 1, argv)
+        with open(os.environ['LOCAL_SLACK_CONFIG']) as f:
+            self.assertEqual(list(json.load(f)), ['C1'])
 
     def test_cli_in_socket_mode_without_daemon_refuses(self):
         os.environ['LOCAL_SLACK_SOCKET'] = os.path.join(self.dir, 'none.sock')
@@ -1124,6 +1128,74 @@ class TestSocketMode(unittest.TestCase):
         self.addCleanup(hold.close)
         with self.assertRaises(slack.Refused):
             slack.socket_call(self.path, 'thread', ['C1', '1700000009.000900'])
+
+    def test_a_mode_0_leftover_socket_is_reclaimed(self):
+        import socket as so
+        s = so.socket(so.AF_UNIX)
+        s.bind(self.path)
+        s.close()
+        os.chmod(self.path, 0)
+        slack.bind_socket(self.path).close()
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o660)
+
+    def test_a_bad_socket_mode_fails_before_binding(self):
+        os.environ['LOCAL_SLACK_SOCKET_MODE'] = 'rw-rw'
+        with self.assertRaises(OSError):
+            slack.bind_socket(self.path)
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_a_write_the_client_gave_up_on_is_not_sent(self):
+        import socket as so
+        self.cfg['write']['top_level'] = True
+        a, b = so.socketpair()
+        b.close()                                        # the client left
+        r = slack.handle_request(self.ctx, os.getuid(), {'cmd': 'post', 'args': ['C1', 'x']}, a)
+        a.close()
+        self.assertFalse(r['ok'])
+        self.assertEqual(self.calls, [])
+
+    def test_a_busy_daemon_refuses_instead_of_queueing_forever(self):
+        self.cfg['write']['top_level'] = True
+        slack.LOCK_WAIT_S, old = 0.1, slack.LOCK_WAIT_S
+        self.addCleanup(setattr, slack, 'LOCK_WAIT_S', old)
+        self.ctx.write_lock.acquire()
+        self.addCleanup(self.ctx.write_lock.release)
+        r = slack.handle_request(self.ctx, os.getuid(), {'cmd': 'post', 'args': ['C1', 'x']})
+        self.assertIn('busy', r['error'])
+        self.assertEqual(self.calls, [])
+
+    def test_an_unexpected_exception_is_answered_without_its_text(self):
+        self.cfg['write']['top_level'] = True
+
+        class Boom:
+            def call(s, *a, **k):
+                raise KeyError('secret-detail')
+        self.ctx.web = Boom()
+        r = slack.handle_request(self.ctx, os.getuid(), {'cmd': 'post', 'args': ['C1', 'x']})
+        self.assertEqual(r, {'ok': False, 'error': 'internal error; see the daemon log'})
+
+    def test_a_shed_connection_is_told_busy(self):
+        slack.MAX_CONNECTIONS, old = 1, slack.MAX_CONNECTIONS
+        self.addCleanup(setattr, slack, 'MAX_CONNECTIONS', old)
+        self.serve({os.getuid()})
+        import socket as so
+        hold = so.socket(so.AF_UNIX)
+        hold.connect(self.path)
+        self.addCleanup(hold.close)
+        with self.assertRaises(slack.Refused) as cm:
+            slack.socket_call(self.path, 'thread', ['C1', '1700000009.000900'])
+        self.assertIn('busy', str(cm.exception))
+
+    def test_an_unknown_allowed_user_refuses_to_start(self):
+        with self.assertRaises(ValueError):
+            slack.parse_uids('1000,no-such-user-xyz')
+
+    def test_peer_uid_reads_an_unsigned_uid(self):
+        import socket as so
+        a, b = so.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual(slack.peer_uid(a), os.getuid())
 
     def test_socket_mode_bits(self):
         os.environ['LOCAL_SLACK_SOCKET_MODE'] = '600'
