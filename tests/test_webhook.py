@@ -1644,8 +1644,8 @@ class TestDispatchEvent(StateDirCase):
         self.mod = mod
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT,
                   spawn_config={'profile': 'cheap-triage'})
-        for i in (1, 2, 3):
-            mod.dispatch_event(self.env(action='opened', issue={'number': i, 'title': 't'}))
+        for action in ('opened', 'edited', 'labeled'):
+            mod.dispatch_event(self.env(action=action, issue={'number': 7, 'title': 't'}))
         deadline = time.time() + 5
         while time.time() < deadline:
             if os.path.exists(out):
@@ -1654,6 +1654,30 @@ class TestDispatchEvent(StateDirCase):
         time.sleep(0.5)   # any second spawn would have to be immediate to be a bug
         with open(out, encoding='utf-8') as f:
             self.assertEqual(f.read().count('SPAWN'), 1)
+
+    def test_different_objects_never_share_a_batch(self):
+        """agent-box#887: three assignments used to coalesce into one spawn whose
+        meta named only the last. Each object now gets its own spawn and meta."""
+        out = os.path.join(self.state, 'spawned_objects.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat >/dev/null; echo "N=$LOCAL_WEBHOOK_SPAWN_META"; } >> %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        for i in (92, 94, 96):
+            mod.dispatch_event(self.env(action='assigned', issue={'number': i, 'title': 't'}))
+        deadline = time.time() + 10
+        numbers = []
+        while time.time() < deadline and len(numbers) < 3:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    numbers = [str(json.loads(ln[2:]).get('number')) for ln in f.read().splitlines()
+                               if ln.startswith('N=')]
+            time.sleep(0.05)
+        time.sleep(0.5)   # a fourth spawn would be a bug too
+        with open(out, encoding='utf-8') as f:
+            numbers = [str(json.loads(ln[2:]).get('number')) for ln in f.read().splitlines()
+                       if ln.startswith('N=')]
+        self.assertEqual(sorted(numbers), ['92', '94', '96'])
 
     def test_no_spawn_config_is_an_empty_object_not_absent(self):
         # Same rule as META: a consumer can `.get()` an empty object, but a

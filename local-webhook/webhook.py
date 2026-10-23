@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.33.0'
+VERSION = '0.34.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -3078,7 +3078,34 @@ class Dispatcher:
         # timing, so the window joins the bucket like the config does.
         if win is not None:
             cfg = dict(cfg, **{'\x01window': win})
+        # agent-box#887: events about DIFFERENT objects never share a batch. A
+        # batch hands its spawn command one meta (the newest line's), so three
+        # assignments coalesced into one session were claimed, leased and logged
+        # as the last one only. The object joins the bucket like the config does:
+        # same-object lines (one failing run's check_run and workflow_run, a
+        # comment after its issue) still coalesce, which is what the window is for.
+        obj = Dispatcher._object((meta or {}).get('payload'))
+        if obj:
+            cfg = dict(cfg, **{'\x01object': obj})
         return key if not cfg else '%s\x00%s' % (key, json.dumps(cfg, sort_keys=True))
+
+    # What an event is ABOUT, from the same payload meta a consumer reads as
+    # LOCAL_WEBHOOK_SPAWN_META: an issue/PR number, else the commit a CI event
+    # reports on, else a generic source's identifier. '' when the event names
+    # none (a push, say), which keeps those on the repo's shared bucket. The
+    # value is payload-derived and only ever becomes part of an in-memory key.
+    @staticmethod
+    def _object(payload):
+        if not isinstance(payload, dict):
+            return ''
+        for name in ('number', 'sha', 'identifier'):
+            v = payload.get(name)
+            if isinstance(v, bool) or not isinstance(v, (str, int)):
+                continue
+            v = str(v)
+            if v:
+                return '%s:%s' % (name, v[:200])
+        return ''
 
     # The routing key a bucket belongs to. Every message says what an operator
     # subscribed to, never the internal separation: a log line reading
