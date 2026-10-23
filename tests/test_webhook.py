@@ -2437,7 +2437,7 @@ class TestDispatcher(StateDirCase):
         # arrived while it waited.
         self.assertLess(text.index('declined'), text.index('arrived-while-waiting'))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
-        self.assertIsNone(d.keys['k']['defer_since'])   # streak closed on acceptance
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))   # streak closed on acceptance
 
     def test_a_declined_batch_is_not_retried_in_a_hot_loop_at_window_0(self):  # review of #96
         log = os.path.join(self.state, 'declines.log')
@@ -2462,7 +2462,7 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: not self.pending(d, 'k') and d.active == 0))
         time.sleep(0.5)
         self.assertEqual(self.runs(path), [])           # no second session
-        self.assertIsNone(d.keys['k']['defer_since'])   # streak closed with the batch
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))   # streak closed with the batch
 
     def test_a_permanently_declined_batch_is_dropped_at_the_age_bound(self):
         err = io.StringIO()
@@ -2478,8 +2478,8 @@ class TestDispatcher(StateDirCase):
             lambda: 'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S' in err.getvalue()))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
         self.assertEqual(self.pending(d, 'k'), [])
-        self.assertIsNone(d.keys['k']['defer_since'])
-        self.assertEqual(d.keys['k']['defer_n'], 0)
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))
+        self.assertEqual(d.keys.get('k', {}).get('defer_n', 0), 0)
         log = err.getvalue()
         self.assertIn('declined', log)                  # each refusal said out loud
         self.assertRegex(log, r'declined them \d+ time\(s\) over \d+s')
