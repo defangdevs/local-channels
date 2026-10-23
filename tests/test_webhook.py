@@ -2122,8 +2122,16 @@ class TestDispatchFollowupOwnership(DispatchCase):
                                                     'issue': {'number': 9, 'title': 't'}}))
         self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
         self.wait_for_spawns(2)
-        with open(self.log, encoding='utf-8') as f:
-            self.assertIn('issue #9 opened', f.read())
+        # The recorder prints RUN before it copies stdin, and since 0.34.0 the
+        # issue spawns in a bucket of its own at once, so the line count alone
+        # can be read before its text lands.
+        deadline = time.time() + 5
+        text = ''
+        while time.time() < deadline and 'issue #9 opened' not in text:
+            with open(self.log, encoding='utf-8') as f:
+                text = f.read()
+            time.sleep(0.05)
+        self.assertIn('issue #9 opened', text)
 
 
 class TestOwnershipOptOut(DispatchCase):
