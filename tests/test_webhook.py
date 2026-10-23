@@ -1679,6 +1679,24 @@ class TestDispatchEvent(StateDirCase):
                        if ln.startswith('N=')]
         self.assertEqual(sorted(numbers), ['92', '94', '96'])
 
+    def test_idle_object_buckets_are_retired(self):
+        """A bucket per object must not live for the life of the receiver: once
+        its spawn is done and its window closed it is forgotten."""
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='cat >/dev/null',
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        d = mod.DISPATCHER
+        d.window = 0
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        for i in range(20):
+            mod.dispatch_event(self.env(action='assigned', issue={'number': i, 'title': 't'}))
+        deadline = time.time() + 10
+        while time.time() < deadline and (d.active or len(d.keys) > 1):
+            time.sleep(0.05)
+        with d.lock:
+            d._sweep()
+            self.assertEqual(len(d.keys), 0)
+
     def test_no_spawn_config_is_an_empty_object_not_absent(self):
         # Same rule as META: a consumer can `.get()` an empty object, but a
         # missing variable makes it write a fallback it should not need.
@@ -2385,7 +2403,8 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
         self.assertEqual(self.pending(d, 'k'), [])
-        self.assertIsNone(d.keys['k']['defer_since'])
+        # An idle key is retired (0.34.0), which also means no streak left.
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))
 
     def test_exit_75_keeps_the_batch_and_re_offers_it(self):
         # Exit code branch 2 of 3. Before 0.16.0 this batch was gone: the

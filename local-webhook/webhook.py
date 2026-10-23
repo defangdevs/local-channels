@@ -3121,6 +3121,7 @@ class Dispatcher:
     # sid names the line's durable record in self.spool, when it has one.
     def add(self, key, text, meta, env=None, sid=None):
         with self.lock:
+            self._sweep()
             key = self._bucket(key, meta)
             st = self._state(key)
             st['pending'].append((text, meta, env, sid))
@@ -3348,6 +3349,23 @@ class Dispatcher:
               'oldest event(s); the spawn command is not keeping up'
               % (self._label(key) or '(none)', self.pending_max, over), file=sys.stderr)
 
+    # Call with self.lock held. Forgets buckets with nothing left to do, so the
+    # per-object keys (0.34.0) cannot accumulate for the life of the receiver.
+    # A key is idle once it is not running, holds no pending batch, timer or
+    # deferral streak, and its rate window has closed: from then on it behaves
+    # exactly like a key never seen (the next event spawns at once), so
+    # dropping it changes nothing observable. Keys inside their window stay,
+    # because that window is what coalesces a follow-up burst.
+    def _sweep(self):
+        now = self.clock()
+        for k, st in list(self.keys.items()):
+            if st['running'] or st['pending'] or st['timer'] is not None or st['defer_since'] is not None:
+                continue
+            ls = st['last_start']
+            if ls is not None and now < ls + max(st.get('window', self.window), 0):
+                continue
+            del self.keys[k]
+
     def _on_timer(self, key):
         with self.lock:
             st = self.keys.get(key)
@@ -3416,6 +3434,7 @@ class Dispatcher:
                         self._forget(items)
                 elif not defer:
                     self._forget(items)
+                self._sweep()
                 for k in list(self.keys):  # a freed slot may unblock any key
                     self._pump(k)
 
