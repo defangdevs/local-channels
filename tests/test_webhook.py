@@ -1679,6 +1679,15 @@ class TestDispatchEvent(StateDirCase):
                        if ln.startswith('N=')]
         self.assertEqual(sorted(numbers), ['92', '94', '96'])
 
+    def test_same_object_from_two_sources_or_topics_never_shares_a_batch(self):
+        bucket = self.load().Dispatcher._bucket
+        def meta(source, topic):
+            return {'source': source, 'topic': topic, 'payload': {'number': 7}}
+        base = bucket('k', meta('github', 'github:o/r'))
+        self.assertEqual(base, bucket('k', meta('github', 'github:o/r')))
+        self.assertNotEqual(base, bucket('k', meta('linear', 'github:o/r')))
+        self.assertNotEqual(base, bucket('k', meta('github', 'github:o/*')))
+
     def test_idle_object_buckets_are_retired(self):
         """A bucket per object must not live for the life of the receiver: once
         its spawn is done and its window closed it is forgotten."""

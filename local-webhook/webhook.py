@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.34.0'
+VERSION = '0.34.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -3086,7 +3086,13 @@ class Dispatcher:
         # comment after its issue) still coalesce, which is what the window is for.
         obj = Dispatcher._object((meta or {}).get('payload'))
         if obj:
-            cfg = dict(cfg, **{'\x01object': obj})
+            # The object is only unique within a source and a watch: two senders
+            # can share a routing key and an identifier, and two watches on one
+            # repo with the same config are still two watches whose note and
+            # topic the single spawn meta would otherwise take from the newest.
+            cfg = dict(cfg, **{'\x01object': obj,
+                               '\x01source': (meta or {}).get('source', ''),
+                               '\x01topic': (meta or {}).get('topic', '')})
         return key if not cfg else '%s\x00%s' % (key, json.dumps(cfg, sort_keys=True))
 
     # What an event is ABOUT, from the same payload meta a consumer reads as
