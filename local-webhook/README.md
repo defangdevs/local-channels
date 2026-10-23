@@ -402,6 +402,14 @@ whatever the source's summarizer produced is visible, not that a given key
 exists for every event type; an event with nothing to add still gets `{}`,
 never a missing variable.
 
+`LOCAL_WEBHOOK_SPAWN_METAS` (0.34.0) is the batch-wide twin: a JSON array with
+one such payload meta per surviving event, in arrival order, so a spawn command
+can see every object a coalesced batch names, not only the newest (three PR
+assignments in one batch used to seed a claim for the last one alone). The last
+element equals `LOCAL_WEBHOOK_SPAWN_META`, which is unchanged. It is always
+set — an array of one for a single event — and holds at most 50 entries (the
+newest, when a batch is longer).
+
 Since **0.27.0** a GitHub CI event also carries `sha` — the commit it reports
 on — and, where the payload has one, `branch`. One run reaches a watch as
 several event shapes (`workflow_run`, `workflow_job`, `check_run`,

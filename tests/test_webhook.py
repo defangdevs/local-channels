@@ -2229,6 +2229,22 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
         self.assertIn('count=1', self.runs(path)[0])
 
+    def test_coalesced_batch_exports_every_events_meta(self):
+        path = os.path.join(self.state, 'metas.log')
+        cmd = ('echo "METAS=$LOCAL_WEBHOOK_SPAWN_METAS META=$LOCAL_WEBHOOK_SPAWN_META" >> %s; sleep 1' % path)
+        d = self.mod.Dispatcher(cmd, 2, 0, 30)
+        d.add('k', 'e1', {'key': 'k', 'payload': {'number': '1'}})
+        self.assertTrue(self.wait_for(lambda: os.path.exists(path)))
+        for n in ('2', '3'):
+            d.add('k', 'e' + n, {'key': 'k', 'payload': {'number': n}})
+        def lines():
+            with open(path, encoding='utf-8') as f:
+                return f.read().splitlines()
+        self.assertTrue(self.wait_for(lambda: len(lines()) == 2))
+        first, second = lines()
+        self.assertIn('METAS=[{"number": "1"}] META={"number": "1"}', first)
+        self.assertIn('METAS=[{"number": "2"}, {"number": "3"}] META={"number": "3"}', second)
+
     def test_burst_coalesces_into_one_followup(self):
         path, cmd = self.recorder('burst', sleep=1)
         d = self.mod.Dispatcher(cmd, 2, 0, 30)  # window 0: follow-up gated only by the running spawn

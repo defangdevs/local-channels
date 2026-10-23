@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.33.0'
+VERSION = '0.34.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -608,6 +608,9 @@ def filter_file_lock(path):
 # webhook_subscriptions, and readable from the spawned process's environment by
 # anything that can read /proc. Put a lookup KEY there, never a credential.
 SPAWN_CONFIG_KEY = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+# Most per-event metas LOCAL_WEBHOOK_SPAWN_METAS carries. Past it the OLDEST go,
+# for the same reason _trim drops the oldest lines: the newest state matters most.
+SPAWN_METAS_MAX = 50
 SPAWN_CONFIG_MAX_KEYS = 16
 SPAWN_CONFIG_MAX_VALUE = 300
 
@@ -3345,6 +3348,12 @@ class Dispatcher:
                 # dict, never absent: an empty object beats no variable, since
                 # a consumer can `.get()` a JSON object but not a missing var.
                 'LOCAL_WEBHOOK_SPAWN_META': json.dumps(meta.get('payload') or {}, sort_keys=True),
+                # Every surviving event's payload meta, in arrival order (#101).
+                # The last element equals SPAWN_META. Always set, an array of
+                # one for a single event, so a consumer needs no absent branch.
+                'LOCAL_WEBHOOK_SPAWN_METAS': json.dumps(
+                    [dict((item[1] or {}).get('payload') or {}) for item in items[-SPAWN_METAS_MAX:]],
+                    sort_keys=True),
                 # The WATCH's own config (agent-box#321) — opaque here, meaningful only to
                 # the spawn command. Same never-absent rule as META, and for the
                 # same reason: `.get()` on an empty object works, on a missing
