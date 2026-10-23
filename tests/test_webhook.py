@@ -1679,6 +1679,41 @@ class TestDispatchEvent(StateDirCase):
                        if ln.startswith('N=')]
         self.assertEqual(sorted(numbers), ['92', '94', '96'])
 
+    def test_same_object_from_two_sources_or_topics_never_shares_a_batch(self):
+        bucket = self.load().Dispatcher._bucket
+        def meta(source, topic):
+            return {'source': source, 'topic': topic, 'payload': {'number': 7}}
+        base = bucket('k', meta('github', 'github:o/r'))
+        self.assertEqual(base, bucket('k', meta('github', 'github:o/r')))
+        self.assertNotEqual(base, bucket('k', meta('linear', 'github:o/r')))
+        self.assertNotEqual(base, bucket('k', meta('github', 'github:o/*')))
+
+    def test_two_named_watches_on_one_topic_never_share_a_batch(self):
+        """Same topic, same spawnConfig, same object, different watches: each
+        spawn must carry ITS watch's note, not the newest line's."""
+        out = os.path.join(self.state, 'spawned_named.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat >/dev/null; echo "NOTE=$LOCAL_WEBHOOK_SPAWN_NOTE"; } >> %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        for name, action in (('opened-watch', 'opened'), ('edited-watch', 'edited')):
+            self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', name=name,
+                      note='note for ' + name, include={'path': 'action', 'in': [action]})
+        for action in ('opened', 'edited'):
+            mod.dispatch_event(self.env(action=action, issue={'number': 7, 'title': 't'}))
+        deadline = time.time() + 10
+        notes = []
+        while time.time() < deadline and len(notes) < 2:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    notes = [ln[5:] for ln in f.read().splitlines() if ln.startswith('NOTE=')]
+            time.sleep(0.05)
+        time.sleep(0.5)
+        with open(out, encoding='utf-8') as f:
+            notes = [ln[5:] for ln in f.read().splitlines() if ln.startswith('NOTE=')]
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(any('opened-watch' in n for n in notes), notes)
+        self.assertTrue(any('edited-watch' in n for n in notes), notes)
+
     def test_idle_object_buckets_are_retired(self):
         """A bucket per object must not live for the life of the receiver: once
         its spawn is done and its window closed it is forgotten."""

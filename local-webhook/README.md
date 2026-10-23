@@ -616,6 +616,9 @@ naming the spawn command's environment: a config free to set `PATH` or
   instead of one session whose meta named only the last (agent-box#887). Events
   that name no object (a push) share the repo's bucket as before, and
   `SPAWN_MAX` still bounds what runs at once.
+  Since 0.34.1 the source and the matching watch's topic are part of the key
+  too, so one object id from two senders, or under two watches, never shares a
+  batch.
 - **Dispatch only.** `webhook_subscribe` refuses it on a `deliver_to:"session"`
   subscription, which spawns nothing and would silently ignore it.
 - **Not a secret store.** It is written to `filter.dispatch.json`, echoed by
