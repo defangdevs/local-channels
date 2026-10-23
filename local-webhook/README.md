@@ -609,6 +609,13 @@ naming the spawn command's environment: a config free to set `PATH` or
   session started as the wrong worker. Same-config lines still coalesce, which
   is what the window is for — one failing run emits `check_run` and then
   `workflow_run`, both matched by the same watch, and they stay one session.
+- **Different objects never coalesce either (0.34.0).** The bucket also carries
+  what the event is about - the issue/PR `number`, else the CI `sha`, else a
+  generic source's `identifier` (the same values as `LOCAL_WEBHOOK_SPAWN_META`).
+  Three assignments arriving together are three spawns, each with its own meta,
+  instead of one session whose meta named only the last (agent-box#887). Events
+  that name no object (a push) share the repo's bucket as before, and
+  `SPAWN_MAX` still bounds what runs at once.
 - **Dispatch only.** `webhook_subscribe` refuses it on a `deliver_to:"session"`
   subscription, which spawns nothing and would silently ignore it.
 - **Not a secret store.** It is written to `filter.dispatch.json`, echoed by

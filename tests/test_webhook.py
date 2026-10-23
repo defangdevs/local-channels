@@ -1644,8 +1644,8 @@ class TestDispatchEvent(StateDirCase):
         self.mod = mod
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT,
                   spawn_config={'profile': 'cheap-triage'})
-        for i in (1, 2, 3):
-            mod.dispatch_event(self.env(action='opened', issue={'number': i, 'title': 't'}))
+        for action in ('opened', 'edited', 'labeled'):
+            mod.dispatch_event(self.env(action=action, issue={'number': 7, 'title': 't'}))
         deadline = time.time() + 5
         while time.time() < deadline:
             if os.path.exists(out):
@@ -1654,6 +1654,48 @@ class TestDispatchEvent(StateDirCase):
         time.sleep(0.5)   # any second spawn would have to be immediate to be a bug
         with open(out, encoding='utf-8') as f:
             self.assertEqual(f.read().count('SPAWN'), 1)
+
+    def test_different_objects_never_share_a_batch(self):
+        """agent-box#887: three assignments used to coalesce into one spawn whose
+        meta named only the last. Each object now gets its own spawn and meta."""
+        out = os.path.join(self.state, 'spawned_objects.txt')
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='{ cat >/dev/null; echo "N=$LOCAL_WEBHOOK_SPAWN_META"; } >> %s' % out,
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        for i in (92, 94, 96):
+            mod.dispatch_event(self.env(action='assigned', issue={'number': i, 'title': 't'}))
+        deadline = time.time() + 10
+        numbers = []
+        while time.time() < deadline and len(numbers) < 3:
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    numbers = [str(json.loads(ln[2:]).get('number')) for ln in f.read().splitlines()
+                               if ln.startswith('N=')]
+            time.sleep(0.05)
+        time.sleep(0.5)   # a fourth spawn would be a bug too
+        with open(out, encoding='utf-8') as f:
+            numbers = [str(json.loads(ln[2:]).get('number')) for ln in f.read().splitlines()
+                       if ln.startswith('N=')]
+        self.assertEqual(sorted(numbers), ['92', '94', '96'])
+
+    def test_idle_object_buckets_are_retired(self):
+        """A bucket per object must not live for the life of the receiver: once
+        its spawn is done and its window closed it is forgotten."""
+        mod = self.load(LOCAL_WEBHOOK_SPAWN_CMD='cat >/dev/null',
+                        LOCAL_WEBHOOK_STATE_DIR=self.state)
+        self.mod = mod
+        d = mod.DISPATCHER
+        d.window = 0
+        self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
+        for i in range(20):
+            mod.dispatch_event(self.env(action='assigned', issue={'number': i, 'title': 't'}))
+        deadline = time.time() + 10
+        while time.time() < deadline and (d.active or len(d.keys) > 1):
+            time.sleep(0.05)
+        with d.lock:
+            d._sweep()
+            self.assertEqual(len(d.keys), 0)
 
     def test_no_spawn_config_is_an_empty_object_not_absent(self):
         # Same rule as META: a consumer can `.get()` an empty object, but a
@@ -2080,8 +2122,16 @@ class TestDispatchFollowupOwnership(DispatchCase):
                                                     'issue': {'number': 9, 'title': 't'}}))
         self.fake_live_peer('peer1', [dict(topic='github:o/*', **self.CI_CLAIM)])
         self.wait_for_spawns(2)
-        with open(self.log, encoding='utf-8') as f:
-            self.assertIn('issue #9 opened', f.read())
+        # The recorder prints RUN before it copies stdin, and since 0.34.0 the
+        # issue spawns in a bucket of its own at once, so the line count alone
+        # can be read before its text lands.
+        deadline = time.time() + 5
+        text = ''
+        while time.time() < deadline and 'issue #9 opened' not in text:
+            with open(self.log, encoding='utf-8') as f:
+                text = f.read()
+            time.sleep(0.05)
+        self.assertIn('issue #9 opened', text)
 
 
 class TestOwnershipOptOut(DispatchCase):
@@ -2361,7 +2411,8 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
         self.assertEqual(self.pending(d, 'k'), [])
-        self.assertIsNone(d.keys['k']['defer_since'])
+        # An idle key is retired (0.34.0), which also means no streak left.
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))
 
     def test_exit_75_keeps_the_batch_and_re_offers_it(self):
         # Exit code branch 2 of 3. Before 0.16.0 this batch was gone: the
@@ -2386,7 +2437,7 @@ class TestDispatcher(StateDirCase):
         # arrived while it waited.
         self.assertLess(text.index('declined'), text.index('arrived-while-waiting'))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
-        self.assertIsNone(d.keys['k']['defer_since'])   # streak closed on acceptance
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))   # streak closed on acceptance
 
     def test_a_declined_batch_is_not_retried_in_a_hot_loop_at_window_0(self):  # review of #96
         log = os.path.join(self.state, 'declines.log')
@@ -2411,7 +2462,7 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: not self.pending(d, 'k') and d.active == 0))
         time.sleep(0.5)
         self.assertEqual(self.runs(path), [])           # no second session
-        self.assertIsNone(d.keys['k']['defer_since'])   # streak closed with the batch
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))   # streak closed with the batch
 
     def test_a_permanently_declined_batch_is_dropped_at_the_age_bound(self):
         err = io.StringIO()
@@ -2427,8 +2478,8 @@ class TestDispatcher(StateDirCase):
             lambda: 'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S' in err.getvalue()))
         self.assertTrue(self.wait_for(lambda: d.active == 0))
         self.assertEqual(self.pending(d, 'k'), [])
-        self.assertIsNone(d.keys['k']['defer_since'])
-        self.assertEqual(d.keys['k']['defer_n'], 0)
+        self.assertIsNone(d.keys.get('k', {}).get('defer_since'))
+        self.assertEqual(d.keys.get('k', {}).get('defer_n', 0), 0)
         log = err.getvalue()
         self.assertIn('declined', log)                  # each refusal said out loud
         self.assertRegex(log, r'declined them \d+ time\(s\) over \d+s')
