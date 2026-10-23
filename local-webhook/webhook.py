@@ -3092,7 +3092,8 @@ class Dispatcher:
             # topic the single spawn meta would otherwise take from the newest.
             cfg = dict(cfg, **{'\x01object': obj,
                                '\x01source': (meta or {}).get('source', ''),
-                               '\x01topic': (meta or {}).get('topic', '')})
+                               '\x01topic': (meta or {}).get('topic', ''),
+                               '\x01watch': (meta or {}).get('watchName', '')})
         return key if not cfg else '%s\x00%s' % (key, json.dumps(cfg, sort_keys=True))
 
     # What an event is ABOUT, from the same payload meta a consumer reads as
@@ -3563,6 +3564,9 @@ def dispatch_event(env, sid=None, at=None, enqueue=True):
         'key': env.get('key', ''),
         'event': env.get('event', ''),
         'topic': entry['topic'] if entry else '',
+        # Which of several named watches on one topic matched (0.28.0): part of
+        # the dispatch bucket, so their notes and configs never share a batch.
+        'watchName': entry.get('name', '') if entry else '',
         'note': entry_note(entry) if entry else '',
         # Which watch matched, in the watch's own words (agent-box#321). Flat and separate
         # from 'payload' so the two can never shadow each other.
