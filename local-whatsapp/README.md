@@ -182,3 +182,20 @@ startup and after replies. Copy files elsewhere if they need to be preserved.
 If storage fills, remove older attachments or copy them elsewhere before resending.
 Text acknowledgements, progress updates, and final replies can be sent
 sequentially for one message; repeating an already sent text is a no-op.
+
+## Clear conversation context
+
+Send `@agent /clear` (or just `/clear` when the prefix is disabled). The bridge
+acknowledges the command itself and clears the selected target. Your next
+message starts a new session using the configured WhatsApp profile, or the box
+default profile, with its normal system/workspace instructions and startup
+notice. Previous chat turns are not passed to that conversation. This works
+for both Claude and Codex without relying on a harness-specific slash command.
+
+Old pending messages are retired, queued replies are suppressed, and late text
+or image replies for old messages are rejected. The upload window is closed.
+The reset is persisted across bridge restarts; if clearing the target fails,
+routing stays blocked until `/clear` succeeds on retry. A send already in
+flight cannot be recalled. Old sessions, transcripts and files are retained;
+this command changes routing and does not delete history, cancel work in the
+old session, or erase workspace files and persistent agent instructions.

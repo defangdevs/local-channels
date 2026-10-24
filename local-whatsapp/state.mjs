@@ -97,10 +97,25 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
 
 export function addInbound(state, inbound) {
   if (state.messages[inbound.id]) return false;
-  const pending = Object.values(state.messages).filter((entry) => !entry.reply);
-  if (pending.length >= MAX_PENDING) throw new Error('inbox full');
+  const pending = Object.values(state.messages).filter((entry) => !entry.reply && !entry.clearedAt);
+  if (pending.length >= MAX_PENDING && !(inbound.control && inbound.text === '/clear')) throw new Error('inbox full');
   state.messages[inbound.id] = inbound;
   return true;
+}
+
+// Retain the old transcript/attachments for inspection, but never route old
+// unanswered messages or accept late replies after a context reset.
+export function retireConversation(state, clearId) {
+  if (!Object.hasOwn(state.messages, clearId)) throw new Error('unknown clear message');
+  const clearedAt = new Date().toISOString();
+  for (const entry of Object.values(state.messages)) {
+    if (entry.id === clearId) break;
+    if (entry.clearedAt) continue;
+    entry.clearedAt = clearedAt;
+    if (entry.ack?.status === 'queued') entry.ack.status = 'cleared';
+    if (entry.reply?.status === 'queued') entry.reply.status = 'cleared';
+  }
+  state.acceptMediaUntil = 0;
 }
 
 export function publicMessage(entry) {
@@ -171,6 +186,7 @@ export function cleanMediaInbox(dir, state, removePartial = false) {
 export function queueReply(state, id, text) {
   const entry = Object.hasOwn(state.messages, id) ? state.messages[id] : null;
   if (!entry) throw new Error('unknown message id');
+  if (entry.clearedAt) throw new Error('message belongs to a cleared conversation');
   if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT) {
     throw new Error('reply must be 1-4000 characters');
   }
@@ -235,6 +251,7 @@ export function imageReplyPath(dir, image) {
 export function queueImageReply(state, dir, id, path, caption = '') {
   const entry = Object.hasOwn(state.messages, id) ? state.messages[id] : null;
   if (!entry) throw new Error('unknown message id');
+  if (entry.clearedAt) throw new Error('message belongs to a cleared conversation');
   if (typeof caption !== 'string' || caption.length > MAX_TEXT) throw new Error('caption must be at most 4000 characters');
   if (!entry.reply && Object.values(state.messages).filter((message) => message.reply?.status === 'queued').length >= MAX_OUTBOX) {
     throw new Error('reply outbox full');

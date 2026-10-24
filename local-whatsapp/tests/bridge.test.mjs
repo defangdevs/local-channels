@@ -72,6 +72,7 @@ esac
           message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: process.env.FAKE_MEDIA_CAPTION ?? ('@' + userInfo().username + ' inspect this'), mimetype: process.env.FAKE_MEDIA === 'videoMessage' ? 'video/mp4' : 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
         }] });
       }, Number(process.env.FAKE_INBOUND_DELAY || 100));
+      if (process.env.FAKE_FOLLOWUP_TEXT) setTimeout(() => ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'AFTER-CLEAR', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, message: { conversation: process.env.FAKE_FOLLOWUP_TEXT } }] }), 500);
       return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
         async requestPairingCode() {
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
@@ -448,3 +449,106 @@ test(`receive-files CLI enables captionless ${kind} and persists its expiry`, as
   }
 });
 }
+
+for (const harness of ['claude', 'codex']) {
+for (const plain of [false, true]) {
+test(`/clear resets ${harness} routing (${plain ? 'plain' : 'prefixed'}) and only sends fresh context`, async () => {
+  const f = setup();
+  const clearedFile = join(f.dir, 'cleared');
+  const spawnedFile = join(f.dir, 'spawned');
+  const argsFile = join(f.dir, 'args');
+  const codexBin = join(f.dir, 'codex');
+  writeFileSync(codexBin, '#!/bin/sh\nprintf "%s\\n" "$@" >> "$CODEX_ARGS_FILE"\n');
+  chmodSync(codexBin, 0o700);
+  writeFileSync(f.sessionBin, `#!/bin/sh
+case "$2" in
+  candidates) printf '%s\\n' '[{"name":"fresh","harness":"${harness}","stopped":false,"selected":false}]' ;;
+  clear) printf 'cleared' > "$CLEARED_FILE"; printf '%s\\n' '{}' ;;
+  spawn) printf '%s' "$3" > "$SPAWNED_FILE"; printf '%s\\n' '{"name":"fresh","harness":"${harness}","stopped":false}' ;;
+esac
+`);
+  writeFileSync(join(f.state, 'target.json'), JSON.stringify({ harness, session: 'old', name: 'old' }));
+  writeFileSync(join(f.state, 'config.json'), JSON.stringify({ profile: 'phone-agent' }));
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'SECRET_OLD_CONTEXT', reply: null },
+  }, sentIds: {}, acceptMediaUntil: Date.now() + 600000 }));
+  const prefix = plain ? '' : '@' + userInfo().username + ' ';
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, LOCAL_WHATSAPP_DEBUG: '',
+    FAKE_OUT: f.fakeOut, LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin,
+    LOCAL_WHATSAPP_CODEX_BIN: codexBin, CODEX_ARGS_FILE: argsFile, CLEARED_FILE: clearedFile,
+    SPAWNED_FILE: spawnedFile, LOCAL_WHATSAPP_SESSION: userInfo().username + '-fresh',
+    FAKE_INBOUND_TEXT: prefix + '/clear', FAKE_FOLLOWUP_TEXT: prefix + 'fresh question',
+    ...(plain ? { LOCAL_WHATSAPP_PREFIX: '' } : {}) };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+  let peer;
+  let output = '';
+  try {
+    if (harness === 'claude') {
+      peer = spawn(process.execPath, [peerSource], { env });
+      peer.stdout.on('data', (chunk) => { output += chunk; });
+      peer.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+    }
+    await waitUntil(() => existsSync(clearedFile), 'selection cleared');
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('Context cleared'), 'clear confirmation');
+    await waitUntil(() => existsSync(spawnedFile), 'fresh profile spawn');
+    if (harness === 'codex') {
+      await waitUntil(() => existsSync(argsFile), 'fresh Codex queue');
+      output = readFileSync(argsFile, 'utf8');
+    } else {
+      await waitUntil(() => output.includes('fresh question'), 'fresh Claude delivery');
+    }
+    assert.match(output, /fresh question/);
+    assert.doesNotMatch(output, /SECRET_OLD_CONTEXT|\/clear/);
+    assert.equal(readFileSync(spawnedFile, 'utf8'), 'phone-agent');
+    const state = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(state.messages.old.clearedAt);
+    assert.equal(state.acceptMediaUntil, 0);
+    assert.equal(state.resetPending, null);
+    const late = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', 'old', 'late reply'], { env, encoding: 'utf8' });
+    assert.equal(late.status, 1);
+    assert.match(late.stderr, /cleared conversation/);
+  } finally {
+    if (peer) await stop(peer);
+    await stop(daemon);
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+}
+}
+
+test('/clear failure persists a routing barrier and cannot leak old or new messages after restart', async () => {
+  const f = setup();
+  const spawned = join(f.dir, 'spawned');
+  writeFileSync(f.sessionBin, `#!/bin/sh
+case "$2" in
+  candidates) printf '%s\\n' '[]' ;;
+  clear) echo 'selection clear failed' >&2; exit 1 ;;
+  spawn) touch "$SPAWNED"; printf '%s\\n' '{"name":"fresh","harness":"codex","stopped":false}' ;;
+esac
+`);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'old context', reply: null },
+  }, sentIds: {}, resetPending: 'recovering' }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state,
+    LOCAL_WHATSAPP_DEBUG: '', LOCAL_WHATSAPP_PREFIX: '',
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_OUT: f.fakeOut,
+    FAKE_INBOUND_TEXT: '/clear', FAKE_FOLLOWUP_TEXT: 'new question', SPAWNED: spawned };
+  let daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('selection clear failed'), 'failed-clear reply');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    let saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(saved.resetPending); assert.ok(saved.messages.old.clearedAt);
+    assert.equal(existsSync(spawned), false);
+    await stop(daemon);
+    daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+    await waitUntil(() => existsSync(join(f.state, 'bridge.sock')), 'restarted bridge');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(existsSync(spawned), false);
+    saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(saved.resetPending);
+  } finally {
+    await stop(daemon);
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
