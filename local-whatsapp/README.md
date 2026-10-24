@@ -185,17 +185,26 @@ sequentially for one message; repeating an already sent text is a no-op.
 
 ## Clear conversation context
 
-Send `@agent /clear` (or just `/clear` when the prefix is disabled). The bridge
-acknowledges the command itself and clears the selected target. Your next
-message starts a new session using the configured WhatsApp profile, or the box
-default profile, with its normal system/workspace instructions and startup
-notice. Previous chat turns are not passed to that conversation. This works
-for both Claude and Codex without relying on a harness-specific slash command.
+Send `@agent /clear` (or just `/clear` when the prefix is disabled). For a
+paginated Codex thread, the bridge connects to the **already running**
+app-server over its private Unix WebSocket and calls native `thread/revert`
+before the first turn. This removes all chat turns from model context and
+durable thread history while retaining system/workspace instructions and
+settings. The same thread id, selected Agentbox session, and harness process
+are kept. No thread or session is spawned, activated, or restarted.
 
-Old pending messages are retired, queued replies are suppressed, and late text
-or image replies for old messages are rejected. The upload window is closed.
-The reset is persisted across bridge restarts; if clearing the target fails,
-routing stays blocked until `/clear` succeeds on retry. A send already in
-flight cannot be recalled. Old sessions, transcripts and files are retained;
-this command changes routing and does not delete history, cancel work in the
-old session, or erase workspace files and persistent agent instructions.
+The default socket is `$CODEX_HOME/app-server-control/app-server-control.sock`
+(`~/.codex` when CODEX_HOME is unset); override it with the absolute
+`LOCAL_WHATSAPP_CODEX_SOCKET` path when needed. The running server must support
+`thread/read`, `thread/resume`, `thread/turns/list`, and `thread/revert`.
+An already empty thread is a no-op. Claude channel connections and legacy
+Codex histories currently report an unsupported-operation error instead of
+silently starting another harness; the current conversation remains usable. If the server rejects clearing an active
+turn, retry `/clear` once that turn has finished.
+
+Old pending WhatsApp messages are retired, queued replies are suppressed,
+and late text/image replies for old messages are rejected. The upload window
+closes. A persisted routing barrier blocks input after a failed or interrupted
+reset until `/clear` succeeds on retry. Sends already in flight cannot be
+recalled. Workspace files are unchanged; reverting conversation history does
+not undo file changes or other external actions.

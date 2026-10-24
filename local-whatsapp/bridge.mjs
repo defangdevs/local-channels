@@ -6,6 +6,7 @@ import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
+import WebSocket from 'ws';
 import pino from 'pino';
 import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
@@ -72,6 +73,66 @@ function setTarget(harness, session, name) {
   const temporary = `${targetPath}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify({ harness, session, ...(name ? { name } : {}) }), { mode: 0o600 });
   renameSync(temporary, targetPath);
+}
+
+// Attach directly to the existing Codex daemon. Never launch a replacement
+// harness or use the session manager's spawn/activate/clear lifecycle here.
+async function resetCodexThread(binding) {
+  const socket = process.env.LOCAL_WHATSAPP_CODEX_SOCKET ||
+    join(process.env.CODEX_HOME || join(process.env.HOME, '.codex'), 'app-server-control', 'app-server-control.sock');
+  if (!isAbsolute(socket) || socket.includes(':')) throw new Error('Codex control socket must be an absolute Unix path');
+  const ws = new WebSocket(`ws+unix://${socket}:/`, { handshakeTimeout: 10000, maxPayload: 8 * 1024 * 1024 });
+  const pending = new Map();
+  let serial = 0;
+  const rejectPending = (error) => {
+    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error); }
+    pending.clear();
+  };
+  ws.on('error', rejectPending);
+  ws.on('close', () => rejectPending(new Error('Codex control connection closed')));
+  ws.on('message', (raw) => {
+    try {
+      const message = JSON.parse(raw.toString());
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id); clearTimeout(request.timer);
+      if (message.error) request.reject(new Error(message.error.message || 'Codex reset failed'));
+      else request.resolve(message.result);
+    } catch (error) { rejectPending(error); }
+  });
+  function rpc(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = ++serial;
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Codex ${method} timed out`)); }, 30000);
+      pending.set(id, { resolve, reject, timer });
+      ws.send(JSON.stringify({ id, method, params }), (error) => {
+        if (error) { clearTimeout(timer); pending.delete(id); reject(error); }
+      });
+    });
+  }
+  try {
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    await rpc('initialize', { clientInfo: { name: 'local_whatsapp', version: '0.5.0' }, capabilities: { experimentalApi: true } });
+    ws.send(JSON.stringify({ method: 'initialized', params: {} }));
+    const { thread } = await rpc('thread/read', { threadId: binding.session, includeTurns: false });
+    if (!thread || thread.id !== binding.session) throw new Error('Codex returned a different current thread');
+    if (thread.historyMode !== 'paginated') throw Object.assign(new Error('In-process clear requires a paginated Codex thread; context was not changed'), { resetUnsupported: true });
+    await rpc('thread/resume', { threadId: thread.id, excludeTurns: true,
+      ...(thread.model ? { model: thread.model } : {}), ...(thread.modelProvider ? { modelProvider: thread.modelProvider } : {}) });
+    const page = await rpc('thread/turns/list', { threadId: thread.id, sortDirection: 'asc', limit: 1 });
+    if (!Array.isArray(page.data)) throw new Error('Invalid Codex history response');
+    if (page.data.length) {
+      const firstTurn = page.data[0].id;
+      if (typeof firstTurn !== 'string' || !firstTurn) throw new Error('Invalid Codex first turn');
+      // Native revert removes this turn and every later turn from the model
+      // context and durable thread history. It leaves instructions/settings,
+      // the thread identity and the existing harness process intact.
+      await rpc('thread/revert', { threadId: thread.id, beforeTurnId: firstTurn });
+    }
+    const checked = await rpc('thread/turns/list', { threadId: thread.id, sortDirection: 'asc', limit: 1 });
+    if (!Array.isArray(checked.data) || checked.data.length) throw new Error('Codex history is not empty after clear');
+    return binding;
+  } finally { rejectPending(new Error('Codex reset finished')); ws.close(); }
 }
 
 async function sessions() {
@@ -359,11 +420,14 @@ async function serve() {
             saveState(dir, state);
             try {
               if (dispatchFinished) await dispatchFinished;
+              const binding = target();
+              if (!binding) throw Object.assign(new Error('No selected conversation to clear'), { resetUnsupported: true });
+              if (binding.harness !== 'codex') throw Object.assign(new Error('In-process clear is not supported for this Claude connection; context was not changed and no replacement harness was started'), { resetUnsupported: true });
+              await resetCodexThread(binding);
               retireConversation(state, inbound.id);
               saveState(dir, state);
-              await clearTarget();
               state.resetPending = Object.values(state.messages).find((entry) => entry.id !== inbound.id && entry.control && entry.text === '/clear' && !entry.reply && !entry.clearedAt)?.id || null;
-              queueReply(state, inbound.id, 'Context cleared. Your next message starts a fresh conversation with the configured profile and normal system/workspace instructions. Previous chat messages will not be included.');
+              queueReply(state, inbound.id, 'Context cleared in the existing Codex thread and process. The system/workspace instructions and settings remain; previous chat turns have been removed.');
             } finally { resetting = false; }
             saveState(dir, state);
             cleanImageOutbox(dir, state);
@@ -397,7 +461,10 @@ async function serve() {
               throw new Error('use /target NAME, /target auto, or /profile NAME|default');
             }
           }
-        } catch (error) { queueReply(state, inbound.id, `Box: ${error.message}`); }
+        } catch (error) {
+          if (error.resetUnsupported) state.resetPending = null;
+          queueReply(state, inbound.id, `Box: ${error.message}`);
+        }
         saveState(dir, state);
       }
       await drainReplies();
