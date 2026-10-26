@@ -1002,3 +1002,67 @@ timers calling `emit`) is
 When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress
 adopts the passed fd (fd 3) and both `LOCAL_WEBHOOK_HTTP_SOCK` and
 `LOCAL_WEBHOOK_PORT` are ignored — the `.socket` unit owns the path and perms.
+
+## Full payloads and email (0.35.0)
+
+Sources can set `"retainPayload": true` in `sources.json`. The existing
+inbox still owns delivery; a private `spool/content/new/` record retains the
+complete normalized payload after its queue copies are consumed. Both peer
+notifications and standing-watch prompts include a content ID and expiry.
+Run `python3 webhook.py read-content ID` to read the full JSON. Its
+`untrusted: true` applies to all payload text, even though the producer was
+signature-verified. Missing or expired content exits 1. Path traversal IDs
+are rejected. Content stays private to the Linux user (0700 directories,
+0600 files), never in a served downloads directory.
+
+Retention defaults to 24 hours from acceptance, bounded by 128 MiB and 2,000
+records. Override with `LOCAL_WEBHOOK_CONTENT_TTL_S`,
+`LOCAL_WEBHOOK_CONTENT_MAX_BYTES`, and `LOCAL_WEBHOOK_CONTENT_MAX`. The
+existing reaper removes expired content and `status.spool.content` reports
+usage and limits. Capacity exhaustion or a failed content write refuses new
+retained deliveries with HTTP 500, allowing intake to retry; unexpired
+content is not evicted to make room. `retainPayload` with the spool disabled
+returns 503. These bounds cover retained content, not the entire inbox (#105).
+References can expire while work is still queued: consumers must handle
+that result, and operators should size retention for their expected delays.
+
+For reliable local producers, `emit SOURCE - --delivery-id ID` accepts a
+stable 1-100 character ID (`[A-Za-z0-9._-]`, first character alphanumeric).
+Retries must reuse both ID and byte-identical JSON; the inbox already
+suppresses matching ID-plus-body deliveries. Omitting the option preserves
+the random-per-invocation behavior. Delivery remains at-least-once.
+
+### Email event contract
+
+Intake is outside this plugin (agent-box#231). It publishes one event per
+accepted local envelope recipient into that recipient Linux user's bus:
+
+```json
+{"email":{"secretFile":"email.secret","format":"generic",
+          "keyPath":"recipient","senderPath":"envelopeSender",
+          "retainPayload":true}}
+```
+
+The object above is the entry under `sources`. The event is `email.received`;
+the routing topic is `email:<recipient>`, such as
+`email:agent@40.70.78.11.defangstation.com`. The normalized payload contains:
+
+- `recipient`, `envelopeSender`, `receivedAt`, `title` (subject), and
+  `summary` (short body preview);
+- `headers`: display `from`, `to`, `cc`, `messageId`, `inReplyTo`, `references`;
+- `text` and `html` alternatives, `attachments` with display filename,
+  content type and base64 bytes, and `rawMimeBase64` for the original MIME;
+- `senderAuthenticated: false` unless trusted intake actually verifies it.
+
+Envelope recipients, including Bcc, select the route. Header `To` and
+sender-supplied `Authentication-Results` never authorize delivery. Intake
+must reject absent/invalid envelope recipients rather than fall back to
+headers. `From` and envelope sender are claims, not authenticated people;
+local HMAC proves only which producer handed the event to the bus. MIME
+limits and local recipient ownership are enforced by intake. Filenames are
+display data, not paths to extract automatically.
+
+Use ordinary subscriptions and standing watches, with their normal filters,
+profiles, ownership and admission. This feature adds no implicit watch or
+email-specific dispatcher. Subaddress/alias normalization is an explicit
+intake choice, and the original recipient must be preserved when normalized.
