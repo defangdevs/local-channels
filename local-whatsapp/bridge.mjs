@@ -93,6 +93,8 @@ async function resetCodexThread(binding) {
   ws.on('message', (raw) => {
     try {
       const message = JSON.parse(raw.toString());
+      // Server-initiated requests carry a method and share the id space; never treat one as a response.
+      if (message.method !== undefined) return;
       const request = pending.get(message.id);
       if (!request) return;
       pending.delete(message.id); clearTimeout(request.timer);

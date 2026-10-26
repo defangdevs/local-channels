@@ -496,7 +496,11 @@ esac
       reasoningEffort: 'high', runtimeWorkspaceRoots: [f.dir],
       sandbox: { type: 'workspaceWrite', writableRoots: [f.dir], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
     };
-    else if (m.method === 'thread/turns/list') result = { data: historyEmpty ? [] : [{ id: 'first-turn' }], nextCursor: null };
+    else if (m.method === 'thread/turns/list') {
+      // A server request that reuses the pending response id must not be mistaken for the response.
+      ws.send(JSON.stringify({ id: m.id, method: 'item/commandExecution/requestApproval', params: {} }));
+      result = { data: historyEmpty ? [] : [{ id: 'first-turn' }], nextCursor: null };
+    }
     else if (m.method === 'thread/revert') {
       if (rejectStart) { ws.send(JSON.stringify({ id: m.id, error: { code: -1, message: 'reset rejected' } })); return; }
       historyEmpty = true;
