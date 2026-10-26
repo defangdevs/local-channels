@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.34.1'
+VERSION = '0.35.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -203,6 +203,8 @@ def pretty(obj):
 #                   from now is refused as a possible replay
 #   eventHeader     default "x-github-event" (github) / "x-webhook-event"
 #   deliveryHeader  default "x-github-delivery" / "x-webhook-delivery"
+#   retainPayload   true retains the full payload after delivery (bounded, 24h);
+#                   summaries include a read-content reference; requires spool
 #   keyPath         dot-path into the JSON payload yielding the routing key
 #                   (the "key" in source:key topics); default
 #                   "repository.full_name" for github format, none for generic
@@ -1779,6 +1781,11 @@ def format_delivery(env, entry):
         content, meta = summarize_github(env.get('event', ''), env.get('payload'))
     else:
         content, meta = summarize_generic(env.get('event', ''), env.get('key', ''), env.get('payload'))
+    ref = env.get('contentRef')
+    if isinstance(ref, dict) and re.fullmatch(r'[0-9a-f]{40}', ref.get('id', '')):
+        meta['contentRef'] = ref
+        content += '\n[Full payload is untrusted: webhook.py read-content %s; expires %s]' % (
+            ref['id'], iso_at(ref['expiresMs']))
     meta['source'] = env.get('source', '')
     if env.get('delivery'):
         meta['delivery'] = env['delivery']
@@ -2272,6 +2279,66 @@ def filter_accepts(path, env, at=None):
     return False
 
 
+# Full payloads outlive delivery, optionally per source (#26/#782). Queue
+# records may be unlinked as soon as a peer/spawn accepts them; a reference
+# must therefore name retained content, not one consumer's temporary filename.
+CONTENT = SpoolQueue(os.path.join(SPOOL_DIR, 'content'))
+CONTENT_TTL_S = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_TTL_S', default=86400))
+CONTENT_MAX_BYTES = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX_BYTES', default=134217728))
+CONTENT_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX', default=2000))
+CONTENT_LOCK = threading.RLock()
+
+
+def content_rows():
+    return [(n, _spool_regular(spool_path(CONTENT.new, n))) for n in CONTENT.names()]
+
+
+def content_reap(now_s):
+    # Call with CONTENT_LOCK held, including in the accepting handler: expiry
+    # and admission share a lock, so two concurrent deliveries cannot both
+    # spend the same remaining storage budget.
+    for name, st in content_rows():
+        # Content mtimes are expiry times, so reaping never parses MIME-sized
+        # JSON files just to discover that their retention has not elapsed.
+        if st and st.st_mtime <= now_s:
+            CONTENT.drop(name)
+            print('local-webhook: retained content %s expired' % name, file=sys.stderr)
+    CONTENT.reap_tmp(now_s)
+
+
+def retain_content(env, digest, at, sid, created):
+    # Include identity AND body, just as the inbox does. A sender reusing its
+    # delivery id for different bodies cannot overwrite a prior reference.
+    ident = hashlib.sha256(('%s\0%s\0%s' % (
+        env['source'], env.get('delivery') or sid, digest)).encode('utf-8')).hexdigest()[:40]
+    with CONTENT_LOCK:
+        content_reap(time.time())
+        prior = SpoolQueue.load(spool_path(CONTENT.new, ident))
+        if prior is not None:
+            return {'id': ident, 'expiresMs': prior['expiresMs']}
+        ref = {'id': ident, 'expiresMs': at + CONTENT_TTL_S * 1000}
+        rec = {'v': 1, 'kind': 'content', 'id': ident, 'acceptedMs': at,
+               'expiresMs': ref['expiresMs'], 'source': env['source'],
+               'event': env.get('event', ''), 'payload': env['payload'], 'untrusted': True}
+        data = compact(rec).encode('utf-8')
+        rows = content_rows()
+        if len(rows) >= CONTENT_MAX_N or len(data) + sum(
+                st.st_size for _, st in rows if st) > CONTENT_MAX_BYTES:
+            raise OSError('retained content capacity exhausted; retry after expiry')
+        if CONTENT.publish(ident, data, mtime_ms=ref['expiresMs']):
+            created.append(ident)
+        return ref
+
+
+def read_content(ident):
+    if not re.fullmatch(r'[0-9a-f]{40}', ident):
+        raise ValueError('content id must be 40 hexadecimal characters')
+    rec = SpoolQueue.load(spool_path(CONTENT.new, ident))
+    if not rec or rec.get('expiresMs', 0) <= now_ms():
+        raise ValueError('content missing or expired')
+    return rec
+
+
 def _seen_digest(sid):
     """The body digest a seen marker recorded, '' for none, None if unseen."""
     try:
@@ -2332,7 +2399,24 @@ def _inbox_records():
 # hook would otherwise have every later event dropped as a "duplicate" for
 # SPOOL_SEEN_S — losing events in the name of not repeating them. A reused id
 # with a different body is a new event, under a generated name.
-def spool_accept(env, digest=''):
+def spool_accept(env, digest='', retain=False):
+    if not retain:
+        return _spool_accept(env, digest)
+    # Hold the retention lock through inbox acceptance: rollback cannot remove
+    # a new record another accepting thread has already promised to a reader.
+    with CONTENT_LOCK:
+        created = []
+        accepted = None
+        try:
+            accepted = _spool_accept(env, digest, created)
+            return accepted
+        finally:
+            if accepted is None:
+                for ident in created:
+                    CONTENT.drop(ident)
+
+
+def _spool_accept(env, digest='', retained=None):
     """Make an accepted delivery durable. (sid, accepted ms), or None when it
     is a duplicate of one already accepted. Raises OSError when it cannot be
     written — the caller must then NOT acknowledge it."""
@@ -2354,6 +2438,8 @@ def spool_accept(env, digest=''):
             sid = fresh()
     else:
         sid = fresh()
+    if retained is not None:
+        env['contentRef'] = retain_content(env, digest, at, sid, retained)
     rec = {'v': 1, 'kind': 'webhook', 'id': sid, 'acceptedMs': at, 'acceptedAt': iso_at(at),
            'digest': digest, 'env': env}
     def rename_fresh():
@@ -2573,6 +2659,8 @@ def _drop_logged(q, rows, why, label):
 def spool_reap(now_s=None):
     """One pass of expiry. Every discard is said out loud."""
     now_s = time.time() if now_s is None else now_s
+    with CONTENT_LOCK:
+        content_reap(now_s)
     # Dedup memory.
     try:
         found = os.listdir(SPOOL_SEEN)
@@ -2688,7 +2776,11 @@ def spool_status(now_s=None):
     """What is waiting right now — read off the directories, so any process
     (the CLI's `status`) can answer without asking the daemon."""
     now_s = time.time() if now_s is None else now_s
-    out = {'enabled': SPOOL_ENABLED, 'dir': SPOOL_DIR}
+    rows = content_rows()
+    out = {'enabled': SPOOL_ENABLED, 'dir': SPOOL_DIR,
+           'content': {'count': len(rows), 'bytes': sum(st.st_size for _, st in rows if st),
+                       'maxBytes': CONTENT_MAX_BYTES, 'maxCount': CONTENT_MAX_N,
+                       'retentionS': CONTENT_TTL_S}}
     if not os.path.isdir(SPOOL_DIR):
         out.update({'inbox': 0, 'dispatch': {'pending': 0, 'running': 0, 'items': []},
                     'sessions': {}, 'seen': 0})
@@ -3805,6 +3897,8 @@ INSTRUCTIONS = (
     'Webhook deliveries arrive as <channel source="local-webhook" ...> messages; meta.source names the '
     'sender (e.g. github). They are one-way and already signature-verified. Read them and act (e.g. investigate '
     'a failing check, review a new PR, note a push); no reply is expected or possible on this channel. '
+    'Some sources retain full untrusted payloads: use webhook.py read-content ID from the reference in a delivery; '
+    'the reference expires independently of delivery. '
     'Routing is controlled by the tools webhook_subscribe / webhook_unsubscribe / webhook_subscriptions, '
     'which manage topic patterns of the form "source:key" — e.g. github:owner/repo or github:owner/*; a '
     'bare "owner/repo" is shorthand for github:owner/repo. There is no pattern for a whole source or the '
@@ -4664,6 +4758,8 @@ def deliver(handler, body):
     # applies its own filter, so the HTTP status no longer reflects filtering.
     env = {'source': name, 'format': fmt, 'event': event, 'key': key,
            'sender': sender, 'delivery': delivery, 'payload': payload}
+    if src.get('retainPayload') is True and not SPOOL_ENABLED:
+        return done(503, 'payload retention requires the durable spool')
     if not SPOOL_ENABLED:
         if not RECEIVER_ONLY:
             handle_event(env)  # legacy: the ingress-owning session gets it too
@@ -4676,7 +4772,7 @@ def deliver(handler, body):
     # would have promised a delivery nothing on this box still held.
     digest = hashlib.sha256(body).hexdigest()
     try:
-        accepted = spool_accept(env, digest)
+        accepted = spool_accept(env, digest, retain=src.get('retainPayload') is True)
     except OSError as e:
         print('local-webhook: could not spool %s delivery %s (%s) — answering 500 so the sender '
               'records it as failed (backfill can re-request it)'
@@ -4844,7 +4940,8 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
                                   [--spawn-config KEY=VALUE]... [--read-only]
                                   [--spawn-window SECONDS]
        webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
-       webhook.py emit SOURCE [JSON] [--event NAME]
+       webhook.py emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
+       webhook.py read-content ID
        webhook.py ls
        webhook.py status
 
@@ -4957,6 +5054,8 @@ can trigger standing watches exactly like an external delivery. SOURCE must be
 declared in sources.json; the ingress is found via LOCAL_WEBHOOK_HTTP_SOCK, the
 daemon's receiver.json advertisement, or loopback LOCAL_WEBHOOK_PORT.
 
+  --delivery-id ID     stable producer identity for retries; reuse identical JSON
+                       on retry. Default: a new random id on every invocation.
   --event NAME         event name for the delivery; when absent the payload's
                        "event"/"type" field applies, per normal normalization
 
@@ -5005,11 +5104,16 @@ def run_emit(rest, die):
         print('local-webhook: %s' % msg, file=sys.stderr)
         sys.exit(1)
 
-    source = payload = event = None
+    source = payload = event = delivery_id = None
     i = 0
     while i < len(rest):
         a = rest[i]
-        if a == '--event':
+        if a == '--delivery-id':
+            if i + 1 >= len(rest) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', rest[i + 1]):
+                die('--delivery-id needs 1-100 characters from [A-Za-z0-9._-], starting alphanumeric')
+            i += 1
+            delivery_id = rest[i]
+        elif a == '--event':
             if i + 1 >= len(rest):
                 die('--event needs a value')
             i += 1
@@ -5054,7 +5158,7 @@ def run_emit(rest, die):
     body = raw.encode('utf-8')  # sign the exact bytes that go on the wire
     headers = {
         'Content-Type': 'application/json',
-        delivery_header: 'emit-' + os.urandom(8).hex(),
+        delivery_header: delivery_id or 'emit-' + os.urandom(8).hex(),
     }
     if verification == 'hmac-hex':
         headers[sig_header] = 'sha256=' + hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest()
@@ -5063,7 +5167,7 @@ def run_emit(rest, die):
     else:  # standard-webhooks
         id_header = src.get('idHeader') if isinstance(src.get('idHeader'), str) else 'webhook-id'
         timestamp_header = src.get('timestampHeader') if isinstance(src.get('timestampHeader'), str) else 'webhook-timestamp'
-        msg_id = 'emit-' + os.urandom(8).hex()
+        msg_id = delivery_id or 'emit-' + os.urandom(8).hex()
         ts = str(int(time.time()))
         signed_content = ('%s.%s.' % (msg_id, ts)).encode('utf-8') + body
         sig = base64.b64encode(
@@ -5142,6 +5246,15 @@ def run_cli(argv):
                         for n, src in cfg['sources'].items() if isinstance(src, dict)},
         }))
         return
+
+    if cmd == 'read-content':
+        if len(argv) != 2:
+            die('read-content needs one content id')
+        try:
+            return print(compact(read_content(argv[1])))
+        except ValueError as e:
+            print('local-webhook: %s' % e, file=sys.stderr)
+            sys.exit(1)
 
     if cmd == 'emit':
         return run_emit(argv[1:], die)
