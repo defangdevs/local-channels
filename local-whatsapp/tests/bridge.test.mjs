@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { createServer } from 'node:http';
+import { WebSocketServer } from 'ws';
 
 const source = fileURLToPath(new URL('../bridge.mjs', import.meta.url));
 const stateSource = fileURLToPath(new URL('../state.mjs', import.meta.url));
@@ -33,6 +35,7 @@ function setup() {
   mkdirSync(state, { mode: 0o700 });
   mkdirSync(join(dir, 'node_modules', '@whiskeysockets', 'baileys'), { recursive: true });
   mkdirSync(join(dir, 'node_modules', 'pino'));
+  cpSync(fileURLToPath(new URL('../node_modules/ws', import.meta.url)), join(dir, 'node_modules', 'ws'), { recursive: true });
   copyFileSync(source, join(dir, 'bridge.mjs'));
   copyFileSync(stateSource, join(dir, 'state.mjs'));
   writeFileSync(sessionBin, `#!/bin/sh
@@ -72,6 +75,7 @@ esac
           message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: process.env.FAKE_MEDIA_CAPTION ?? ('@' + userInfo().username + ' inspect this'), mimetype: process.env.FAKE_MEDIA === 'videoMessage' ? 'video/mp4' : 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
         }] });
       }, Number(process.env.FAKE_INBOUND_DELAY || 100));
+      if (process.env.FAKE_FOLLOWUP_TEXT) setTimeout(() => ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'AFTER-CLEAR', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, message: { conversation: process.env.FAKE_FOLLOWUP_TEXT } }] }), 500);
       return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
         async requestPairingCode() {
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
@@ -448,3 +452,157 @@ test(`receive-files CLI enables captionless ${kind} and persists its expiry`, as
   }
 });
 }
+
+
+async function resetFixture(harness = 'codex') {
+  const f = setup();
+  const calls = [];
+  const http = createServer();
+  const wsServer = new WebSocketServer({ server: http });
+  const socket = join(f.dir, 'codex.sock');
+  const lifecycle = join(f.dir, 'lifecycle');
+  const argsFile = join(f.dir, 'args');
+  const codexBin = join(f.dir, 'codex');
+  const rollout = join(f.dir, 'old.jsonl');
+  writeFileSync(rollout, JSON.stringify({ type: 'session_meta', payload: { base_instructions: { text: 'BASE_SYSTEM_INSTRUCTIONS' } } }) + '\n' + JSON.stringify({ type: 'user', text: 'SECRET_OLD_CONTEXT' }) + '\n');
+  writeFileSync(codexBin, '#!/bin/sh\nprintf "%s\\n" "$@" >> "$CODEX_ARGS_FILE"\n');
+  chmodSync(codexBin, 0o700);
+  writeFileSync(f.sessionBin, `#!/bin/sh
+case "$2" in
+  candidates) printf '%s\\n' '[{"name":"existing","harness":"${harness}","stopped":false,"selected":true}]' ;;
+  spawn|activate|clear) printf '%s\\n' "$2" >> "$LIFECYCLE_FILE"; exit 1 ;;
+esac
+`);
+  writeFileSync(join(f.state, 'target.json'), JSON.stringify({ harness, session: 'old-thread', name: 'existing' }));
+  writeFileSync(join(f.state, 'codex-threads.json'), JSON.stringify({ existing: { thread: 'old-thread' } }));
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'SECRET_OLD_CONTEXT', reply: null, deliveredTo: 'codex:old-thread' },
+  }, sentIds: {}, acceptMediaUntil: Date.now() + 600000 }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, LOCAL_WHATSAPP_DEBUG: '',
+    LOCAL_WHATSAPP_PREFIX: '', LOCAL_WHATSAPP_CODEX_SOCKET: socket,
+    FAKE_OUT: f.fakeOut, LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin,
+    LOCAL_WHATSAPP_CODEX_BIN: codexBin, CODEX_ARGS_FILE: argsFile, LIFECYCLE_FILE: lifecycle,
+    FAKE_INBOUND_TEXT: '/clear', FAKE_FOLLOWUP_TEXT: 'fresh question' };
+  let rejectStart = false;
+  let historyEmpty = false;
+  wsServer.on('connection', (ws) => ws.on('message', (raw) => {
+    const m = JSON.parse(raw.toString()); calls.push(m);
+    if (m.id === undefined) return;
+    let result;
+    if (m.method === 'initialize') result = {};
+    else if (m.method === 'thread/read') result = { thread: { id: m.params.threadId, model: 'keep-model', modelProvider: 'openai', historyMode: 'paginated' } };
+    else if (m.method === 'thread/resume') result = {
+      model: 'keep-model', modelProvider: 'openai', cwd: f.dir, approvalPolicy: 'never',
+      reasoningEffort: 'high', runtimeWorkspaceRoots: [f.dir],
+      sandbox: { type: 'workspaceWrite', writableRoots: [f.dir], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
+    };
+    else if (m.method === 'thread/turns/list') {
+      // A server request that reuses the pending response id must not be mistaken for the response.
+      ws.send(JSON.stringify({ id: m.id, method: 'item/commandExecution/requestApproval', params: {} }));
+      result = { data: historyEmpty ? [] : [{ id: 'first-turn' }], nextCursor: null };
+    }
+    else if (m.method === 'thread/revert') {
+      if (rejectStart) { ws.send(JSON.stringify({ id: m.id, error: { code: -1, message: 'reset rejected' } })); return; }
+      historyEmpty = true;
+      result = { thread: { id: 'old-thread', turns: [] } };
+    } else throw new Error('Unexpected method ' + m.method);
+    ws.send(JSON.stringify({ id: m.id, result }));
+  }));
+  await new Promise((resolve) => http.listen(socket, resolve));
+  return { ...f, calls, env, lifecycle, argsFile, rejectStart(value) { rejectStart = value; }, emptyHistory() { historyEmpty = true; }, async cleanup() {
+    for (const client of wsServer.clients) client.terminate();
+    await new Promise((resolve) => wsServer.close(resolve));
+    await new Promise((resolve) => http.close(resolve));
+    rmSync(f.dir, { recursive: true, force: true });
+  } };
+}
+
+for (const plain of [false, true]) {
+test(`/clear reuses the existing Codex process (${plain ? 'plain' : 'prefixed'}) without session lifecycle calls`, async () => {
+  const f = await resetFixture();
+  const head = plain ? '' : '@' + userInfo().username + ' ';
+  const env = { ...f.env, LOCAL_WHATSAPP_PREFIX: plain ? '' : userInfo().username,
+    FAKE_INBOUND_TEXT: head + '/clear', FAKE_FOLLOWUP_TEXT: head + 'fresh question' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('Context cleared'), 'reset confirmation');
+    await waitUntil(() => existsSync(f.argsFile), 'fresh Codex queue');
+    const output = readFileSync(f.argsFile, 'utf8');
+    assert.match(output, /old-thread/); assert.match(output, /fresh question/);
+    assert.doesNotMatch(output, /SECRET_OLD_CONTEXT|\/clear/);
+    assert.equal(existsSync(f.lifecycle), false, 'must never spawn, activate, or detach an Agentbox session');
+    assert.equal(f.calls.some((m) => m.method === 'thread/start'), false);
+    const revert = f.calls.find((m) => m.method === 'thread/revert').params;
+    assert.deepEqual(revert, { threadId: 'old-thread', beforeTurnId: 'first-turn' });
+    const resumed = f.calls.find((m) => m.method === 'thread/resume').params;
+    assert.equal(resumed.model, 'keep-model');
+    assert.doesNotMatch(JSON.stringify(f.calls), /SECRET_OLD_CONTEXT/);
+    const selected = JSON.parse(readFileSync(join(f.state, 'target.json'), 'utf8'));
+    assert.deepEqual(selected, { harness: 'codex', name: 'existing', session: 'old-thread' });
+    const status = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' });
+    assert.equal(JSON.parse(status.stdout).target.session, 'old-thread', 'thread identity stays unchanged');
+    const saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(saved.messages.old.clearedAt); assert.equal(saved.resetPending, null); assert.equal(saved.acceptMediaUntil, 0);
+    const late = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', 'old', 'late'], { env, encoding: 'utf8' });
+    assert.equal(late.status, 1); assert.match(late.stderr, /cleared conversation/);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+}
+
+test('/clear failure remains blocked across restart and never starts a replacement harness', async () => {
+  const f = await resetFixture(); f.rejectStart(true);
+  let daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: f.env });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('reset rejected'), 'failed reset');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(existsSync(f.argsFile), false); assert.equal(existsSync(f.lifecycle), false);
+    await stop(daemon);
+    daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: f.env });
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(existsSync(f.argsFile), false); assert.equal(existsSync(f.lifecycle), false);
+    assert.ok(JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).resetPending);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+
+test('control replies are delivered while a failed /clear keeps the barrier pending', async () => {
+  const f = await resetFixture(); f.rejectStart(true);
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, FAKE_FOLLOWUP_TEXT: '/sessions' } });
+  const lines = () => (existsSync(f.fakeOut) ? readFileSync(f.fakeOut, 'utf8').trim().split('\n').filter(Boolean) : []);
+  try {
+    await waitUntil(() => lines().some((line) => line.includes('reset rejected')), 'failed reset');
+    await waitUntil(() => lines().some((line) => !line.includes('reset rejected')), 'control reply past the barrier');
+    assert.ok(JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).resetPending);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+
+test('/clear reports unsupported Claude reset instead of spawning another harness', async () => {
+  const f = await resetFixture('claude');
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: f.env });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('In-process clear is not supported'), 'capability error');
+    assert.equal(f.calls.length, 0);
+    assert.equal(existsSync(f.lifecycle), false);
+    const selected = JSON.parse(readFileSync(join(f.state, 'target.json'), 'utf8'));
+    assert.equal(selected.session, 'old-thread');
+    const saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.equal(saved.messages.old.clearedAt, undefined);
+    assert.equal(saved.resetPending, null);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+
+test('an interrupted in-place reset safely retries an already empty thread after restart', async () => {
+  const f = await resetFixture();
+  const statePath = join(f.state, 'messages.json');
+  const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+  saved.messages.clear = { id: 'clear', chat: '14155551234@s.whatsapp.net', text: '/clear', control: true, reply: null };
+  saved.resetPending = 'clear';
+  f.emptyHistory();
+  writeFileSync(statePath, JSON.stringify(saved));
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, FAKE_INBOUND_TEXT: 'fresh question', FAKE_FOLLOWUP_TEXT: '' } });
+  try {
+    await waitUntil(() => existsSync(f.argsFile), 'recovered queue');
+    assert.match(readFileSync(f.argsFile, 'utf8'), /old-thread/);
+    assert.equal(f.calls.some((m) => m.method === 'thread/revert' || m.method === 'thread/start'), false);
+    assert.equal(existsSync(f.lifecycle), false);
+  } finally { await stop(daemon); await f.cleanup(); }
+});

@@ -6,8 +6,9 @@ import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
+import WebSocket from 'ws';
 import pino from 'pino';
-import { REPLY_GUIDANCE, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -72,6 +73,68 @@ function setTarget(harness, session, name) {
   const temporary = `${targetPath}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify({ harness, session, ...(name ? { name } : {}) }), { mode: 0o600 });
   renameSync(temporary, targetPath);
+}
+
+// Attach directly to the existing Codex daemon. Never launch a replacement
+// harness or use the session manager's spawn/activate/clear lifecycle here.
+async function resetCodexThread(binding) {
+  const socket = process.env.LOCAL_WHATSAPP_CODEX_SOCKET ||
+    join(process.env.CODEX_HOME || join(process.env.HOME, '.codex'), 'app-server-control', 'app-server-control.sock');
+  if (!isAbsolute(socket) || socket.includes(':')) throw new Error('Codex control socket must be an absolute Unix path');
+  const ws = new WebSocket(`ws+unix://${socket}:/`, { handshakeTimeout: 10000, maxPayload: 8 * 1024 * 1024 });
+  const pending = new Map();
+  let serial = 0;
+  const rejectPending = (error) => {
+    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error); }
+    pending.clear();
+  };
+  ws.on('error', rejectPending);
+  ws.on('close', () => rejectPending(new Error('Codex control connection closed')));
+  ws.on('message', (raw) => {
+    try {
+      const message = JSON.parse(raw.toString());
+      // Server-initiated requests carry a method and share the id space; never treat one as a response.
+      if (message.method !== undefined) return;
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id); clearTimeout(request.timer);
+      if (message.error) request.reject(new Error(message.error.message || 'Codex reset failed'));
+      else request.resolve(message.result);
+    } catch (error) { rejectPending(error); }
+  });
+  function rpc(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = ++serial;
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Codex ${method} timed out`)); }, 30000);
+      pending.set(id, { resolve, reject, timer });
+      ws.send(JSON.stringify({ id, method, params }), (error) => {
+        if (error) { clearTimeout(timer); pending.delete(id); reject(error); }
+      });
+    });
+  }
+  try {
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    await rpc('initialize', { clientInfo: { name: 'local_whatsapp', version: '0.5.0' }, capabilities: { experimentalApi: true } });
+    ws.send(JSON.stringify({ method: 'initialized', params: {} }));
+    const { thread } = await rpc('thread/read', { threadId: binding.session, includeTurns: false });
+    if (!thread || thread.id !== binding.session) throw new Error('Codex returned a different current thread');
+    if (thread.historyMode !== 'paginated') throw Object.assign(new Error('In-process clear requires a paginated Codex thread; context was not changed'), { resetUnsupported: true });
+    await rpc('thread/resume', { threadId: thread.id, excludeTurns: true,
+      ...(thread.model ? { model: thread.model } : {}), ...(thread.modelProvider ? { modelProvider: thread.modelProvider } : {}) });
+    const page = await rpc('thread/turns/list', { threadId: thread.id, sortDirection: 'asc', limit: 1 });
+    if (!Array.isArray(page.data)) throw new Error('Invalid Codex history response');
+    if (page.data.length) {
+      const firstTurn = page.data[0].id;
+      if (typeof firstTurn !== 'string' || !firstTurn) throw new Error('Invalid Codex first turn');
+      // Native revert removes this turn and every later turn from the model
+      // context and durable thread history. It leaves instructions/settings,
+      // the thread identity and the existing harness process intact.
+      await rpc('thread/revert', { threadId: thread.id, beforeTurnId: firstTurn });
+    }
+    const checked = await rpc('thread/turns/list', { threadId: thread.id, sortDirection: 'asc', limit: 1 });
+    if (!Array.isArray(checked.data) || checked.data.length) throw new Error('Codex history is not empty after clear');
+    return binding;
+  } finally { rejectPending(new Error('Codex reset finished')); ws.close(); }
 }
 
 async function sessions() {
@@ -251,6 +314,8 @@ async function serve() {
   let connected = false;
   let draining = false;
   let dispatching = false;
+  let dispatchFinished = null;
+  let resetting = false;
   let handlingControls = false;
   let inboundQueue = Promise.resolve();
 
@@ -265,14 +330,17 @@ async function serve() {
   }
 
   async function dispatch() {
-    if (dispatching) return;
+    if (dispatching || resetting || state.resetPending) return;
     dispatching = true;
+    let finishDispatch;
+    dispatchFinished = new Promise((resolve) => { finishDispatch = resolve; });
     try {
-      if (!Object.values(state.messages).some((message) => !message.reply && !message.control)) return;
+      if (!Object.values(state.messages).some((message) => !message.reply && !message.control && !message.clearedAt)) return;
       const available = await sessions();
       const binding = await ensureTarget(available);
       for (const message of Object.values(state.messages)) {
-        if (message.reply || message.control) continue;
+        if (resetting || state.resetPending) break;
+        if (message.reply || message.control || message.clearedAt) continue;
         if (binding.harness === 'claude') {
           for (const [peer, info] of peers) {
             if (info.session !== binding.session || message.deliveredTo === info.id) continue;
@@ -292,6 +360,8 @@ async function serve() {
       }
     } finally {
       dispatching = false;
+      finishDispatch();
+      dispatchFinished = null;
     }
   }
 
@@ -300,6 +370,8 @@ async function serve() {
     draining = true;
     try {
       for (const entry of Object.values(state.messages)) {
+        if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
+        if (entry.clearedAt) continue;
         if (entry.ack?.status === 'queued' && !debugReceipts) {
           // Do not replay old diagnostic receipts after debug mode is disabled.
           entry.ack.status = 'suppressed';
@@ -324,8 +396,8 @@ async function serve() {
             if (timestamp < Date.now() - 30 * 24 * 3600 * 1000) delete state.sentIds[id];
           }
           const completed = Object.values(state.messages)
-            .filter((message) => message.reply?.status === 'sent')
-            .sort((left, right) => left.reply.sentAt.localeCompare(right.reply.sentAt));
+            .filter((message) => message.reply?.status === 'sent' || message.clearedAt)
+            .sort((left, right) => (left.clearedAt || left.reply.sentAt).localeCompare(right.clearedAt || right.reply.sentAt));
           for (const old of completed.slice(0, Math.max(0, completed.length - 1000))) delete state.messages[old.id];
           saveState(dir, state);
           cleanImageOutbox(dir, state);
@@ -340,8 +412,29 @@ async function serve() {
     handlingControls = true;
     try {
       for (const inbound of Object.values(state.messages)) {
-        if (!inbound.control || inbound.reply) continue;
+        if (!inbound.control || inbound.reply || inbound.clearedAt) continue;
         try {
+          if (inbound.text === '/clear') {
+            resetting = true;
+            // Persist a barrier first: a restart or failed session command must
+            // not reroute old pending messages into a new conversation.
+            state.resetPending = inbound.id;
+            saveState(dir, state);
+            try {
+              if (dispatchFinished) await dispatchFinished;
+              const binding = target();
+              if (!binding) throw Object.assign(new Error('No selected conversation to clear'), { resetUnsupported: true });
+              if (binding.harness !== 'codex') throw Object.assign(new Error('In-process clear is not supported for this Claude connection; context was not changed and no replacement harness was started'), { resetUnsupported: true });
+              await resetCodexThread(binding);
+              retireConversation(state, inbound.id);
+              saveState(dir, state);
+              state.resetPending = Object.values(state.messages).find((entry) => entry.id !== inbound.id && entry.control && entry.text === '/clear' && !entry.reply && !entry.clearedAt)?.id || null;
+              queueReply(state, inbound.id, 'Context cleared in the existing Codex thread and process. The system/workspace instructions and settings remain; previous chat turns have been removed.');
+            } finally { resetting = false; }
+            saveState(dir, state);
+            cleanImageOutbox(dir, state);
+            continue;
+          }
           const available = await sessions();
           if (inbound.text === '/attach') {
             state.acceptMediaUntil = Date.now() + 10 * 60 * 1000;
@@ -370,7 +463,10 @@ async function serve() {
               throw new Error('use /target NAME, /target auto, or /profile NAME|default');
             }
           }
-        } catch (error) { queueReply(state, inbound.id, `Box: ${error.message}`); }
+        } catch (error) {
+          if (error.resetUnsupported) state.resetPending = null;
+          queueReply(state, inbound.id, `Box: ${error.message}`);
+        }
         saveState(dir, state);
       }
       await drainReplies();
@@ -416,7 +512,7 @@ async function serve() {
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, until: new Date(state.acceptMediaUntil).toISOString() })}\n`);
           } else if (value.op === 'status') {
-            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, acceptMediaUntil: state.acceptMediaUntil || null, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply).length })}\n`);
+            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, resetPending: Boolean(state.resetPending), acceptMediaUntil: state.acceptMediaUntil || null, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply && !entry.clearedAt).length })}\n`);
           } else {
             peer.write(`${JSON.stringify({ ok: false, error: 'unknown operation' })}\n`);
           }
@@ -449,13 +545,16 @@ async function serve() {
           const inbound = parseInbound(message, credentials.creds, state.sentIds, addressPrefix, Date.now() < (state.acceptMediaUntil || 0));
           if (!inbound || Object.hasOwn(state.messages, inbound.id)) continue;
           try {
-            if (Object.values(state.messages).filter((m) => !m.reply).length >= 200) throw new Error('inbox full');
+            if (Object.values(state.messages).filter((m) => !m.reply && !m.clearedAt).length >= 200 && !(!inbound.attachment && inbound.text === '/clear')) throw new Error('inbox full');
             if (inbound.attachment) {
               await receiveAttachment(dir, inbound, () => downloadMediaMessage(message, 'stream', { options: { timeout: 60000 } }, { logger, reuploadRequest: socket.updateMediaMessage }));
             }
-            const control = !inbound.attachment && (inbound.text === '/attach' || inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
+            const control = !inbound.attachment && (inbound.text === '/clear' || inbound.text === '/attach' || inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
               inbound.text.startsWith('/profile'));
-            if (control) inbound.control = true;
+            if (control) {
+              inbound.control = true;
+              if (inbound.text === '/clear' && !state.resetPending) state.resetPending = inbound.id;
+            }
             else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
             if (addInbound(state, inbound)) {
               saveState(dir, state);
