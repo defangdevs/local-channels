@@ -49,6 +49,29 @@ class TestContent(StateDirCase):
         self.assertNotEqual(first['contentRef']['id'], second['contentRef']['id'])
         self.assertEqual(self.mod.read_content(first['contentRef']['id'])['payload']['text'], 'complete body')
 
+    def test_failed_inbox_write_rolls_back_only_new_content(self):
+        env = self.env()
+        real_publish = self.mod.SPOOL_INBOX.publish
+        def broken(*args, **kwargs):
+            raise OSError('inbox disk failure')
+        self.mod.SPOOL_INBOX.publish = broken
+        with self.assertRaises(OSError):
+            self.mod.spool_accept(env, 'a', retain=True)
+        self.assertEqual(self.mod.spool_status()['content']['count'], 0)
+        self.mod.SPOOL_INBOX.publish = real_publish
+        self.mod.spool_accept(env, 'a', retain=True)
+        self.mod.SPOOL_INBOX.publish = broken
+        # An already-promised reference must survive a failed duplicate path.
+        with self.assertRaises(OSError):
+            self.mod.spool_accept(self.env(), 'a', retain=True)
+        self.assertEqual(self.mod.read_content(env['contentRef']['id'])['payload']['text'], 'complete body')
+
+    def test_idless_acceptances_have_independent_retention(self):
+        first, second = self.env(ident=''), self.env(ident='')
+        self.mod.spool_accept(first, 'a', retain=True)
+        self.mod.spool_accept(second, 'a', retain=True)
+        self.assertNotEqual(first['contentRef']['id'], second['contentRef']['id'])
+
     def test_concurrent_admission_respects_count_cap(self):
         mod = self.load(LOCAL_WEBHOOK_CONTENT_MAX='1')
         results = []

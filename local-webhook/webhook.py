@@ -2286,7 +2286,7 @@ CONTENT = SpoolQueue(os.path.join(SPOOL_DIR, 'content'))
 CONTENT_TTL_S = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_TTL_S', default=86400))
 CONTENT_MAX_BYTES = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX_BYTES', default=134217728))
 CONTENT_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX', default=2000))
-CONTENT_LOCK = threading.Lock()
+CONTENT_LOCK = threading.RLock()
 
 
 def content_rows():
@@ -2306,11 +2306,11 @@ def content_reap(now_s):
     CONTENT.reap_tmp(now_s)
 
 
-def retain_content(env, digest, at):
+def retain_content(env, digest, at, sid, created):
     # Include identity AND body, just as the inbox does. A sender reusing its
     # delivery id for different bodies cannot overwrite a prior reference.
     ident = hashlib.sha256(('%s\0%s\0%s' % (
-        env['source'], env.get('delivery', ''), digest)).encode('utf-8')).hexdigest()[:40]
+        env['source'], env.get('delivery') or sid, digest)).encode('utf-8')).hexdigest()[:40]
     with CONTENT_LOCK:
         content_reap(time.time())
         prior = SpoolQueue.load(spool_path(CONTENT.new, ident))
@@ -2325,7 +2325,8 @@ def retain_content(env, digest, at):
         if len(rows) >= CONTENT_MAX_N or len(data) + sum(
                 st.st_size for _, st in rows if st) > CONTENT_MAX_BYTES:
             raise OSError('retained content capacity exhausted; retry after expiry')
-        CONTENT.publish(ident, data, mtime_ms=ref['expiresMs'])
+        if CONTENT.publish(ident, data, mtime_ms=ref['expiresMs']):
+            created.append(ident)
         return ref
 
 
@@ -2399,6 +2400,23 @@ def _inbox_records():
 # SPOOL_SEEN_S — losing events in the name of not repeating them. A reused id
 # with a different body is a new event, under a generated name.
 def spool_accept(env, digest='', retain=False):
+    if not retain:
+        return _spool_accept(env, digest)
+    # Hold the retention lock through inbox acceptance: rollback cannot remove
+    # a new record another accepting thread has already promised to a reader.
+    with CONTENT_LOCK:
+        created = []
+        accepted = None
+        try:
+            accepted = _spool_accept(env, digest, created)
+            return accepted
+        finally:
+            if accepted is None:
+                for ident in created:
+                    CONTENT.drop(ident)
+
+
+def _spool_accept(env, digest='', retained=None):
     """Make an accepted delivery durable. (sid, accepted ms), or None when it
     is a duplicate of one already accepted. Raises OSError when it cannot be
     written — the caller must then NOT acknowledge it."""
@@ -2420,8 +2438,8 @@ def spool_accept(env, digest='', retain=False):
             sid = fresh()
     else:
         sid = fresh()
-    if retain:
-        env['contentRef'] = retain_content(env, digest, at)
+    if retained is not None:
+        env['contentRef'] = retain_content(env, digest, at, sid, retained)
     rec = {'v': 1, 'kind': 'webhook', 'id': sid, 'acceptedMs': at, 'acceptedAt': iso_at(at),
            'digest': digest, 'env': env}
     def rename_fresh():
