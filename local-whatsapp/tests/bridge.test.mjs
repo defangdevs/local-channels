@@ -560,6 +560,17 @@ test('/clear failure remains blocked across restart and never starts a replaceme
   } finally { await stop(daemon); await f.cleanup(); }
 });
 
+test('control replies are delivered while a failed /clear keeps the barrier pending', async () => {
+  const f = await resetFixture(); f.rejectStart(true);
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, FAKE_FOLLOWUP_TEXT: '/sessions' } });
+  const lines = () => (existsSync(f.fakeOut) ? readFileSync(f.fakeOut, 'utf8').trim().split('\n').filter(Boolean) : []);
+  try {
+    await waitUntil(() => lines().some((line) => line.includes('reset rejected')), 'failed reset');
+    await waitUntil(() => lines().some((line) => !line.includes('reset rejected')), 'control reply past the barrier');
+    assert.ok(JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).resetPending);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+
 test('/clear reports unsupported Claude reset instead of spawning another harness', async () => {
   const f = await resetFixture('claude');
   const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: f.env });

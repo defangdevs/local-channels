@@ -368,7 +368,7 @@ async function serve() {
     draining = true;
     try {
       for (const entry of Object.values(state.messages)) {
-        if (state.resetPending && entry.id !== state.resetPending) continue;
+        if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
         if (entry.clearedAt) continue;
         if (entry.ack?.status === 'queued' && !debugReceipts) {
           // Do not replay old diagnostic receipts after debug mode is disabled.
