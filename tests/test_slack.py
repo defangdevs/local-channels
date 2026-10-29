@@ -1365,7 +1365,7 @@ class TestFiles(unittest.TestCase):
     def test_bad_text_and_audio_bytes_refused(self):
         for mime, body in [('text/plain', b'a\x00b'), ('text/plain', b'\xff\xfe\x00'),
                            ('text/csv', b'\x80abc'), ('audio/webm', b'<html>'),
-                           ('audio/mp4', b'\0\0\0\x18moov'), ('audio/mpeg', b'GIF89a'),
+                           ('audio/mp4', b'\0\0\0\x18moov'), ('audio/mpeg', b'GIF89a'), ('audio/mpeg', b'\xff\xf1\x50\x80'),
                            ('audio/ogg', b'RIFF'), ('audio/wav', b'RIFF\0\0\0\0WEBP')]:
             self.files[:] = [self.fobj(mimetype=mime, size=len(body))]
             self.body = body

@@ -1692,6 +1692,12 @@ def _is_text(b):
     return True
 
 
+def _mpeg_frame(b):
+    """An MPEG audio frame header: 11 sync bits, a valid version and a layer
+    that is not 00 (FF F1 / FF F9 is an AAC ADTS header, not MP3)."""
+    return len(b) > 1 and b[0] == 0xff and b[1] & 0xe0 == 0xe0 and b[1] >> 3 & 3 != 1 and b[1] >> 1 & 3 != 0
+
+
 # MIME type -> (extension, signature check). The saved extension comes from
 # here, never from the sender's file name.
 FILE_TYPES = {
@@ -1707,7 +1713,7 @@ FILE_TYPES = {
     'audio/webm': ('webm', lambda b: b.startswith(b'\x1a\x45\xdf\xa3')),
     'audio/mp4': ('m4a', lambda b: b[4:8] == b'ftyp'),
     'audio/x-m4a': ('m4a', lambda b: b[4:8] == b'ftyp'),
-    'audio/mpeg': ('mp3', lambda b: b.startswith(b'ID3') or (len(b) > 1 and b[0] == 0xff and b[1] & 0xe0 == 0xe0)),
+    'audio/mpeg': ('mp3', lambda b: b.startswith(b'ID3') or _mpeg_frame(b)),
     'audio/ogg': ('ogg', lambda b: b.startswith(b'OggS')),
     'audio/wav': ('wav', lambda b: b[:4] == b'RIFF' and b[8:12] == b'WAVE'),
 }
