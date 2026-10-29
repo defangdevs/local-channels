@@ -1730,6 +1730,9 @@ def read_thread(web, channel, ts):
         cursor = (r.get('response_metadata') or {}).get('next_cursor')
         if not cursor:
             break
+    if cursor:
+        # A partial list that looks complete would hide files from the agent.
+        raise Refused('thread %s has more messages than %d pages hold; list is truncated' % (ts, 10))
     return out
 
 

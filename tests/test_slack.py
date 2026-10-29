@@ -1369,6 +1369,12 @@ class TestFiles(unittest.TestCase):
         self.assertEqual([r['ts'] for r in rows], ['1.1', '1.2'])
         self.assertIn('files', rows[1])
 
+    def test_thread_refuses_a_truncated_list(self):
+        self.web.call = lambda method, params=None, **kw: {
+            'ok': True, 'messages': [{'ts': '1.1'}], 'response_metadata': {'next_cursor': 'more'}}
+        with self.assertRaises(slack.Refused):
+            slack.read_thread(self.web, 'C1', '1.1')
+
     def test_file_found_on_a_later_page(self):
         pages = [{'ok': True, 'messages': [], 'response_metadata': {'next_cursor': 'c2'}},
                  {'ok': True, 'messages': [{'ts': '1.1', 'files': self.files}]}]
