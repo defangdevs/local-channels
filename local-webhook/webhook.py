@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.35.0'
+VERSION = '0.36.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -468,7 +468,8 @@ FILTER_COMMENT = (
     "events again, subscribe to a topic (webhook_subscribe, or `webhook.py subscribe <topic>`); "
     "webhook_subscriptions reports which of the three states you are in as filterState absent/invalid/ok. "
     "spawnConfig does nothing in THIS file — it is a dispatch-only field (see the dispatch comment) and "
-    "webhook_subscribe refuses it on a session subscription."
+    "webhook_subscribe refuses it on a session subscription. A configured acceptance adapter "
+    "acknowledges claimed session deliveries and successful spawns, not observer subscriptions."
 )
 
 # Dispatch subscriptions (issue #1): entries in this file ask for delivery into
@@ -2839,6 +2840,29 @@ def spool_status(now_s=None):
     return out
 
 
+# Optional deployment adapter, never a command supplied by a webhook. The
+# hook runs after the last inch accepted work, not at ingress/spool time.
+# One executable path (no shell/argv parsing); the envelope stays stdin data.
+ACK_CMD = os.environ.get('LOCAL_WEBHOOK_ACK_CMD', '')
+ACK_TIMEOUT_S = 10
+
+
+def acknowledge_accepted(envelope, target):
+    if not ACK_CMD or not isinstance(envelope, dict):
+        return
+    try:
+        result = subprocess.run(
+            [ACK_CMD], input=json.dumps({'envelope': envelope, 'target': target}).encode('ascii'),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=ACK_TIMEOUT_S)
+        if result.returncode:
+            print('local-webhook: acknowledgment hook failed (exit %d); work was delivered'
+                  % result.returncode, file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired):
+        # An acknowledgment must never turn successfully delivered work into
+        # a retry (and a second worker). Do not echo adapter output/secrets.
+        print('local-webhook: acknowledgment hook unavailable; work was delivered', file=sys.stderr)
+
+
 def handle_event(env, at=None, sid=None):
     """Route one envelope through THIS session's filter and deliver it.
     'delivered', 'filtered' (the filter declined it) or 'failed' (the last
@@ -2851,12 +2875,19 @@ def handle_event(env, at=None, sid=None):
     if CODEX_PEER:
         # Same text, same meta, same UNTRUSTED framing — a codex session just
         # has to be handed it rather than notified.
-        return 'delivered' if codex_deliver(text, meta, sid) else 'failed'
-    out({
-        'jsonrpc': '2.0',
-        'method': 'notifications/claude/channel',
-        'params': {'content': text, 'meta': meta},
-    })
+        if not codex_deliver(text, meta, sid):
+            return 'failed'
+    else:
+        out({
+            'jsonrpc': '2.0',
+            'method': 'notifications/claude/channel',
+            'params': {'content': text, 'meta': meta},
+        })
+    # A repo-wide observer is not an owner. Use the same positive-claim
+    # predicate that suppresses a duplicate standing-watch worker.
+    if filter_claims(FILTER_FILE, env.get('source', ''), env.get('key', ''),
+                     env.get('sender', ''), env.get('event', ''), env.get('payload')):
+        acknowledge_accepted(env, FILTER_KEY)
     return 'delivered'
 
 
@@ -3512,6 +3543,12 @@ class Dispatcher:
                 print('local-webhook: spawn command exited %d for %s: %s'
                       % (p.returncode, label, p.stdout.decode('utf-8', 'replace').strip()[:500]),
                       file=sys.stderr)
+            else:
+                # Each batch item retains its verified envelope, including
+                # after spool recovery. Acknowledge every accepted item, not
+                # just the newest metadata. Exit 75/failure never gets here.
+                for item in items:
+                    acknowledge_accepted(item[2], 'dispatch')
         except subprocess.TimeoutExpired:
             print('local-webhook: spawn command timed out (%ss) for %s' % (self.timeout, label), file=sys.stderr)
         except OSError as e:
@@ -3942,6 +3979,8 @@ INSTRUCTIONS = (
     'kept on disk and delivered when it is back, if the subscription was live when the event arrived — so '
     'a burst of older deliveries right after a restart is a backlog, not new activity; meta.delivery '
     'identifies each one. '
+    'A deployment may configure LOCAL_WEBHOOK_ACK_CMD to acknowledge accepted work externally. '
+    'It runs only after a claimed session delivery or a successful spawn, never merely at ingress. '
     'The subscription list persists in %s and is hot-reloaded per delivery.'
     % (DEFAULT_TTL_HOURS, FILTER_FILE)
 ) + (' This session acts as "%s".' % SELF if SELF else '')
@@ -4030,7 +4069,8 @@ TOOLS = [
             'previous; renew_on_event:true resets it on every delivery instead. For a standing watch that '
             'should NOT land in this session, pass deliver_to:"subagent" — each matching event batch then '
             'spawns a fresh session, and such a subscription must carry include/exclude rules saying which '
-            'events are worth one.' % DEFAULT_TTL_HOURS,
+            'events are worth one. A deployment acceptance hook may acknowledge claimed deliveries '
+            'and successful spawns externally; observer deliveries are not acknowledged.' % DEFAULT_TTL_HOURS,
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -5058,6 +5098,9 @@ daemon's receiver.json advertisement, or loopback LOCAL_WEBHOOK_PORT.
                        on retry. Default: a new random id on every invocation.
   --event NAME         event name for the delivery; when absent the payload's
                        "event"/"type" field applies, per normal normalization
+
+LOCAL_WEBHOOK_ACK_CMD optionally names one executable to acknowledge work after
+a claimed session accepts delivery or a spawn command succeeds (JSON on stdin).
 
 Subscriptions are per session (LOCAL_WEBHOOK_SESSION) and hot-reloaded, so this
 takes effect on the next delivery with no session restart.

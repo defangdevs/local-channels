@@ -3458,8 +3458,8 @@ class EndToEndCase(unittest.TestCase):
         self.assertTrue(os.path.exists(self.http_sock), 'daemon never bound its socket')
         return p
 
-    def start_peer(self, session):
-        env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0')
+    def start_peer(self, session, **extra):
+        env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0', **extra)
         p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.procs.append(p)
