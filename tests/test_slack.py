@@ -1327,7 +1327,7 @@ class TestFiles(unittest.TestCase):
             ('remote', {}, dict(filetype='remote')),
             ('svg', {}, dict(mimetype='image/svg+xml')),
             ('html', {}, dict(mimetype='text/html')),
-            ('pdf off by default', {}, dict(mimetype='application/pdf')),
+            ('zip', {}, dict(mimetype='application/zip')),
             ('oversize declared', {}, dict(size=21 * 1024 * 1024)),
         ]
         for name, kw, over in cases:
@@ -1344,11 +1344,33 @@ class TestFiles(unittest.TestCase):
         with self.assertRaises(slack.Refused):
             self.fetch()
 
-    def test_pdf_opt_in(self):
-        self.defaults['files']['types'].append('application/pdf')
+    def test_pdf_on_by_default(self):
         self.files[:] = [self.fobj(mimetype='application/pdf')]
         self.body = b'%PDF-1.7 ...'
         self.assertEqual(self.fetch()[1], 'pdf')
+
+    def test_text_and_audio_on_by_default(self):
+        cases = [('text/plain', b'log line\n', 'txt'), ('text/csv', b'a,b\n1,2\n', 'csv'),
+                 ('text/markdown', '# h\u00e9\n'.encode(), 'md'), ('application/json', b'{}', 'json'),
+                 ('audio/webm', b'\x1a\x45\xdf\xa3xx', 'webm'), ('audio/mp4', b'\0\0\0\x18ftypM4A ', 'm4a'),
+                 ('audio/x-m4a', b'\0\0\0\x18ftypM4A ', 'm4a'), ('audio/mpeg', b'ID3\x04', 'mp3'),
+                 ('audio/mpeg', b'\xff\xfb\x90\x00', 'mp3'), ('audio/ogg', b'OggS\0', 'ogg'),
+                 ('audio/wav', b'RIFF\0\0\0\0WAVEfmt ', 'wav')]
+        for mime, body, ext in cases:
+            self.files[:] = [self.fobj(mimetype=mime, size=len(body))]
+            self.body = body
+            with self.subTest(mime, body=body):
+                self.assertEqual(self.fetch()[1], ext)
+
+    def test_bad_text_and_audio_bytes_refused(self):
+        for mime, body in [('text/plain', b'a\x00b'), ('text/plain', b'\xff\xfe\x00'),
+                           ('text/csv', b'\x80abc'), ('audio/webm', b'<html>'),
+                           ('audio/mp4', b'\0\0\0\x18moov'), ('audio/mpeg', b'GIF89a'),
+                           ('audio/ogg', b'RIFF'), ('audio/wav', b'RIFF\0\0\0\0WEBP')]:
+            self.files[:] = [self.fobj(mimetype=mime, size=len(body))]
+            self.body = body
+            with self.subTest(mime, body=body), self.assertRaises(slack.Refused):
+                self.fetch()
 
     def test_save_failure_leaves_no_part_and_prunes(self):
         os.makedirs(self.dir, exist_ok=True)
