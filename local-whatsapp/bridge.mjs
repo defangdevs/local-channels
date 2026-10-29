@@ -274,8 +274,10 @@ async function pair() {
       category,
       ...(statusCode ? { statusCode } : {}),
     })}\n`);
-    process.stderr.write(`${safeMessage || `WhatsApp pairing failed (reference ${attemptId}).`}\n`);
-    process.exit(1);
+    process.stderr.write(
+      `${safeMessage || `WhatsApp pairing failed (reference ${attemptId}).`}\n`,
+      () => process.exit(1),
+    );
   }
 
   let phone;

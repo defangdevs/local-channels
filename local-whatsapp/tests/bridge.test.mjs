@@ -114,7 +114,7 @@ async function runPairFailure(fixture, envOverrides) {
   });
   let errors = '';
   pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
-  const code = await new Promise((resolve) => pair.once('exit', resolve));
+  const code = await new Promise((resolve) => pair.once('close', resolve));
   return { code, errors };
 }
 
@@ -139,7 +139,7 @@ test('pair exits successfully when the newly linked socket closes', async () => 
   pair.stdout.on('data', (chunk) => { output += chunk.toString(); });
   pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
   try {
-    const code = await new Promise((resolve) => pair.once('exit', resolve));
+    const code = await new Promise((resolve) => pair.once('close', resolve));
     assert.equal(code, 0, errors);
     assert.match(output, /TEST1234/);
     assert.match(output, /device linked/);
