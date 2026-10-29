@@ -124,4 +124,4 @@ class TestAcceptanceHookE2E(EndToEndCase):
         peer.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         peer.stdin.flush()
         self.assertIn('offline owner', self.read_peer_line(peer)['params']['content'])
-        self.assertTrue(self.wait_file(log, contains='"target":"owner"'))
+        self.assertTrue(self.wait_file(log, contains='"target": "owner"'))
