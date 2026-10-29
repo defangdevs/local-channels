@@ -1361,6 +1361,14 @@ class TestFiles(unittest.TestCase):
         slack.save_file('F3', 'png', b'b' * 10, total_cap=15, directory=self.dir)
         self.assertEqual(os.listdir(self.dir), ['F3.png'])
 
+    def test_thread_follows_the_cursor(self):
+        pages = [{'ok': True, 'messages': [{'ts': '1.1'}], 'response_metadata': {'next_cursor': 'c2'}},
+                 {'ok': True, 'messages': [{'ts': '1.2', 'files': self.files}]}]
+        self.web.call = lambda method, params=None, **kw: pages.pop(0)
+        rows = slack.read_thread(self.web, 'C1', '1.1')
+        self.assertEqual([r['ts'] for r in rows], ['1.1', '1.2'])
+        self.assertIn('files', rows[1])
+
     def test_file_found_on_a_later_page(self):
         pages = [{'ok': True, 'messages': [], 'response_metadata': {'next_cursor': 'c2'}},
                  {'ok': True, 'messages': [{'ts': '1.1', 'files': self.files}]}]

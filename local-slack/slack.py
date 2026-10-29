@@ -1716,13 +1716,20 @@ def file_meta(f):
 
 
 def read_thread(web, channel, ts):
-    r = web.call('conversations.replies', {'channel': channel, 'ts': ts, 'limit': 200})
-    out = []
-    for m in r.get('messages', []):
-        row = {'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')}
-        if m.get('files'):
-            row['files'] = [file_meta(f) for f in m['files'] if isinstance(f, dict)]
-        out.append(row)
+    out, cursor = [], None
+    # Slack pages this method; follow the cursor (bounded) so a long thread
+    # lists every message's files, not just the first page's.
+    for _page in range(10):
+        r = web.call('conversations.replies', dict({'channel': channel, 'ts': ts, 'limit': 200},
+                                                   **({'cursor': cursor} if cursor else {})))
+        for m in r.get('messages', []):
+            row = {'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')}
+            if m.get('files'):
+                row['files'] = [file_meta(f) for f in m['files'] if isinstance(f, dict)]
+            out.append(row)
+        cursor = (r.get('response_metadata') or {}).get('next_cursor')
+        if not cursor:
+            break
     return out
 
 
