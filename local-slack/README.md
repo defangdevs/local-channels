@@ -31,7 +31,7 @@ may reach it are the deployment's choice.
   of that name (lower- or upper-case) in `$CREDENTIALS_DIRECTORY` (systemd
   `LoadCredential=`) or `LOCAL_SLACK_CREDENTIALS_DIR`. The daemon then needs no
   token in its environment.
-- CLI: with `LOCAL_SLACK_SOCKET` set, `slack.py reply|post|status|react|thread`
+- CLI: with `LOCAL_SLACK_SOCKET` set, `slack.py reply|post|status|react|thread|file`
   talk to the socket, read no token and never call Slack. `doctor` warns when a
   token is in the caller's environment; its credential-file warning only sees
   `CREDENTIALS_DIRECTORY` / `LOCAL_SLACK_CREDENTIALS_DIR` in the caller's own
@@ -58,7 +58,7 @@ may reach it are the deployment's choice.
 1. Create an internal Slack app in your own workspace with Socket Mode on, an
    app-level token with the `connections:write` scope, bot scopes
    `channels:history groups:history channels:read groups:read chat:write
-   reactions:read reactions:write users:read`, and bot events
+   reactions:read reactions:write users:read files:read`, and bot events
    `message.channels message.groups reaction_added reaction_removed
    channel_shared channel_unshared member_left_channel member_joined_channel`. Do **not** add
    `app_mentions:read` (mentions are read from `message` events; subscribing to
@@ -99,6 +99,30 @@ may reach it are the deployment's choice.
    user, configured channel count) and keeps `connection.json` in the state dir
    up to date; `slack.py doctor` reports it, and says so when the recorded pid
    is gone.
+
+## Files
+
+`slack.py thread CHANNEL TS` lists each message's files (id, name, mimetype, size,
+subtype, and `transcript` for audio and video clips); it never prints
+`url_private`. `slack.py file CHANNEL TS FILE_ID` saves one file under
+`<state dir>/files/<file id>.<ext>` (mode 0600) and prints the path. In
+socket-service mode the daemon checks and downloads and the CLI saves the
+bytes, so the CLI still holds no token.
+
+Needs the `files:read` bot scope. Adding a scope means reinstalling the app in
+the workspace that owns it; check afterwards that the bot token is unchanged.
+
+Guards, in both modes: the channel must be configured and the file must be on
+that message; only `_defaults.files.types` (images by default; add
+`application/pdf`; SVG and HTML can never be enabled), at most
+`_defaults.files.max_bytes` (20 MiB, checked against the declared size and while
+streaming), oldest files pruned past `total_bytes`; external and remote files
+are refused; the download goes only to `files.slack.com` over https and
+redirects are refused, so the bot token cannot follow one elsewhere; the first
+bytes must match the type. File contents are untrusted data, like message text.
+A voice clip's transcript exists only if someone pressed "Generate transcript"
+in Slack; the field shape is not documented and is not yet checked against a
+real clip, nor is a Slack Connect file from the other workspace.
 
 ## Events (topic `slack:<team>/<channel>`)
 

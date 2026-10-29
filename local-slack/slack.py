@@ -19,7 +19,7 @@
 # Two modes: PLAIN (tokens in the agent user's env) and socket-service (the
 # daemon alone holds the tokens and serves writes on a Unix socket, callers
 # checked by SO_PEERCRED). Grants, the
-# HTTP Events API transport, files, the settings card and classifier
+# HTTP Events API transport, the settings card and classifier
 # isolation hardening are follow-ups; the spec's guardrails that do not depend
 # on grants are all enforced here, in the code path every write passes.
 import base64
@@ -344,6 +344,11 @@ DEFAULT_DEFAULTS = {
     # progress reactions `status` keeps on the thread parent. None configured,
     # none made.
     'status_marks': {},
+    # What `file` may download. Types are MIME types, and only those with a
+    # signature in FILE_TYPES can ever be enabled, so SVG and HTML stay out
+    # whatever the config says. PDF is opt-in: add 'application/pdf'.
+    'files': {'types': ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+              'max_bytes': 20 * 1024 * 1024, 'total_bytes': 200 * 1024 * 1024},
 }
 
 
@@ -943,6 +948,14 @@ class SlackError(Exception):
     pass
 
 
+FILE_HOSTS = ('files.slack.com',)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
 class Web:
     def __init__(self, bot_token, app_token=None):
         self.bot, self.app = bot_token, app_token
@@ -981,6 +994,34 @@ class Web:
         if not out.get('ok'):
             raise SlackError(out.get('error', 'unknown_error'))
         return out
+
+    def download(self, url, max_bytes):
+        """Bytes of one Slack-hosted file, at most max_bytes. The bot token goes
+        to an exact Slack file host over https and nowhere else: redirects are
+        refused rather than followed, because urllib would copy the
+        Authorization header to whatever host the redirect names."""
+        u = urllib.parse.urlsplit(url or '')
+        if u.scheme != 'https' or u.hostname not in FILE_HOSTS or u.port not in (None, 443):
+            raise SlackError('file_host_refused')
+        if not self.t3.take(False):
+            raise SlackError('rate_limited: local read budget exhausted')
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + self.bot})
+        try:
+            with opener.open(req, timeout=30) as r:
+                if r.status != 200:
+                    raise SlackError('http %d' % r.status)
+                buf = b''
+                while len(buf) <= max_bytes:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        return buf
+                    buf += chunk
+        except urllib.error.HTTPError as e:
+            raise SlackError('file_redirect_refused' if 300 <= e.code < 400 else 'http %d' % e.code)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise SlackError('network_error: %s' % type(e).__name__)
+        raise SlackError('file_too_large')
 
 
 # --------------------------------------------------------------------------
@@ -1349,7 +1390,8 @@ USAGE = '''local-slack %s
   slack.py channel add CHANNEL_ID [--track all|mention|reaction:EMOJI] [--quiet MIN]
                        [--write] [--allow-external]
   slack.py channel rm CHANNEL_ID
-  slack.py thread CHANNEL TS
+  slack.py thread CHANNEL TS               messages, with each one's files listed
+  slack.py file CHANNEL TS FILE_ID         save one allowed file; prints its local path
   slack.py reply CHANNEL TS TEXT
   slack.py post CHANNEL TEXT
   slack.py status CHANNEL TS TEXT [--done|--failed]
@@ -1579,7 +1621,7 @@ MAX_CONNECTIONS = 32
 SERVER_TIMEOUT_S = 10    # a connected peer must send its request within this
 LOCK_WAIT_S = 10         # a write waits this long for the one write lock
 CLIENT_TIMEOUT_S = 90    # must exceed LOCK_WAIT_S plus a Slack round trip
-SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread')
+SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread', 'file')
 
 
 def parse_uids(spec):
@@ -1624,6 +1666,9 @@ def execute(w, cmd, rest):
     elif cmd == 'react' and len(rest) == 3:
         w.react(*rest)
         r = {}
+    elif cmd == 'file' and len(rest) == 3:
+        fid, ext, data = fetch_file(w.web, w.channels, w.defaults, *rest)
+        return {'id': fid, 'ext': ext, 'data': base64.b64encode(data).decode()}
     else:
         raise Refused('usage: %s' % cmd)
     out = {'ts': r.get('ts')}
@@ -1632,9 +1677,131 @@ def execute(w, cmd, rest):
     return out
 
 
+# MIME type -> (extension, signature check). The saved extension comes from
+# here, never from the sender's file name.
+FILE_TYPES = {
+    'image/png': ('png', lambda b: b.startswith(b'\x89PNG\r\n\x1a\n')),
+    'image/jpeg': ('jpg', lambda b: b.startswith(b'\xff\xd8\xff')),
+    'image/gif': ('gif', lambda b: b[:6] in (b'GIF87a', b'GIF89a')),
+    'image/webp': ('webp', lambda b: b[:4] == b'RIFF' and b[8:12] == b'WEBP'),
+    'application/pdf': ('pdf', lambda b: b.startswith(b'%PDF-')),
+}
+_CTRL = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]')
+
+
+def _transcript(f):
+    """Slack's own transcript of an audio or video clip, when it made one. The
+    field shape is undocumented: this reads transcription.preview.content, a
+    transcription string and a preview string, and must be checked against a
+    real clip. Slack only makes one after a person asks for it."""
+    t = f.get('transcription')
+    cand = None
+    if isinstance(t, dict):
+        p = t.get('preview')
+        cand = (p.get('content') if isinstance(p, dict) else p) or t.get('content')
+    elif isinstance(t, str):
+        cand = t
+    return cand if isinstance(cand, str) and cand.strip() else None
+
+
+def file_meta(f):
+    m = {'id': f.get('id'), 'name': _CTRL.sub('', str(f.get('name') or f.get('title') or ''))[:200],
+         'mimetype': f.get('mimetype'), 'size': f.get('size'), 'subtype': f.get('subtype')}
+    if str(f.get('mimetype') or '').split('/')[0] in ('audio', 'video') or f.get('subtype') == 'slack_audio':
+        t = _transcript(f)
+        m['transcript'] = t[:8000] if t else None
+        if not t:
+            m['transcript_note'] = 'Slack has no transcript for this clip'
+    return m
+
+
 def read_thread(web, channel, ts):
     r = web.call('conversations.replies', {'channel': channel, 'ts': ts, 'limit': 200})
-    return [{'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')} for m in r.get('messages', [])]
+    out = []
+    for m in r.get('messages', []):
+        row = {'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')}
+        if m.get('files'):
+            row['files'] = [file_meta(f) for f in m['files'] if isinstance(f, dict)]
+        out.append(row)
+    return out
+
+
+def fetch_file(web, channels, defaults, channel, ts, file_id):
+    """One file from one allowlisted thread message, checked; returns
+    (file id, extension, bytes). Shared by plain mode and the daemon, so the
+    guards cannot differ between them."""
+    if channel not in channels:
+        raise Refused('channel %s is not configured' % channel)
+    cfg = defaults.get('files') or {}
+    allowed = [t for t in cfg.get('types', []) if t in FILE_TYPES]
+    cap = int(cfg.get('max_bytes') or 0)
+    if cap <= 0:
+        raise Refused('file downloads are turned off (_defaults.files.max_bytes)')
+    f, cursor = None, None
+    # Slack pages this method and may return fewer than `limit`, so follow the
+    # cursor (bounded) instead of trusting the first response to hold the message.
+    for _page in range(10):
+        r = web.call('conversations.replies', dict({'channel': channel, 'ts': ts, 'limit': 200},
+                                                   **({'cursor': cursor} if cursor else {})))
+        f = next((f for m in r.get('messages', []) if m.get('ts') == ts
+                  for f in m.get('files') or [] if isinstance(f, dict) and f.get('id') == file_id), None)
+        cursor = (r.get('response_metadata') or {}).get('next_cursor')
+        if f is not None or not cursor:
+            break
+    if f is None:
+        raise Refused('file %s is not on message %s' % (file_id, ts))
+    if f.get('mode') in ('external', 'file_access') or f.get('is_external') or f.get('filetype') == 'remote':
+        raise Refused('file %s is external or remote; not downloaded' % file_id)
+    mime = f.get('mimetype')
+    if mime not in allowed:
+        raise Refused('file type %s is not allowed (allowed: %s)' % (mime, ', '.join(allowed) or 'none'))
+    size = f.get('size')
+    if not isinstance(size, int) or size > cap:
+        raise Refused('file %s is larger than %d bytes' % (file_id, cap))
+    if not re.fullmatch(r'[A-Za-z0-9]{1,32}', str(file_id)):
+        raise Refused('bad file id')
+    try:
+        data = web.download(f.get('url_private'), cap)
+    except SlackError as e:
+        raise Refused('download failed: %s' % e)
+    ext, sig = FILE_TYPES[mime]
+    if not sig(data):
+        raise Refused('file %s is not a real %s (first bytes do not match)' % (file_id, mime))
+    return file_id, ext, data
+
+
+def save_file(file_id, ext, data, total_cap=0, directory=None):
+    """Write the bytes under this user's state dir as <file id>.<ext>, mode
+    0600, .part then rename; prune the oldest files past total_cap."""
+    if total_cap and len(data) > total_cap:
+        raise Refused('file is larger than the total file cache (%d bytes)' % total_cap)
+    d = directory or os.path.join(state_dir(), 'files')
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    final = os.path.join(d, '%s.%s' % (file_id, ext))
+    part = '%s.%d.part' % (final, os.getpid())
+    try:
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+        os.rename(part, final)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
+    if total_cap:
+        files = sorted(((os.stat(p).st_mtime, p) for p in (os.path.join(d, n) for n in os.listdir(d))
+                        if os.path.isfile(p) and p != final), reverse=True)
+        used = len(data)
+        for _mt, p in files:
+            used += os.path.getsize(p)
+            if used > total_cap:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    return final
 
 
 def client_gone(conn):
@@ -1670,6 +1837,11 @@ def handle_request(ctx, uid, req, conn=None):
             if args[0] not in channels:
                 raise Refused('channel %s is not configured' % args[0])
             return {'ok': True, 'messages': read_thread(ctx.web, *args)}
+        if cmd == 'file':
+            if len(args) != 3:
+                raise Refused('usage: file CHANNEL TS FILE_ID')
+            return dict(execute(Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot,
+                                       session=session), cmd, args), ok=True)
         w = Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot, session=session)
         w.team = ctx.bot.get('team') or ''
         if not ctx.write_lock.acquire(timeout=LOCK_WAIT_S):
@@ -1998,8 +2170,14 @@ def _main(cmd, rest):
             print('daemon: no status file (never started)')
         return 0
     if cmd == 'thread' and len(rest) == 2:
+        if rest[0] not in channels:
+            raise Refused('channel %s is not configured' % rest[0])
         for m in read_thread(web, *rest):
             print(json.dumps(m))
+        return 0
+    if cmd == 'file' and len(rest) == 3:
+        fid, ext, data = fetch_file(web, channels, defaults, *rest)
+        print(save_file(fid, ext, data, defaults['files'].get('total_bytes') or 0))
         return 0
     if cmd not in SOCKET_COMMANDS:
         print(USAGE, file=sys.stderr)
@@ -2047,6 +2225,11 @@ def _socket_main(sock, cmd, rest):
     if cmd not in SOCKET_COMMANDS:
         print(USAGE, file=sys.stderr)
         return 2
+    if cmd == 'file' and len(rest) == 3:
+        r = socket_call(sock, cmd, rest)
+        print(save_file(r['id'], r['ext'], base64.b64decode(r['data']),
+                        load_config()[1]['files'].get('total_bytes') or 0))
+        return 0
     r = socket_call(sock, cmd, rest)
     print(json.dumps({k: v for k, v in r.items() if k != 'ok'}))
     return 0
