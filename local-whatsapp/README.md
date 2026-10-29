@@ -83,7 +83,11 @@ sends no automatic receipt by default. For diagnostic receipts, start the bridge
 with `LOCAL_WHATSAPP_DEBUG=1`; unset it and restart to disable them. Other values
 do not enable debug mode. On agent-box, set this variable in the settings secrets
 panel and restart the bridge. Agent replies and responses to explicit commands
-remain enabled, and delivery errors are logged to stderr. Send `@agent /sessions` to list available agent-box
+remain enabled, and delivery errors are logged to stderr. Pairing failures also
+write JSON diagnostics with an opaque attempt ID, failure stage, stable category,
+and provider status code when available. They never include the phone number,
+pairing code, raw provider error, or response body. Send `@agent /sessions` to
+list available agent-box
 sessions and `@agent /target NAME` to select one, even if it is currently
 stopped. Before delivering the next message, the bridge asks agent-box to
 reactivate that stopped session through its normal capacity policy. A refusal
