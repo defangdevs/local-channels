@@ -1264,5 +1264,139 @@ class TestCredentials(unittest.TestCase):
         self.assertIn('WARNING: SLACK_BOT_TOKEN', buf.getvalue())
 
 
+class TestFiles(unittest.TestCase):
+    """thread lists files; `file` downloads one behind every guard."""
+    PNG = b'\x89PNG\r\n\x1a\n' + b'x' * 20
+    URL = 'https://files.slack.com/files-pri/T1-F1/a.png'
+
+    def fobj(self, **kw):
+        f = {'id': 'F1', 'name': '../../.bashrc', 'mimetype': 'image/png', 'size': 28,
+             'url_private': self.URL, 'subtype': None}
+        f.update(kw)
+        return f
+
+    def setUp(self):
+        self.files = [self.fobj()]
+        self.body = self.PNG
+        self.downloads = []
+        outer = self
+
+        class W:
+            def call(s, method, params=None, **kw):
+                return {'ok': True, 'messages': [{'ts': '1.1', 'user': 'U1', 'text': '', 'files': outer.files}]}
+
+            def download(s, url, cap):
+                outer.downloads.append(url)
+                if len(outer.body) > cap:
+                    raise slack.SlackError('file_too_large')
+                return outer.body
+        self.web = W()
+        self.channels = {'C1': slack.DEFAULT_CHANNEL}
+        self.defaults = slack._merge(slack.DEFAULT_DEFAULTS, {})
+        self.dir = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def fetch(self, ch='C1', ts='1.1', fid='F1'):
+        return slack.fetch_file(self.web, self.channels, self.defaults, ch, ts, fid)
+
+    def test_thread_lists_files_without_url(self):
+        self.files.append(self.fobj(id='F2', name='a\x00b\n' + 'n' * 300, mimetype='audio/mp4',
+                                    transcription={'status': 'complete', 'preview': {'content': 'hello'}}))
+        self.files.append(self.fobj(id='F3', mimetype='audio/mp4'))
+        rows = slack.read_thread(self.web, 'C1', '1.1')
+        fs = rows[0]['files']
+        self.assertNotIn('url_private', json.dumps(rows))
+        self.assertEqual((fs[0]['id'], fs[0]['mimetype'], fs[0]['size']), ('F1', 'image/png', 28))
+        self.assertEqual(fs[1]['transcript'], 'hello')
+        self.assertTrue(fs[1]['name'].startswith('ab') and len(fs[1]['name']) <= 200)
+        self.assertIsNone(fs[2]['transcript'])
+        self.assertIn('transcript_note', fs[2])
+
+    def test_happy_path_saves_by_id_with_mode_0600(self):
+        fid, ext, data = self.fetch()
+        path = slack.save_file(fid, ext, data, directory=self.dir)
+        self.assertEqual(os.path.basename(path), 'F1.png')
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.listdir(self.dir), ['F1.png'])
+
+    def test_refusals(self):
+        cases = [
+            ('unknown channel', dict(ch='C9'), None),
+            ('not in thread', dict(fid='F9'), None),
+            ('external', {}, dict(mode='external')),
+            ('remote', {}, dict(filetype='remote')),
+            ('svg', {}, dict(mimetype='image/svg+xml')),
+            ('html', {}, dict(mimetype='text/html')),
+            ('pdf off by default', {}, dict(mimetype='application/pdf')),
+            ('oversize declared', {}, dict(size=21 * 1024 * 1024)),
+        ]
+        for name, kw, over in cases:
+            self.files[:] = [self.fobj(**(over or {}))]
+            with self.subTest(name), self.assertRaises(slack.Refused):
+                self.fetch(**kw)
+        self.assertEqual(self.downloads, [])
+
+    def test_oversize_stream_and_html_body_refused(self):
+        self.body = b'\x89PNG\r\n\x1a\n' + b'x' * (21 * 1024 * 1024)
+        with self.assertRaises(slack.Refused):
+            self.fetch()
+        self.body = b'<html>sign in</html>'
+        with self.assertRaises(slack.Refused):
+            self.fetch()
+
+    def test_pdf_opt_in(self):
+        self.defaults['files']['types'].append('application/pdf')
+        self.files[:] = [self.fobj(mimetype='application/pdf')]
+        self.body = b'%PDF-1.7 ...'
+        self.assertEqual(self.fetch()[1], 'pdf')
+
+    def test_save_failure_leaves_no_part_and_prunes(self):
+        os.makedirs(self.dir, exist_ok=True)
+        os.symlink('/nonexistent', os.path.join(self.dir, 'F1.png.%d.part' % os.getpid()))
+        with self.assertRaises(OSError):
+            slack.save_file('F1', 'png', b'x', directory=self.dir)
+        self.assertEqual(os.listdir(self.dir), [])  # O_NOFOLLOW refused; no .part left
+        slack.save_file('F2', 'png', b'a' * 10, directory=self.dir)
+        os.utime(os.path.join(self.dir, 'F2.png'), (1, 1))
+        slack.save_file('F3', 'png', b'b' * 10, total_cap=15, directory=self.dir)
+        self.assertEqual(os.listdir(self.dir), ['F3.png'])
+
+    def test_download_host_and_redirects(self):
+        web = slack.Web('xoxb-secret')
+        for url in ('http://files.slack.com/x', 'https://evil.example/x',
+                    'https://files.slack.com.evil.example/x', 'https://files.slack.com:8443/x'):
+            with self.assertRaises(slack.SlackError):
+                web.download(url, 100)
+        seen = []
+
+        class H(slack.urllib.request.BaseHandler):
+            handler_order = 100  # ahead of the real HTTPSHandler
+
+            def https_open(s, req):
+                seen.append((req.full_url, req.get_header('Authorization')))
+                import email.message
+                import io
+                hdrs = email.message.Message()
+                hdrs['Location'] = 'https://evil.example/'
+                resp = slack.urllib.response.addinfourl(io.BytesIO(), hdrs, req.full_url, 302)
+                resp.msg = 'Found'
+                return resp  # the opener's own redirect handler must now refuse it
+        real = slack.urllib.request.build_opener
+        slack.urllib.request.build_opener = lambda *h: real(*h, H())
+        self.addCleanup(setattr, slack.urllib.request, 'build_opener', real)
+        with self.assertRaises(slack.SlackError):
+            web.download(self.URL, 100)
+        self.assertEqual([u for u, _ in seen], [self.URL])  # never followed
+
+    def test_socket_and_plain_share_one_check(self):
+        ctx = slack.Ctx(self.web, slack.Store(':memory:'), lambda: self.channels, lambda: self.defaults,
+                        dict(BOT, team='T1'))
+        r = slack.handle_request(ctx, 1, {'cmd': 'file', 'args': ['C1', '1.1', 'F1']})
+        self.assertTrue(r['ok'])
+        self.assertEqual((r['id'], r['ext']), ('F1', 'png'))
+        r = slack.handle_request(ctx, 1, {'cmd': 'file', 'args': ['C9', '1.1', 'F1']})
+        self.assertFalse(r['ok'])
+
+
 if __name__ == '__main__':
     unittest.main()
