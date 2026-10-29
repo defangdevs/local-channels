@@ -107,6 +107,27 @@ esac
   return { dir, state, fakeOut, sessionBin };
 }
 
+async function runPairFailure(fixture, envOverrides) {
+  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
+    env: { ...process.env, ...envOverrides },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let errors = '';
+  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  const code = await new Promise((resolve) => pair.once('exit', resolve));
+  return { code, errors };
+}
+
+function pairingFailureDiagnostic(errors) {
+  const diagnostic = errors
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line))
+    .find((line) => line.event === 'whatsapp_pairing_failed');
+  assert.ok(diagnostic, 'pairing failure diagnostic is present');
+  return diagnostic;
+}
+
 test('pair exits successfully when the newly linked socket closes', async () => {
   const fixture = setup();
   const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
@@ -125,124 +146,76 @@ test('pair exits successfully when the newly linked socket closes', async () => 
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test('pairing failures log safe diagnostics without provider details or phone data', async () => {
-  const fixture = setup();
-  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
-    env: {
-      ...process.env,
+const pairingFailures = [
+  {
+    name: 'provider refusal omits provider details and phone data',
+    env: (fixture) => ({
       LOCAL_WHATSAPP_STATE_DIR: fixture.state,
       LOCAL_WHATSAPP_PHONE: '14155551234',
       FAKE_PAIR: '1',
       FAKE_PAIR_REQUEST_FAIL: '1',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let errors = '';
-  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
-  try {
-    const code = await new Promise((resolve) => pair.once('exit', resolve));
-    assert.equal(code, 1);
-    const diagnostic = errors
-      .split('\n')
-      .filter((line) => line.startsWith('{'))
-      .map((line) => JSON.parse(line))
-      .find((line) => line.event === 'whatsapp_pairing_failed');
-    assert.deepEqual(diagnostic, {
-      event: 'whatsapp_pairing_failed',
-      attemptId: diagnostic.attemptId,
-      phase: 'request_code',
-      category: 'pairing_code_rejected',
-      statusCode: 400,
-    });
-    assert.match(diagnostic.attemptId, /^[0-9a-f-]{36}$/);
-    assert.doesNotMatch(errors, /14155551234|SECRET-CODE|private provider response/);
-  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
-});
-
-test('pairing logs credential-save failures without exposing the error', async () => {
-  const fixture = setup();
-  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
-    env: {
-      ...process.env,
+    }),
+    phase: 'request_code',
+    category: 'pairing_code_rejected',
+    statusCode: 400,
+    redacted: /14155551234|SECRET-CODE|private provider response/,
+  },
+  {
+    name: 'connection credential-save failure omits the raw error',
+    env: (fixture) => ({
       LOCAL_WHATSAPP_STATE_DIR: fixture.state,
       LOCAL_WHATSAPP_PHONE: '14155551234',
       FAKE_PAIR: '1',
       FAKE_FAIL_SAVE_CREDS: '1',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let errors = '';
-  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
-  try {
-    const code = await new Promise((resolve) => pair.once('exit', resolve));
-    assert.equal(code, 1);
-    const diagnostic = errors
-      .split('\n')
-      .filter((line) => line.startsWith('{'))
-      .map((line) => JSON.parse(line))
-      .find((line) => line.event === 'whatsapp_pairing_failed');
-    assert.equal(diagnostic.phase, 'connection');
-    assert.equal(diagnostic.category, 'pairing_setup_failed');
-    assert.doesNotMatch(errors, /private credential write failure/);
-  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
-});
-
-test('pairing logs creds.update write failures without exposing the error', async () => {
-  const fixture = setup();
-  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
-    env: {
-      ...process.env,
+    }),
+    phase: 'connection',
+    category: 'pairing_setup_failed',
+    redacted: /private credential write failure/,
+  },
+  {
+    name: 'creds.update write failure omits the raw error',
+    env: (fixture) => ({
       LOCAL_WHATSAPP_STATE_DIR: fixture.state,
       LOCAL_WHATSAPP_PHONE: '14155551234',
       FAKE_PAIR: '1',
       FAKE_CREDS_UPDATE: '1',
       FAKE_FAIL_SAVE_CREDS: '1',
+    }),
+    phase: 'credentials',
+    category: 'pairing_setup_failed',
+    redacted: /private credential write failure/,
+  },
+  {
+    name: 'private-directory setup failure omits filesystem details',
+    env: (fixture) => {
+      const blockedState = join(fixture.dir, 'blocked-state');
+      writeFileSync(blockedState, 'not a directory');
+      return {
+        LOCAL_WHATSAPP_STATE_DIR: blockedState,
+        LOCAL_WHATSAPP_PHONE: '14155551234',
+      };
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let errors = '';
-  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
-  try {
-    const code = await new Promise((resolve) => pair.once('exit', resolve));
-    assert.equal(code, 1);
-    const diagnostic = errors
-      .split('\n')
-      .filter((line) => line.startsWith('{'))
-      .map((line) => JSON.parse(line))
-      .find((line) => line.event === 'whatsapp_pairing_failed');
-    assert.equal(diagnostic.phase, 'credentials');
-    assert.equal(diagnostic.category, 'pairing_setup_failed');
-    assert.doesNotMatch(errors, /private credential write failure/);
-  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
-});
+    phase: 'setup',
+    category: 'pairing_setup_failed',
+    redacted: /blocked-state|EEXIST|not a directory/,
+  },
+];
 
-test('pairing logs private-directory setup failures without exposing filesystem details', async () => {
-  const fixture = setup();
-  const blockedState = join(fixture.dir, 'blocked-state');
-  writeFileSync(blockedState, 'not a directory');
-  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
-    env: {
-      ...process.env,
-      LOCAL_WHATSAPP_STATE_DIR: blockedState,
-      LOCAL_WHATSAPP_PHONE: '14155551234',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+for (const scenario of pairingFailures) {
+  test(`pairing failure logs safe diagnostic: ${scenario.name}`, async () => {
+    const fixture = setup();
+    try {
+      const result = await runPairFailure(fixture, scenario.env(fixture));
+      assert.equal(result.code, 1);
+      const diagnostic = pairingFailureDiagnostic(result.errors);
+      assert.equal(diagnostic.phase, scenario.phase);
+      assert.equal(diagnostic.category, scenario.category);
+      if (scenario.statusCode) assert.equal(diagnostic.statusCode, scenario.statusCode);
+      assert.match(diagnostic.attemptId, /^[0-9a-f-]{36}$/);
+      assert.doesNotMatch(result.errors, scenario.redacted);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
   });
-  let errors = '';
-  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
-  try {
-    const code = await new Promise((resolve) => pair.once('exit', resolve));
-    assert.equal(code, 1);
-    const diagnostic = errors
-      .split('\n')
-      .filter((line) => line.startsWith('{'))
-      .map((line) => JSON.parse(line))
-      .find((line) => line.event === 'whatsapp_pairing_failed');
-    assert.equal(diagnostic.phase, 'setup');
-    assert.equal(diagnostic.category, 'pairing_setup_failed');
-    assert.doesNotMatch(errors, /blocked-state|EEXIST|not a directory/);
-  } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
-});
+}
 
 for (const debug of ['', '0', 'true', '1']) {
 for (const plain of [false, true]) {
