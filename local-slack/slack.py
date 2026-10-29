@@ -1737,9 +1737,17 @@ def fetch_file(web, channels, defaults, channel, ts, file_id):
     cap = int(cfg.get('max_bytes') or 0)
     if cap <= 0:
         raise Refused('file downloads are turned off (_defaults.files.max_bytes)')
-    r = web.call('conversations.replies', {'channel': channel, 'ts': ts, 'limit': 200})
-    f = next((f for m in r.get('messages', []) if m.get('ts') == ts
-              for f in m.get('files') or [] if isinstance(f, dict) and f.get('id') == file_id), None)
+    f, cursor = None, None
+    # Slack pages this method and may return fewer than `limit`, so follow the
+    # cursor (bounded) instead of trusting the first response to hold the message.
+    for _page in range(10):
+        r = web.call('conversations.replies', dict({'channel': channel, 'ts': ts, 'limit': 200},
+                                                   **({'cursor': cursor} if cursor else {})))
+        f = next((f for m in r.get('messages', []) if m.get('ts') == ts
+                  for f in m.get('files') or [] if isinstance(f, dict) and f.get('id') == file_id), None)
+        cursor = (r.get('response_metadata') or {}).get('next_cursor')
+        if f is not None or not cursor:
+            break
     if f is None:
         raise Refused('file %s is not on message %s' % (file_id, ts))
     if f.get('mode') in ('external', 'file_access') or f.get('is_external') or f.get('filetype') == 'remote':
@@ -1765,6 +1773,8 @@ def fetch_file(web, channels, defaults, channel, ts, file_id):
 def save_file(file_id, ext, data, total_cap=0, directory=None):
     """Write the bytes under this user's state dir as <file id>.<ext>, mode
     0600, .part then rename; prune the oldest files past total_cap."""
+    if total_cap and len(data) > total_cap:
+        raise Refused('file is larger than the total file cache (%d bytes)' % total_cap)
     d = directory or os.path.join(state_dir(), 'files')
     os.makedirs(d, mode=0o700, exist_ok=True)
     final = os.path.join(d, '%s.%s' % (file_id, ext))

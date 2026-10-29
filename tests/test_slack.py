@@ -1361,6 +1361,17 @@ class TestFiles(unittest.TestCase):
         slack.save_file('F3', 'png', b'b' * 10, total_cap=15, directory=self.dir)
         self.assertEqual(os.listdir(self.dir), ['F3.png'])
 
+    def test_file_found_on_a_later_page(self):
+        pages = [{'ok': True, 'messages': [], 'response_metadata': {'next_cursor': 'c2'}},
+                 {'ok': True, 'messages': [{'ts': '1.1', 'files': self.files}]}]
+        self.web.call = lambda method, params=None, **kw: pages.pop(0)
+        self.assertEqual(self.fetch()[0], 'F1')
+
+    def test_new_file_larger_than_total_cap_refused(self):
+        with self.assertRaises(slack.Refused):
+            slack.save_file('F1', 'png', b'x' * 11, total_cap=10, directory=self.dir)
+        self.assertEqual(os.listdir(self.dir) if os.path.isdir(self.dir) else [], [])
+
     def test_download_host_and_redirects(self):
         web = slack.Web('xoxb-secret')
         for url in ('http://files.slack.com/x', 'https://evil.example/x',
