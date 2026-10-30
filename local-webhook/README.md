@@ -769,9 +769,12 @@ CI can arrive before the merge webhook. With the durable spool enabled, CI that
 could satisfy an active explicit PR claim's policy waits in the existing inbox
 for up to **60 seconds**, before normal routing (the receiver's reaper interval
 can add scheduling delay). A matching merge wakes only its exact SHA immediately.
-The inbox survives restart and uses its normal delivery-ID deduplication and
-inflight guard, so there is no second replay stream. A known claim is never
-delayed; a policy-filtered event is not held. If the merge is missing or arrives
+Merge-triggered retries notify live peers directly; recovery and reaper retries
+retain their ordinary inbox-drain behavior. The inbox survives restart and uses
+its normal delivery-ID deduplication and inflight guard, so there is no second
+replay stream. A filter already accepting the event does not request a delay;
+another session can still need merge scope, so every session filter is checked.
+A policy-filtered event is not held. If the merge is missing or arrives
 after this window, CI proceeds through normal routing/dispatch without invented
 ownership. With the spool disabled only merge-first delivery is supported.
 The receiver must actually receive the authenticated merge event; there is no

@@ -278,6 +278,21 @@ class TestMergeFollow(StateDirCase):
         self.mod.spool_process(sid, env, at, live=False, enqueue=False)
         return sid
 
+    def test_known_session_does_not_prevent_another_session_waiting_for_merge(self):
+        observer = self.load(LOCAL_WEBHOOK_SESSION='a-observer')
+        result = observer.call_tool({'name': 'webhook_subscribe', 'arguments': {
+            'topic': 'o/r', 'include': ANY_EVENT, 'exclude': {}}})
+        self.assertNotIn('error:', result['content'][0]['text'])
+        self.subscribe()
+        env = self.env('status', ci('status'), delivery='shared-early')
+        sid = self.accept(env)
+        self.assertTrue(os.path.exists(self.mod._inbox_path('new', sid)),
+                        'the already-serving observer bypassed the PR owner grace period')
+        self.accept(self.env())
+        self.assertEqual(self.mod.peer_queue('testsess').names(), [sid])
+        self.assertIn(sid, self.mod.peer_queue('a-observer').names())
+        self.assertIsNone(self.mod.spool_accept(env, 'shared-early'))
+
     def test_ci_before_merge_survives_restart_and_is_fanned_once(self):
         self.subscribe()
         env = self.env('status', ci('status'), delivery='early')
@@ -321,8 +336,8 @@ class TestMergeFollowEndToEnd(EndToEndCase):
                      '--exclude', json.dumps({'path': 'event', 'in': ['pull_request']}), session='owner')
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def ready_peer(self):
-        peer = self.start_peer('owner')
+    def ready_peer(self, **extra):
+        peer = self.start_peer('owner', **extra)
         peer.stdin.write(self.INITIALIZED)
         peer.stdin.flush()
         return peer
@@ -403,6 +418,18 @@ class TestMergeFollowEndToEnd(EndToEndCase):
         self.assertEqual(self.post(ci(), event='workflow_run')[0], 200)
         peer = self.ready_peer()
         self.assertEqual(self.read_peer_line(peer)['params']['meta']['event'], 'workflow_run')
+        self.assertTrue(self.no_line(peer))
+
+    def test_merge_retries_notify_live_peers_without_polling(self):
+        self.subscribe()
+        self.start_daemon()
+        # A one-hour poll makes a missing live doorbell observable without
+        # depending on whether this CI happens to arrive near a normal tick.
+        peer = self.ready_peer(LOCAL_WEBHOOK_SPOOL_POLL_S='3600')
+        self.assertEqual(self.post(ci('status'), event='status', delivery='wake-early')[0], 200)
+        self.assertTrue(self.no_line(peer))
+        self.assertEqual(self.post(merged(self.stamp()), event='pull_request', delivery='wake-merge')[0], 200)
+        self.assertEqual(self.read_peer_line(peer, timeout=3)['params']['meta']['event'], 'status')
         self.assertTrue(self.no_line(peer))
 
     def test_merge_first_works_without_durable_spool(self):

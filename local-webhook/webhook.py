@@ -2437,23 +2437,29 @@ def wait_for_merge(env, at):
         f = read_filter(filter_path_of(key))
         if not f['enabled']:
             continue
+        filter_possible = False
         for e in f['topics']:
             if (entry_expired(e, f['ttlHours'], at)
                     or not match_topic(env['source'], env['key'], e['topic'])):
                 continue
-            if e['include'] is not None and entry_forwards(
+            if entry_forwards(
                     e, env.get('sender', ''), env['event'], env.get('payload'), self_login=None,
                     source=env['source'], key=env['key'], at=at):
-                return False  # already claimed; do not delay known work
+                # This filter will already receive it. Another session can
+                # still need the merge grace period; a broad observer must
+                # not make the CI leave new/ before that owner learns scope.
+                filter_possible = False
+                break
             numbers = pr_numbers(e['include']) if not predicate_error(e['include']) else set()
             if numbers:
                 candidate = dict(e, include=merge_include(e['include'], numbers))
-                possible |= entry_forwards(candidate, env.get('sender', ''), env['event'],
-                                           env.get('payload'), self_login=None)
+                filter_possible |= entry_forwards(candidate, env.get('sender', ''), env['event'],
+                                                  env.get('payload'), self_login=None)
+        possible |= filter_possible
     return possible
 
 
-def retry_merge_ci(env, enqueue):
+def retry_merge_ci(env, enqueue, live=False):
     """Wake only pending CI for this exact merge; the normal inbox handles
     idempotence, fan-out, ownership and dispatch, including after a restart.
     Never replay an event that already left new/.
@@ -2470,7 +2476,7 @@ def retry_merge_ci(env, enqueue):
         if (ci.get('source') != env.get('source') or ci.get('key') != env.get('key')
                 or not path or get_path(ci.get('payload'), path) != sha):
             continue
-        resume_inbox(phase, sid, enqueue=enqueue)
+        resume_inbox(phase, sid, enqueue=enqueue, live=live)
 
 
 # Full payloads outlive delivery, optionally per source (#26/#782). Queue
@@ -2719,7 +2725,7 @@ def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
         _inbox_advance(sid, 'fanned', 'dispatched')
     spool_commit(sid, digest)
     if learned:
-        retry_merge_ci(env, enqueue)
+        retry_merge_ci(env, enqueue, live=live)
 
 
 # ---- the session side: one peer drains its own box ----
@@ -2814,7 +2820,7 @@ def spool_recover():
     return redone, requeued
 
 
-def _inbox_resume(phase, sid, enqueue, now_s=None):
+def _inbox_resume(phase, sid, enqueue, now_s=None, live=False):
     """Finish one inbox record from the step it stopped at. True if it was
     finished; a failure is logged and leaves it for the next pass, until it is
     older than the age bound — then it is discarded, out loud, rather than
@@ -2839,7 +2845,7 @@ def _inbox_resume(phase, sid, enqueue, now_s=None):
             pass
         return False
     try:
-        spool_process(sid, rec['env'], rec['acceptedMs'], live=False, enqueue=enqueue,
+        spool_process(sid, rec['env'], rec['acceptedMs'], live=live, enqueue=enqueue,
                       digest=rec.get('digest') or '', phase=phase)
         return True
     except Exception as e:  # noqa: BLE001 — one record must not stop the rest
@@ -2848,7 +2854,7 @@ def _inbox_resume(phase, sid, enqueue, now_s=None):
         return False
 
 
-def resume_inbox(phase, sid, enqueue, now_s=None):
+def resume_inbox(phase, sid, enqueue, now_s=None, live=False):
     # Merge-triggered retries, the reaper and HTTP handlers can overlap. The
     # existing inflight set must be claimed atomically, not just inspected,
     # or two retries can both dispatch the same accepted delivery.
@@ -2857,7 +2863,7 @@ def resume_inbox(phase, sid, enqueue, now_s=None):
             return False
         SPOOL_INFLIGHT.add(sid)
     try:
-        return _inbox_resume(phase, sid, enqueue, now_s)
+        return _inbox_resume(phase, sid, enqueue, now_s, live=live)
     finally:
         with SPOOL_INFLIGHT_LOCK:
             SPOOL_INFLIGHT.discard(sid)
