@@ -718,6 +718,68 @@ concurrent sessions acting as different GitHub users can then subscribe to the
 same repo with different ignore lists — each mutes only its own echoes, while
 fan-out delivers the event to both.
 
+## Following a PR through its merge (0.37.0)
+
+A session entry with an explicit positive `pull_request.number` include leaf
+(`{"path":"pull_request.number","in":[42]}`) automatically follows PR #42's
+merge. A bare numeric agent-box claim includes that leaf; `pr:42` also has it.
+`issue:42` alone does not. GitHub review payloads carry `pull_request`, whereas
+ordinary PR discussion comments carry `issue.number` and need that extra clause.
+No linked issue/PR lookup or branch association is inferred.
+
+After authenticating a github-format `pull_request` event with `action:closed`,
+`merged:true`, a positive integer PR number, a full 40-hex `merge_commit_sha` and
+a valid `merged_at`, the **receiver** stores bounded `mergeCommits` metadata on
+matching, enabled, unexpired session entries. This works even while the session
+is offline, and close/self-echo excludes do not prevent learning. They still
+prevent the close notification. Standing-watch entries never learn merge scope.
+
+For exactly that source, repository and commit, these CI events can satisfy the
+original PR-number leaf:
+
+| event | SHA path |
+|---|---|
+| `workflow_run` | `workflow_run.head_sha` |
+| `workflow_job` | `workflow_job.head_sha` |
+| `check_run` | `check_run.head_sha` |
+| `check_suite` | `check_suite.head_sha` |
+| `deployment_status` | `deployment.sha` |
+| `status` | `sha` |
+
+The receiver keeps the original `include` tree unchanged on disk and extends
+only its matching PR-number leaves during evaluation. An enclosing `all` with
+a terminal/failure policy stays in force, as do `exclude`, `ignoreSenders`,
+subscription expiry and first-accepting-entry precedence. Delivery, inbox
+fan-out and duplicate-worker suppression all use this same effective scope.
+A predicate restricted to `event:pull_request` still excludes CI; subscribers
+must express the CI relevance policy they want. Later unrelated commits on
+`main`, `master` or any other branch cannot match learned scope.
+
+Learned scope accepts events for **one hour from GitHub's merge timestamp**;
+replays, renewals and warm CI do not extend that deadline. Entries hold at most
+64 learned merges. Expired metadata remains only through the inbox retention
+bound so a restarted peer can evaluate previously accepted deliveries at their
+acceptance time, then is pruned on writes. Removing/replacing the include scope
+clears learned metadata; unsubscribe removes it. Both receiver and session peers
+must run 0.37.0 or later: older writers discard unknown entry fields. Existing
+filter, IPC and HTTP shapes remain compatible; `mergeCommits` is additive
+receiver-managed state, not a new required subscription argument.
+
+CI can arrive before the merge webhook. With the durable spool enabled, CI that
+could satisfy an active explicit PR claim's policy waits in the existing inbox
+for up to **60 seconds**, before normal routing (the receiver's reaper interval
+can add scheduling delay). A matching merge wakes only its exact SHA immediately.
+Merge-triggered retries notify live peers directly; recovery and reaper retries
+retain their ordinary inbox-drain behavior. The inbox survives restart and uses
+its normal delivery-ID deduplication and inflight guard, so there is no second
+replay stream. A filter already accepting the event does not request a delay;
+another session can still need merge scope, so every session filter is checked.
+A policy-filtered event is not held. If the merge is missing or arrives
+after this window, CI proceeds through normal routing/dispatch without invented
+ownership. With the spool disabled only merge-first delivery is supported.
+The receiver must actually receive the authenticated merge event; there is no
+GitHub API backfill of PR relationships.
+
 ## The durable inbox (spool, 0.33.0)
 
 Once a delivery's signature checks out, the sender is done with it and will

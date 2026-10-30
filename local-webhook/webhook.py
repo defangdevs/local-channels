@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.36.0'
+VERSION = '0.37.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -440,6 +440,79 @@ def filter_path_of(key):
 
 
 FILTER_FILE = filter_path_of(FILTER_KEY)
+# Learned scope is deliberately shorter-lived than a session subscription.
+# GitHub's merge timestamp anchors expiry, so replay cannot renew it. Never
+# follow a moving base ref: every row belongs to one source/repo/PR/commit.
+MERGE_TTL_MS = 3600 * 1000
+MERGE_CI_GRACE_MS = 60 * 1000
+MERGE_MAX = 64
+COMMIT_SHA = re.compile(r'^[0-9a-fA-F]{40}$')
+MERGE_SHA_PATHS = {
+    'workflow_run': 'workflow_run.head_sha',
+    'workflow_job': 'workflow_job.head_sha',
+    'check_run': 'check_run.head_sha',
+    'check_suite': 'check_suite.head_sha',
+    'deployment_status': 'deployment.sha',
+    'status': 'sha',
+}
+
+
+def merge_rows(raw):
+    """Ignore corrupt learned state without broadening the original claim."""
+    rows = []
+    for r in raw[:MERGE_MAX] if isinstance(raw, list) else []:
+        if (isinstance(r, dict) and isinstance(r.get('source'), str)
+                and isinstance(r.get('key'), str) and r['key']
+                and type(r.get('number')) is int and r['number'] > 0
+                and isinstance(r.get('sha'), str) and COMMIT_SHA.fullmatch(r['sha'])
+                and parse_ms(r.get('mergedAt')) is not None):
+            rows.append({k: r[k] for k in ('source', 'key', 'number', 'sha', 'mergedAt')})
+    return rows
+
+
+def pr_numbers(pred):
+    """Only positive, explicit PR-number leaves confer transition authority.
+
+    issue.number is discussion/issue scope, not an association to some other
+    implementation PR. Branches, negative rules and repo observers confer no
+    such authority either. Preserve the predicate tree when extending a leaf
+    so its surrounding relevance policy still decides which CI is wanted.
+    """
+    if not isinstance(pred, dict):
+        return set()
+    for op in ('any', 'all'):
+        if isinstance(pred.get(op), list):
+            return set().union(*(pr_numbers(p) for p in pred[op]))
+    if pred.get('path') == 'pull_request.number' and isinstance(pred.get('in'), list):
+        return {n for n in pred['in'] if type(n) is int and n > 0}
+    return set()
+
+
+def merge_include(pred, numbers):
+    if not numbers or not isinstance(pred, dict):
+        return pred
+    for op in ('any', 'all'):
+        if isinstance(pred.get(op), list):
+            return {op: [merge_include(p, numbers) for p in pred[op]]}
+    if pr_numbers(pred) & numbers:
+        # An empty all is the predicate language's true node. This replaces
+        # ONLY the matching scope leaf; it cannot bypass an enclosing policy.
+        return {'all': []}
+    return pred
+
+
+def learned_numbers(e, source, key, event, payload, at):
+    path = MERGE_SHA_PATHS.get(event)
+    sha = get_path(payload, path) if path else None
+    if not isinstance(sha, str) or not COMMIT_SHA.fullmatch(sha):
+        return set()
+    return {r['number'] for r in e.get('mergeCommits', [])
+            if r['source'].lower() == source.lower() and r['key'].lower() == key.lower()
+            and r['sha'].lower() == sha.lower()
+            and parse_ms(r['mergedAt']) - MERGE_CI_GRACE_MS <= at
+            < parse_ms(r['mergedAt']) + MERGE_TTL_MS}
+
+
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
     "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
@@ -459,8 +532,8 @@ FILTER_COMMENT = (
     "entries without timestamps don't expire until a write stamps them). Optional include/exclude are payload "
     "predicates ({any/all: [...]} over {path, in/notIn} whole-value leaves and {path, "
     "contains/notContains} case-insensitive substring leaves, and path may address \"event\"): exclude refuses "
-    "matching events, include accepts ONLY matching ones, and together they are the whole policy — this "
-    "file holds no built-in event vocabulary any more (0.23.0). (Old names when/drop are read as aliases; a "
+    "matching events, include accepts ONLY matching ones, and together they are the whole relevance policy "
+    "(0.23.0). PR merge-follow (0.37.0) extends scope only, never that policy. (Old names when/drop are read as aliases; a "
     "new write always uses include/exclude.) A brand-new session subscription with no exclude given is seeded "
     "with a default noise/direct-self-echo exclude (stars/watches/forks/..., plus direct events from the resolved session login) when its source is "
     "github-format; a re-subscribe never "
@@ -470,7 +543,10 @@ FILTER_COMMENT = (
     "webhook_subscriptions reports which of the three states you are in as filterState absent/invalid/ok. "
     "spawnConfig does nothing in THIS file — it is a dispatch-only field (see the dispatch comment) and "
     "webhook_subscribe refuses it on a session subscription. A configured acceptance adapter "
-    "acknowledges claimed session deliveries and successful spawns, not observer subscriptions."
+    "acknowledges claimed session deliveries and successful spawns, not observer subscriptions. "
+    "Explicit positive pull_request.number include leaves automatically follow authenticated merged PRs "
+    "to their exact merge SHA for one hour from merged_at, retaining the surrounding policy. Receiver-managed "
+    "mergeCommits rows persist this bounded scope; no branch or linked-issue scope is inferred."
 )
 
 # Dispatch subscriptions (issue #1): entries in this file ask for delivery into
@@ -798,6 +874,7 @@ def normalize_entry(t, note_max=NOTE_MAX_WATCH, where=''):
             # (write_filter no longer emits the old names).
             'include': t.get('include', t.get('when', None)),
             'exclude': t.get('exclude', t.get('drop', None)),
+            'mergeCommits': merge_rows(t.get('mergeCommits')),
             'note': t['note'] if isinstance(t.get('note'), str) else '',
             'noteMax': note_max,
             # #93: this watch's own coalescing window, seconds; None = the
@@ -898,6 +975,13 @@ def write_filter(f, path=FILTER_FILE):
             o['include'] = e['include']
         if e['exclude'] is not None:
             o['exclude'] = e['exclude']
+        # Keep expired metadata through the inbox retention bound: routing a
+        # backlog uses its acceptance time, so a peer returning after expiry
+        # must get the same answer for every event in that backlog.
+        rows = [r for r in e.get('mergeCommits', [])
+                if parse_ms(r['mergedAt']) + MERGE_TTL_MS + SPOOL_PEER_MAX_S * 1000 > now_ms()]
+        if rows:
+            o['mergeCommits'] = rows
         if e['spawnConfig']:
             o['spawnConfig'] = e['spawnConfig']
         if e.get('ownership') == 'none':
@@ -1124,7 +1208,8 @@ def predicate_error(pred, where='predicate'):
 _SELF_DEFAULT = object()
 
 
-def entry_forwards(e, sender, event, payload=None, self_login=_SELF_DEFAULT):
+def entry_forwards(e, sender, event, payload=None, self_login=_SELF_DEFAULT,
+                   source='', key='', at=None):
     if e['include'] is not None or e['exclude'] is not None:
         # Most GitHub payloads carry no field of their own named "event" (the
         # X-GitHub-Event header is passed to us separately), so a predicate
@@ -1140,7 +1225,9 @@ def entry_forwards(e, sender, event, payload=None, self_login=_SELF_DEFAULT):
         ctx.setdefault('_senderLower', sender.lower() if sender else None)
         if e['exclude'] is not None and match_predicate(e['exclude'], ctx):
             return False
-        if e['include'] is not None and not match_predicate(e['include'], ctx):
+        include = merge_include(e['include'], learned_numbers(
+            e, source, key, event, payload, now_ms() if at is None else at))
+        if include is not None and not match_predicate(include, ctx):
             return False
     if not e['ignoreSenders'] or not sender:
         return True
@@ -1234,7 +1321,7 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, requ
                 if require_rules and e['include'] is None and e['exclude'] is None:
                     ruleless = True
                     continue
-                if not entry_forwards(e, sender, event, payload):
+                if not entry_forwards(e, sender, event, payload, source=source, key=key, at=now):
                     continue
                 forward = True
                 matched = e
@@ -1316,7 +1403,8 @@ def filter_claims(path, source, key, sender, event, payload=None, at=None):
             # can claim one either — otherwise a keyless event would suppress
             # its own spawn on behalf of a session that will never see it.
             continue
-        if match_topic(source, key, e['topic']) and entry_forwards(e, sender, event, payload):
+        if match_topic(source, key, e['topic']) and entry_forwards(
+                e, sender, event, payload, source=source, key=key, at=now):
             return True
     return False
 
@@ -2276,9 +2364,119 @@ def filter_accepts(path, env, at=None):
         if entry_expired(e, f['ttlHours'], now):
             continue
         if match_topic(env.get('source', ''), key, e['topic']) and entry_forwards(
-                e, env.get('sender', ''), env.get('event', ''), env.get('payload'), self_login=None):
+                e, env.get('sender', ''), env.get('event', ''), env.get('payload'), self_login=None,
+                source=env.get('source', ''), key=key, at=now):
             return True
     return False
+
+
+def learn_merge(env, at):
+    """Receiver only, after authentication and before fan-out or dispatch.
+
+    Learning is scope maintenance, not delivery: a close/self-echo exclude
+    must not prevent learning our own merge. It still suppresses the close
+    notification and applies unchanged to subsequent CI. Every writer uses
+    the existing cross-process filter lock, including CLI subscribe/renew.
+    """
+    p = env.get('payload')
+    pr = g(p, 'pull_request')
+    if (env.get('format') != 'github' or env.get('event') != 'pull_request'
+            or g(p, 'action') != 'closed' or not isinstance(pr, dict)
+            or pr.get('merged') is not True or not env.get('key')):
+        return False
+    number, sha = pr.get('number'), pr.get('merge_commit_sha')
+    merged = parse_ms(pr.get('merged_at'))
+    if (type(number) is not int or number <= 0 or not isinstance(sha, str)
+            or not COMMIT_SHA.fullmatch(sha) or merged is None
+            or merged > at + MERGE_CI_GRACE_MS or at >= merged + MERGE_TTL_MS):
+        return False
+    row = {'source': env['source'], 'key': env['key'], 'number': number,
+           'sha': sha.lower(), 'mergedAt': iso_at(merged)}
+    learned = False
+    for key in filter_keys():
+        path = filter_path_of(key)
+        with FILTER_LOCK, filter_file_lock(path):
+            f = read_filter(path)
+            if not f['enabled']:
+                continue
+            changed = False
+            for e in f['topics']:
+                if (entry_expired(e, f['ttlHours'], at)
+                        or not match_topic(env['source'], env['key'], e['topic'])
+                        or predicate_error(e['include']) or number not in pr_numbers(e['include'])):
+                    continue
+                rows = [r for r in e.get('mergeCommits', [])
+                        if parse_ms(r['mergedAt']) + MERGE_TTL_MS + SPOOL_PEER_MAX_S * 1000 > at]
+                prior = next((r for r in rows if r['source'].lower() == row['source'].lower()
+                              and r['key'].lower() == row['key'].lower() and r['number'] == number), None)
+                if prior is None and len(rows) < MERGE_MAX:
+                    e['mergeCommits'] = rows + [row]
+                    changed = True
+                # Replaying an already learned merge is harmless, and may be
+                # recovery after the filter write but before the inbox retry.
+                learned = True
+            if changed:
+                write_filter(f, path)  # propagate failure: the durable inbox retries
+    return learned
+
+
+def wait_for_merge(env, at):
+    """Keep potentially owned CI in the existing inbox briefly, not a second
+    replay cache. Until the merge webhook arrives its PR is unknowable. This
+    wait gives that webhook one minute to establish scope before we dispatch
+    to a new worker. No spool means no out-of-order recovery guarantee.
+    """
+    if env.get('format') != 'github' or now_ms() >= at + MERGE_CI_GRACE_MS:
+        return False
+    path = MERGE_SHA_PATHS.get(env.get('event'))
+    sha = get_path(env.get('payload'), path) if path else None
+    if not isinstance(sha, str) or not COMMIT_SHA.fullmatch(sha) or not env.get('key'):
+        return False
+    possible = False
+    for key in filter_keys():
+        f = read_filter(filter_path_of(key))
+        if not f['enabled']:
+            continue
+        filter_possible = False
+        for e in f['topics']:
+            if (entry_expired(e, f['ttlHours'], at)
+                    or not match_topic(env['source'], env['key'], e['topic'])):
+                continue
+            if entry_forwards(
+                    e, env.get('sender', ''), env['event'], env.get('payload'), self_login=None,
+                    source=env['source'], key=env['key'], at=at):
+                # This filter will already receive it. Another session can
+                # still need the merge grace period; a broad observer must
+                # not make the CI leave new/ before that owner learns scope.
+                filter_possible = False
+                break
+            numbers = pr_numbers(e['include']) if not predicate_error(e['include']) else set()
+            if numbers:
+                candidate = dict(e, include=merge_include(e['include'], numbers))
+                filter_possible |= entry_forwards(candidate, env.get('sender', ''), env['event'],
+                                                  env.get('payload'), self_login=None)
+        possible |= filter_possible
+    return possible
+
+
+def retry_merge_ci(env, enqueue, live=False):
+    """Wake only pending CI for this exact merge; the normal inbox handles
+    idempotence, fan-out, ownership and dispatch, including after a restart.
+    Never replay an event that already left new/.
+    """
+    sha = g(env.get('payload'), 'pull_request', 'merge_commit_sha')
+    for phase, sid, _ in _inbox_records():
+        if phase != 'new':
+            continue
+        rec = SpoolQueue.load(_inbox_path(phase, sid))
+        ci = rec.get('env', {}) if rec else {}
+        if not isinstance(ci, dict):
+            continue
+        path = MERGE_SHA_PATHS.get(ci.get('event'))
+        if (ci.get('source') != env.get('source') or ci.get('key') != env.get('key')
+                or not path or get_path(ci.get('payload'), path) != sha):
+            continue
+        resume_inbox(phase, sid, enqueue=enqueue, live=live)
 
 
 # Full payloads outlive delivery, optionally per source (#26/#782). Queue
@@ -2506,6 +2704,9 @@ def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
     """Everything after the commit point, for one accepted event: per-session
     copies, the live doorbell, the standing-watch record, then the commit —
     starting from `phase`, so recovery resumes a record where it stopped."""
+    learned = learn_merge(env, at)
+    if phase == 'new' and wait_for_merge(env, at):
+        return  # accepted, durable; retry after learning, recovery, or the grace bound
     keys = []
     if phase == 'new':
         keys = spool_fanout(sid, env, at, _inbox_path('new', sid))
@@ -2523,6 +2724,8 @@ def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
         dispatch_event(env, sid=sid, at=at, enqueue=enqueue)  # standing watches (issue #1)
         _inbox_advance(sid, 'fanned', 'dispatched')
     spool_commit(sid, digest)
+    if learned:
+        retry_merge_ci(env, enqueue, live=live)
 
 
 # ---- the session side: one peer drains its own box ----
@@ -2617,7 +2820,7 @@ def spool_recover():
     return redone, requeued
 
 
-def _inbox_resume(phase, sid, enqueue, now_s=None):
+def _inbox_resume(phase, sid, enqueue, now_s=None, live=False):
     """Finish one inbox record from the step it stopped at. True if it was
     finished; a failure is logged and leaves it for the next pass, until it is
     older than the age bound — then it is discarded, out loud, rather than
@@ -2642,13 +2845,28 @@ def _inbox_resume(phase, sid, enqueue, now_s=None):
             pass
         return False
     try:
-        spool_process(sid, rec['env'], rec['acceptedMs'], live=False, enqueue=enqueue,
+        spool_process(sid, rec['env'], rec['acceptedMs'], live=live, enqueue=enqueue,
                       digest=rec.get('digest') or '', phase=phase)
         return True
     except Exception as e:  # noqa: BLE001 — one record must not stop the rest
         print('local-webhook: could not finish the fan-out of %s (%s step): %s — retrying later'
               % (sid, phase, e), file=sys.stderr)
         return False
+
+
+def resume_inbox(phase, sid, enqueue, now_s=None, live=False):
+    # Merge-triggered retries, the reaper and HTTP handlers can overlap. The
+    # existing inflight set must be claimed atomically, not just inspected,
+    # or two retries can both dispatch the same accepted delivery.
+    with SPOOL_INFLIGHT_LOCK:
+        if sid in SPOOL_INFLIGHT:
+            return False
+        SPOOL_INFLIGHT.add(sid)
+    try:
+        return _inbox_resume(phase, sid, enqueue, now_s, live=live)
+    finally:
+        with SPOOL_INFLIGHT_LOCK:
+            SPOOL_INFLIGHT.discard(sid)
 
 
 def _drop_logged(q, rows, why, label):
@@ -2687,7 +2905,7 @@ def spool_reap(now_s=None):
             continue
         print('local-webhook: finishing the interrupted fan-out of %s (%s step)' % (sid, phase),
               file=sys.stderr)
-        _inbox_resume(phase, sid, enqueue=True, now_s=now_s)
+        resume_inbox(phase, sid, enqueue=True, now_s=now_s)
     for q in (SPOOL_INBOX, SPOOL_DISPATCH):
         q.reap_tmp(now_s)
     if DISPATCHER is None:
@@ -4010,6 +4228,11 @@ INSTRUCTIONS = (
     'Subscriptions filter on payload CONTENT with include/exclude predicates (see '
     'webhook_subscribe; old names when/drop still work) — e.g. deliver only issues/PRs being opened, '
     'exclude close/merge echoes without muting their sender, or claim the one PR you are working on. '
+    'Explicit positive pull_request.number include leaves automatically follow authenticated merged PRs '
+    'to their exact merge SHA for one hour from merged_at; surrounding CI policy, excludes and sender '
+    'muting still apply. Issue-only and linked-object claims infer no PR, and no default branch is claimed. '
+    'With the durable spool, potentially owned CI can wait up to 60 seconds for an out-of-order merge '
+    'event (plus reaper scheduling delay); merge-first delivery also works without the spool. '
     'A brand-new session subscription on a github-format source gets a default '
     'noise/direct-self-echo exclude (stars, watches, forks, and direct events from the resolved session '
     'login) unless you pass your own exclude; a re-subscribe never reapplies it, so clearing it with exclude:{} sticks. Another sender is never seeded — those are '
@@ -4115,7 +4338,10 @@ TOOLS = [
             'should NOT land in this session, pass deliver_to:"subagent" — each matching event batch then '
             'spawns a fresh session, and such a subscription must carry include/exclude rules saying which '
             'events are worth one. A deployment acceptance hook may acknowledge claimed deliveries '
-            'and successful spawns externally; observer deliveries are not acknowledged.' % DEFAULT_TTL_HOURS,
+            'and successful spawns externally; observer deliveries are not acknowledged. Explicit positive '
+            'pull_request.number include leaves follow authenticated merges to the exact merge SHA for one '
+            'hour from merged_at, retaining the surrounding event policy. Issue-only claims infer no PR; '
+            'no default branch is claimed.' % DEFAULT_TTL_HOURS,
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -4262,8 +4488,10 @@ TOOLS = [
                         'four. Example — opened issues/PRs plus failing CI: '
                         '{"any": [{"path": "action", "in": ["opened", "reopened"]}, '
                         '{"path": "workflow_run.conclusion", "in": ["failure", "timed_out"]}]}. These rules '
-                        'are the WHOLE policy — this plugin carries no built-in event vocabulary of its own '
-                        '(0.23.0) — so express sender muting inside the predicate too, e.g. {"path": '
+                        'are the WHOLE relevance policy (0.23.0). Explicit positive pull_request.number '
+                        'leaves follow authenticated merges to their exact SHA for one hour from merged_at '
+                        '(0.37.0), extending scope without bypassing that policy. Issue-only claims infer '
+                        'no PR and no branch is added. Express sender muting inside the predicate too, e.g. {"path": '
                         '"sender.login", "notIn": [...]}, rather than combining with ignore_senders. On a '
                         'session subscription an include is also a CLAIM: while this session lives, a '
                         'standing watch with ownership:"required" (the default) will not spawn a second '
@@ -4385,6 +4613,11 @@ def call_tool(params):
                 o['include'] = e['include']
             if e['exclude'] is not None:
                 o['exclude'] = e['exclude']
+            active_merges = [dict(r, expiresAt=iso_at(parse_ms(r['mergedAt']) + MERGE_TTL_MS))
+                             for r in e.get('mergeCommits', [])
+                             if now < parse_ms(r['mergedAt']) + MERGE_TTL_MS]
+            if active_merges:
+                o['mergeCommits'] = active_merges
             if e['spawnConfig']:
                 o['spawnConfig'] = e['spawnConfig']
             if e.get('ownership') == 'none':
@@ -4656,6 +4889,8 @@ def call_tool(params):
                 if raw_renew is not _MISSING:
                     e['renewOnEvent'] = raw_renew
                 if raw_include is not _MISSING:
+                    if e['include'] != (raw_include or None):
+                        e['mergeCommits'] = []
                     e['include'] = raw_include or None
                 if raw_exclude is not _MISSING:
                     e['exclude'] = raw_exclude or None
@@ -4846,6 +5081,10 @@ def deliver(handler, body):
     if src.get('retainPayload') is True and not SPOOL_ENABLED:
         return done(503, 'payload retention requires the durable spool')
     if not SPOOL_ENABLED:
+        try:
+            learn_merge(env, now_ms())
+        except OSError:
+            return done(500, 'merge scope unavailable')
         if not RECEIVER_ONLY:
             handle_event(env)  # legacy: the ingress-owning session gets it too
         broadcast(env)
@@ -5085,7 +5324,13 @@ source or for everything: name a key or a prefix.
                        {"path": "sender.login", "notIn": [...]}). On a session
                        subscription an --include also CLAIMS the events it
                        matches, so a standing watch starts no second agent on
-                       work this session declared
+                       work this session declared. Explicit positive
+                       pull_request.number leaves follow authenticated merges
+                       to the exact merge SHA for one hour from merged_at;
+                       enclosing CI policy, excludes and sender muting remain.
+                       Issue-only claims infer no PR; no branch is added.
+                       With the spool, potentially owned CI waits up to 60s for
+                       a late merge event (plus reaper scheduling delay)
   --exclude JSON       never deliver events matching this predicate (evaluated
                        first, wins over --include). Same shape. Pass '{}' to
                        clear either on re-subscribe. A brand-new "session"
