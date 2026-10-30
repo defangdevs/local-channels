@@ -3048,7 +3048,13 @@ class TestDispatchSpool(SpoolCase):
         d = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q)
         text, meta, env, sid = self.put('github~cap-1', 'held at capacity')
         d.add('o/r', text, meta, env, sid=sid)
-        self.assertTrue(self.wait_for(lambda: d.keys['o/r']['defer_n'] == 1 and d.active == 0))
+        def deferred():
+            # active/defer_n change before _requeue publishes its record, all
+            # under this lock. Observing them unlocked can race that publish
+            # and read a missing record on a busy host.
+            with d.lock:
+                return d.keys['o/r']['defer_n'] == 1 and d.active == 0
+        self.assertTrue(self.wait_for(deferred))
         rec = self.q.load(os.path.join(self.q.new, sid))
         self.assertEqual(rec['deferN'], 1)
         self.assertIsInstance(rec['deferredMs'], int)
