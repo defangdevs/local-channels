@@ -59,7 +59,11 @@ esac
     export const Browsers = { macOS: () => ['Chrome', 'macOS', '1'] };
     export const DisconnectReason = { loggedOut: 401 };
     export async function useMultiFileAuthState() {
-      return { state: { creds: { me: process.env.FAKE_PAIR ? null : { id: '14155551234:1@s.whatsapp.net' } } }, saveCreds: async () => {} };
+      return { state: { creds: { me: process.env.FAKE_PAIR ? null : { id: '14155551234:1@s.whatsapp.net' } } }, saveCreds: async () => {
+        if (process.env.FAKE_FAIL_SAVE_CREDS) {
+          throw new Error('private credential write failure');
+        }
+      } };
     }
     export async function downloadMediaMessage() {
       if (process.env.FAKE_DOWNLOAD_ERROR) throw new Error('media expired');
@@ -68,7 +72,11 @@ esac
     export default function makeWASocket() {
       const ev = new EventEmitter();
       setTimeout(() => {
-        if (process.env.FAKE_PAIR) { ev.emit('connection.update', { qr: 'QR' }); return; }
+        if (process.env.FAKE_PAIR) {
+          ev.emit('connection.update', { qr: 'QR' });
+          if (process.env.FAKE_CREDS_UPDATE) ev.emit('creds.update');
+          return;
+        }
         ev.emit('connection.update', { connection: 'open' });
         ev.emit('messages.upsert', { type: 'notify', messages: [{
           key: { id: process.env.FAKE_INBOUND_ID || 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' },
@@ -78,6 +86,12 @@ esac
       if (process.env.FAKE_FOLLOWUP_TEXT) setTimeout(() => ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'AFTER-CLEAR', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, message: { conversation: process.env.FAKE_FOLLOWUP_TEXT } }] }), 500);
       return { ev, end() { if (process.env.FAKE_PAIR) ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: new Error('closed after pairing') } }); },
         async requestPairingCode() {
+          if (process.env.FAKE_PAIR_REQUEST_FAIL) {
+            throw Object.assign(
+              new Error('private provider response 14155551234 SECRET-CODE'),
+              { output: { statusCode: 400 } },
+            );
+          }
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
           return 'TEST1234';
         }, async sendMessage(jid, payload) {
@@ -93,6 +107,27 @@ esac
   return { dir, state, fakeOut, sessionBin };
 }
 
+async function runPairFailure(fixture, envOverrides) {
+  const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
+    env: { ...process.env, ...envOverrides },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let errors = '';
+  pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  const code = await new Promise((resolve) => pair.once('close', resolve));
+  return { code, errors };
+}
+
+function pairingFailureDiagnostic(errors) {
+  const diagnostic = errors
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line))
+    .find((line) => line.event === 'whatsapp_pairing_failed');
+  assert.ok(diagnostic, 'pairing failure diagnostic is present');
+  return diagnostic;
+}
+
 test('pair exits successfully when the newly linked socket closes', async () => {
   const fixture = setup();
   const pair = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'pair'], {
@@ -104,12 +139,83 @@ test('pair exits successfully when the newly linked socket closes', async () => 
   pair.stdout.on('data', (chunk) => { output += chunk.toString(); });
   pair.stderr.on('data', (chunk) => { errors += chunk.toString(); });
   try {
-    const code = await new Promise((resolve) => pair.once('exit', resolve));
+    const code = await new Promise((resolve) => pair.once('close', resolve));
     assert.equal(code, 0, errors);
     assert.match(output, /TEST1234/);
     assert.match(output, /device linked/);
   } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
 });
+
+const pairingFailures = [
+  {
+    name: 'provider refusal omits provider details and phone data',
+    env: (fixture) => ({
+      LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+      LOCAL_WHATSAPP_PHONE: '14155551234',
+      FAKE_PAIR: '1',
+      FAKE_PAIR_REQUEST_FAIL: '1',
+    }),
+    phase: 'request_code',
+    category: 'pairing_code_rejected',
+    statusCode: 400,
+    redacted: /14155551234|SECRET-CODE|private provider response/,
+  },
+  {
+    name: 'connection credential-save failure omits the raw error',
+    env: (fixture) => ({
+      LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+      LOCAL_WHATSAPP_PHONE: '14155551234',
+      FAKE_PAIR: '1',
+      FAKE_FAIL_SAVE_CREDS: '1',
+    }),
+    phase: 'connection',
+    category: 'pairing_setup_failed',
+    redacted: /private credential write failure/,
+  },
+  {
+    name: 'creds.update write failure omits the raw error',
+    env: (fixture) => ({
+      LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+      LOCAL_WHATSAPP_PHONE: '14155551234',
+      FAKE_PAIR: '1',
+      FAKE_CREDS_UPDATE: '1',
+      FAKE_FAIL_SAVE_CREDS: '1',
+    }),
+    phase: 'credentials',
+    category: 'pairing_setup_failed',
+    redacted: /private credential write failure/,
+  },
+  {
+    name: 'private-directory setup failure omits filesystem details',
+    env: (fixture) => {
+      const blockedState = join(fixture.dir, 'blocked-state');
+      writeFileSync(blockedState, 'not a directory');
+      return {
+        LOCAL_WHATSAPP_STATE_DIR: blockedState,
+        LOCAL_WHATSAPP_PHONE: '14155551234',
+      };
+    },
+    phase: 'setup',
+    category: 'pairing_setup_failed',
+    redacted: /blocked-state|EEXIST|not a directory/,
+  },
+];
+
+for (const scenario of pairingFailures) {
+  test(`pairing failure logs safe diagnostic: ${scenario.name}`, async () => {
+    const fixture = setup();
+    try {
+      const result = await runPairFailure(fixture, scenario.env(fixture));
+      assert.equal(result.code, 1);
+      const diagnostic = pairingFailureDiagnostic(result.errors);
+      assert.equal(diagnostic.phase, scenario.phase);
+      assert.equal(diagnostic.category, scenario.category);
+      if (scenario.statusCode) assert.equal(diagnostic.statusCode, scenario.statusCode);
+      assert.match(diagnostic.attemptId, /^[0-9a-f-]{36}$/);
+      assert.doesNotMatch(result.errors, scenario.redacted);
+    } finally { rmSync(fixture.dir, { recursive: true, force: true }); }
+  });
+}
 
 for (const debug of ['', '0', 'true', '1']) {
 for (const plain of [false, true]) {

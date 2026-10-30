@@ -253,49 +253,96 @@ async function baileys() {
   return { ...library, makeWASocket: library.default || library.makeWASocket };
 }
 
+function pairingStatusCode(error) {
+  const status = error?.output?.statusCode ?? error?.statusCode;
+  return Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : undefined;
+}
+
 async function pair() {
-  ensurePrivateDir(dir);
-  ensurePrivateDir(authPath);
-  const phone = (process.env.LOCAL_WHATSAPP_PHONE || readFileSync(0, 'utf8')).trim().replace(/\D/g, '');
-  if (!/^\d{7,15}$/.test(phone)) throw new Error('enter an international phone number on stdin');
-  const { makeWASocket, useMultiFileAuthState, Browsers } = await baileys();
-  let requested = false;
-  let linked = false;
-  async function connectForPair() {
-    const { state, saveCreds } = await useMultiFileAuthState(authPath);
-    if (state.creds.me && !requested) throw new Error('this device is already paired');
-    const socket = makeWASocket({ auth: state, browser: Browsers.macOS('Chrome'), printQRInTerminal: false, logger });
-    socket.ev.on('creds.update', saveCreds);
-    socket.ev.on('connection.update', async ({ qr, connection, lastDisconnect }) => {
-      if (qr && !requested) {
-        requested = true;
-        try {
-          const code = await socket.requestPairingCode(phone);
-          process.stdout.write(`WhatsApp pairing code: ${code}\n`);
-          process.stdout.write('Enter it in WhatsApp > Linked devices > Link a device > Link with phone number instead.\n');
-        } catch (error) { process.stderr.write(`pairing failed: ${error.message}\n`); process.exit(1); }
-      }
-      if (connection === 'open') {
-        if (linked) return;
-        linked = true;
-        await saveCreds();
-        process.stdout.write('WhatsApp device linked.\n');
-        socket.end();
-        setTimeout(() => process.exit(0), 500);
-      } else if (connection === 'close' && lastDisconnect) {
-        if (linked) return;
-        const code = lastDisconnect.error?.output?.statusCode;
-        if (code === 515) {
-          setTimeout(() => connectForPair().catch((error) => { process.stderr.write(`${error.message}\n`); process.exit(1); }), 1000);
-        } else {
-          process.stderr.write(`pairing connection closed: ${lastDisconnect.error?.message || 'unknown'}\n`);
-          process.exit(1);
-        }
-      }
-    });
+  const attemptId = randomUUID();
+  let failed = false;
+  function fail(phase, category, error, safeMessage) {
+    if (failed) return;
+    failed = true;
+    const statusCode = pairingStatusCode(error);
+    process.stderr.write(`${JSON.stringify({
+      event: 'whatsapp_pairing_failed',
+      attemptId,
+      phase,
+      category,
+      ...(statusCode ? { statusCode } : {}),
+    })}\n`);
+    process.stderr.write(
+      `${safeMessage || `WhatsApp pairing failed (reference ${attemptId}).`}\n`,
+      () => process.exit(1),
+    );
   }
-  await connectForPair();
-  setTimeout(() => { process.stderr.write('pairing timed out\n'); process.exit(1); }, 180000).unref();
+
+  let phone;
+  try {
+    ensurePrivateDir(dir);
+    ensurePrivateDir(authPath);
+    phone = (process.env.LOCAL_WHATSAPP_PHONE || readFileSync(0, 'utf8')).trim().replace(/\D/g, '');
+    if (!/^\d{7,15}$/.test(phone)) {
+      fail('input', 'invalid_phone', undefined, 'Enter an international phone number including its country code.');
+      return;
+    }
+    process.stderr.write(`${JSON.stringify({ event: 'whatsapp_pairing_started', attemptId })}\n`);
+    const { makeWASocket, useMultiFileAuthState, Browsers } = await baileys();
+    let requested = false;
+    let linked = false;
+    async function connectForPair() {
+      const { state, saveCreds } = await useMultiFileAuthState(authPath);
+      if (state.creds.me && !requested) throw new Error('this device is already paired');
+      const socket = makeWASocket({ auth: state, browser: Browsers.macOS('Chrome'), printQRInTerminal: false, logger });
+      socket.ev.on('creds.update', () => {
+        saveCreds().catch((error) => {
+          fail('credentials', 'pairing_setup_failed', error);
+        });
+      });
+      socket.ev.on('connection.update', async ({ qr, connection, lastDisconnect }) => {
+        if (qr && !requested) {
+          requested = true;
+          try {
+            const code = await socket.requestPairingCode(phone);
+            process.stdout.write(`WhatsApp pairing code: ${code}\n`);
+            process.stdout.write('Enter it in WhatsApp > Linked devices > Link a device > Link with phone number instead.\n');
+          } catch (error) {
+            fail('request_code', 'pairing_code_rejected', error);
+          }
+        }
+        if (connection === 'open') {
+          if (linked) return;
+          linked = true;
+          try {
+            await saveCreds();
+          } catch (error) {
+            fail('connection', 'pairing_setup_failed', error);
+            return;
+          }
+          process.stdout.write('WhatsApp device linked.\n');
+          socket.end();
+          setTimeout(() => process.exit(0), 500);
+        } else if (connection === 'close' && lastDisconnect) {
+          if (linked) return;
+          const disconnectCode = lastDisconnect.error?.output?.statusCode;
+          if (disconnectCode === 515) {
+            setTimeout(() => connectForPair().catch((error) => {
+              fail('reconnect', 'pairing_connection_failed', error);
+            }), 1000);
+          } else {
+            fail('connection', 'pairing_connection_closed', lastDisconnect.error);
+          }
+        }
+      });
+    }
+    await connectForPair();
+    setTimeout(() => fail('timeout', 'pairing_timeout'), 180000).unref();
+  } catch (error) {
+    fail('setup', 'pairing_setup_failed', error);
+  }
 }
 
 async function serve() {

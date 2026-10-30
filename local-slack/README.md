@@ -113,8 +113,9 @@ Needs the `files:read` bot scope. Adding a scope means reinstalling the app in
 the workspace that owns it; check afterwards that the bot token is unchanged.
 
 Guards, in both modes: the channel must be configured and the file must be on
-that message; only `_defaults.files.types` (images by default; add
-`application/pdf`; SVG and HTML can never be enabled), at most
+that message; only `_defaults.files.types` (images, PDF, plain text
+(txt, md, csv, json; must decode as UTF-8, no NUL) and audio (webm, mp4/m4a, mp3, ogg,
+wav) by default; SVG, HTML, archives and executables can never be enabled), at most
 `_defaults.files.max_bytes` (20 MiB, checked against the declared size and while
 streaming), oldest files pruned past `total_bytes`; external and remote files
 are refused; the download goes only to `files.slack.com` over https and

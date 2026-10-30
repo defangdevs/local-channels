@@ -346,8 +346,12 @@ DEFAULT_DEFAULTS = {
     'status_marks': {},
     # What `file` may download. Types are MIME types, and only those with a
     # signature in FILE_TYPES can ever be enabled, so SVG and HTML stay out
-    # whatever the config says. PDF is opt-in: add 'application/pdf'.
-    'files': {'types': ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+    # whatever the config says. Images, PDF, plain text and audio are on by
+    # default; narrow the list to turn any of them off.
+    'files': {'types': ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+                        'text/plain', 'text/markdown', 'text/csv', 'application/json',
+                        'audio/webm', 'audio/mp4', 'audio/x-m4a', 'audio/mpeg', 'audio/ogg',
+                        'audio/wav'],
               'max_bytes': 20 * 1024 * 1024, 'total_bytes': 200 * 1024 * 1024},
 }
 
@@ -1677,6 +1681,23 @@ def execute(w, cmd, rest):
     return out
 
 
+def _is_text(b):
+    """Plain text has no signature: it must decode as UTF-8 and hold no NUL."""
+    if b'\x00' in b:
+        return False
+    try:
+        b.decode('utf-8')
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _mpeg_frame(b):
+    """An MPEG audio frame header: 11 sync bits, a valid version and a layer
+    that is not 00 (FF F1 / FF F9 is an AAC ADTS header, not MP3)."""
+    return len(b) > 1 and b[0] == 0xff and b[1] & 0xe0 == 0xe0 and b[1] >> 3 & 3 != 1 and b[1] >> 1 & 3 != 0
+
+
 # MIME type -> (extension, signature check). The saved extension comes from
 # here, never from the sender's file name.
 FILE_TYPES = {
@@ -1685,6 +1706,16 @@ FILE_TYPES = {
     'image/gif': ('gif', lambda b: b[:6] in (b'GIF87a', b'GIF89a')),
     'image/webp': ('webp', lambda b: b[:4] == b'RIFF' and b[8:12] == b'WEBP'),
     'application/pdf': ('pdf', lambda b: b.startswith(b'%PDF-')),
+    'text/plain': ('txt', lambda b: _is_text(b)),
+    'text/markdown': ('md', lambda b: _is_text(b)),
+    'text/csv': ('csv', lambda b: _is_text(b)),
+    'application/json': ('json', lambda b: _is_text(b)),
+    'audio/webm': ('webm', lambda b: b.startswith(b'\x1a\x45\xdf\xa3')),
+    'audio/mp4': ('m4a', lambda b: b[4:8] == b'ftyp'),
+    'audio/x-m4a': ('m4a', lambda b: b[4:8] == b'ftyp'),
+    'audio/mpeg': ('mp3', lambda b: b.startswith(b'ID3') or _mpeg_frame(b)),
+    'audio/ogg': ('ogg', lambda b: b.startswith(b'OggS')),
+    'audio/wav': ('wav', lambda b: b[:4] == b'RIFF' and b[8:12] == b'WAVE'),
 }
 _CTRL = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]')
 
@@ -1716,13 +1747,23 @@ def file_meta(f):
 
 
 def read_thread(web, channel, ts):
-    r = web.call('conversations.replies', {'channel': channel, 'ts': ts, 'limit': 200})
-    out = []
-    for m in r.get('messages', []):
-        row = {'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')}
-        if m.get('files'):
-            row['files'] = [file_meta(f) for f in m['files'] if isinstance(f, dict)]
-        out.append(row)
+    out, cursor = [], None
+    # Slack pages this method; follow the cursor (bounded) so a long thread
+    # lists every message's files, not just the first page's.
+    for _page in range(10):
+        r = web.call('conversations.replies', dict({'channel': channel, 'ts': ts, 'limit': 200},
+                                                   **({'cursor': cursor} if cursor else {})))
+        for m in r.get('messages', []):
+            row = {'ts': m.get('ts'), 'user': m.get('user'), 'text': m.get('text')}
+            if m.get('files'):
+                row['files'] = [file_meta(f) for f in m['files'] if isinstance(f, dict)]
+            out.append(row)
+        cursor = (r.get('response_metadata') or {}).get('next_cursor')
+        if not cursor:
+            break
+    if cursor:
+        # A partial list that looks complete would hide files from the agent.
+        raise Refused('thread %s has more messages than %d pages hold; list is truncated' % (ts, 10))
     return out
 
 
