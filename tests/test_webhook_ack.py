@@ -28,6 +28,7 @@ class TestAcceptanceHook(StateDirCase):
                     'sender': 'someone', 'payload': {'action': 'created', 'comment': {'id': 123}}}
 
     def records(self):
+        self.mod.drain_acks()
         if not os.path.exists(self.log):
             return []
         with open(self.log) as f:
@@ -90,6 +91,7 @@ class TestAcceptanceHook(StateDirCase):
             with patch.object(self.mod.subprocess, 'run', side_effect=result), \
                     patch.object(sys, 'stderr', io.StringIO()) as err:
                 self.assertEqual(self.mod.handle_event(self.env), 'delivered')
+                self.mod.drain_acks()
                 self.assertIn('acknowledgment hook unavailable', err.getvalue())
         self.mod.ACK_CMD = ''
         self.assertEqual(self.mod.handle_event(self.env), 'delivered')

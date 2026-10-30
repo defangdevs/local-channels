@@ -31,6 +31,7 @@ import http.client
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import signal
@@ -1278,7 +1279,7 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, requ
 #     to avoid.
 #   - it answers about the filter as its owner would see it.
 # Expiry is read, never applied: an expired entry claims nothing.
-def filter_claims(path, source, key, sender, event, payload=None):
+def filter_claims(path, source, key, sender, event, payload=None, at=None):
     """Does the filter at `path` DECLARE a claim on this event?
 
     Only entries carrying an `include` predicate are consulted. That is the
@@ -1304,7 +1305,7 @@ def filter_claims(path, source, key, sender, event, payload=None):
     f = read_filter(path)
     if not f['enabled'] or not f['topicsConfigured']:
         return False
-    now = now_ms()
+    now = now_ms() if at is None else at
     for e in f['topics']:
         if e['include'] is None:
             continue
@@ -2847,9 +2848,16 @@ ACK_CMD = os.environ.get('LOCAL_WEBHOOK_ACK_CMD', '')
 ACK_TIMEOUT_S = 10
 
 
-def acknowledge_accepted(envelope, target):
-    if not ACK_CMD or not isinstance(envelope, dict):
-        return
+# Acknowledgments run on ONE background worker behind a bounded queue, so a
+# slow adapter can neither hold up a delivery nor a dispatch slot. A full
+# queue drops the ack (logged): the work was delivered and must not retry.
+ACK_QUEUE_MAX = 64
+_ack_queue = queue.Queue(maxsize=ACK_QUEUE_MAX)
+_ack_lock = threading.Lock()
+_ack_worker = None
+
+
+def _run_ack(envelope, target):
     try:
         result = subprocess.run(
             [ACK_CMD], input=json.dumps({'envelope': envelope, 'target': target}).encode('ascii'),
@@ -2861,6 +2869,43 @@ def acknowledge_accepted(envelope, target):
         # An acknowledgment must never turn successfully delivered work into
         # a retry (and a second worker). Do not echo adapter output/secrets.
         print('local-webhook: acknowledgment hook unavailable; work was delivered', file=sys.stderr)
+
+
+def _ack_loop():
+    while True:
+        envelope, target = _ack_queue.get()
+        try:
+            _run_ack(envelope, target)
+        finally:
+            _ack_queue.task_done()
+
+
+def acknowledge_accepted(envelope, target):
+    global _ack_worker
+    if not ACK_CMD or not isinstance(envelope, dict):
+        return
+    with _ack_lock:
+        if _ack_worker is None or not _ack_worker.is_alive():
+            _ack_worker = threading.Thread(target=_ack_loop, name='ack-worker', daemon=True)
+            _ack_worker.start()
+    try:
+        _ack_queue.put_nowait((envelope, target))
+    except queue.Full:
+        print('local-webhook: acknowledgment queue full; work was delivered', file=sys.stderr)
+
+
+def drain_acks(timeout=ACK_TIMEOUT_S * 2):
+    """Wait (bounded) for queued acknowledgments; used at exit and by tests."""
+    done = threading.Event()
+
+    def wait():
+        _ack_queue.join()
+        done.set()
+    threading.Thread(target=wait, daemon=True).start()
+    done.wait(timeout)
+
+
+atexit.register(drain_acks)
 
 
 def handle_event(env, at=None, sid=None):
@@ -2886,7 +2931,7 @@ def handle_event(env, at=None, sid=None):
     # A repo-wide observer is not an owner. Use the same positive-claim
     # predicate that suppresses a duplicate standing-watch worker.
     if filter_claims(FILTER_FILE, env.get('source', ''), env.get('key', ''),
-                     env.get('sender', ''), env.get('event', ''), env.get('payload')):
+                     env.get('sender', ''), env.get('event', ''), env.get('payload'), at=at):
         acknowledge_accepted(env, FILTER_KEY)
     return 'delivered'
 
