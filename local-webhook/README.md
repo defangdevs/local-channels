@@ -980,6 +980,7 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SESSION` | — | per-session subscription scope; selects `filter.<session>.json` (falls back to `SELF`, then default) |
 | `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets + filters (must be shared across a box's daemon + sessions for fan-out) |
 | `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; resolves `"@self"` in ignore lists (no longer the filter-file key) |
+| `LOCAL_WEBHOOK_ACK_CMD` | unset | optional executable path (no shell), called after successful delivery to a claiming session or successful spawn. JSON stdin: `{ "envelope": <verified event>, "target": "dispatch" or <session key> }`. Timeout 10s; errors logged without retrying work. The adapter owns source-specific reactions and idempotence. No call for filtered/observer deliveries, inbox acceptance, deferred/failed spawns or failed Codex queue delivery |
 | `LOCAL_WEBHOOK_SPAWN_CMD` | — | ingress owner only: shell command run per dispatched event batch (prompt text on stdin, `LOCAL_WEBHOOK_SPAWN_*` env). Unset = dispatch subscriptions are inert |
 | `LOCAL_WEBHOOK_SPAWN_MAX` | `2` | max concurrent spawn commands across all keys |
 | `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | default (a watch's `spawn_window_s` overrides it); seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
@@ -1066,3 +1067,25 @@ Use ordinary subscriptions and standing watches, with their normal filters,
 profiles, ownership and admission. This feature adds no implicit watch or
 email-specific dispatcher. Subaddress/alias normalization is an explicit
 intake choice, and the original recipient must be preserved when normalized.
+
+
+## Acceptance acknowledgments (0.36.0)
+
+A deployment can set `LOCAL_WEBHOOK_ACK_CMD` in both receiver and session-peer
+processes to one executable path. The optional adapter receives the verified
+source envelope as JSON data on stdin after work is handed to a claiming
+session (Claude channel write or successful Codex queue), or after the spawn
+command returns zero. This confirms dispatch acceptance, not that a model
+has started or finished reasoning. Every item in a coalesced batch is passed,
+including recovered items. An observer subscription without an include claim
+receives no acknowledgment. Pending/offline inbox records and deferred
+spawns are not acknowledged until delivery succeeds.
+
+The adapter must treat payloads as untrusted, validate source identities and
+reaction targets, and make repeated acceptance idempotent per source account
+and message. Failures/timeouts are reported and cannot fail or retry already
+delivered work. There is no durable reaction retry queue: a failed reaction
+may be missing until that event is delivered again. This hook carries source
+identity and payload separately, so a deployment can implement GitHub and
+Slack reactions without parsing the rendered prompt. It adds no transport
+reply tool or default external writes to local-webhook itself.
