@@ -196,7 +196,9 @@ class TestTracker(Rig):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, 'c.json')
             open(p, 'w').write(json.dumps({'C1': {'controllers': ['Members']}, 'C2': {'controllers': 'U1'},
-                                           'C3': {'controllers': ['members', 'U1']}, 'C4': {}}))
+                                           'C3': {'controllers': ['members', 'U1']}, 'C4': {},
+                                           'C5': {'controllers': None}, 'C6': {'controllers': False},
+                                           'C7': {'controllers': 0}, 'C8': {'controllers': ''}}))
             ch, _ = slack.load_config(p)
             self.assertEqual(sorted(ch), ['C3', 'C4'])
 

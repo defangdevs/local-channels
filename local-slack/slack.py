@@ -395,7 +395,7 @@ def load_config(path=None):
 
 def _bad_controllers(ctl):
     if not isinstance(ctl, list):
-        return ctl
+        return [ctl]     # a list, so a falsy null/false/0/"" still counts as bad
     return [x for x in ctl if not (x == 'members' or (isinstance(x, str) and re.fullmatch(r'[UW][A-Z0-9]+', x)))]
 
 
