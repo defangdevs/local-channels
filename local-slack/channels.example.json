@@ -41,14 +41,5 @@
       ]
     },
     "retention_days": 30
-  },
-  "_example_shared_channel": {
-    "C0123EXAMPLE": {
-      "allow_external": true,
-      "controllers": [
-        "members",
-        "U0123EXTERNAL"
-      ]
-    }
   }
 }

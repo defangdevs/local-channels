@@ -169,7 +169,18 @@ Set `controllers` to a list of user IDs to allow only those. Put the keyword
 `"members"` in the list to also allow every full home-workspace member, for
 example `"controllers": ["members", "U0123EXTERNAL"]` for a Slack Connect
 channel where a partner's operator steers the bot with the home team. An empty
-list keeps the default.
+list keeps the default. A typo (anything that is not `"members"` or a user ID)
+skips that channel at load with a warning, and `slack.py channels` prints each
+channel's controllers.
+
+"Full member of the home workspace" means a user whose `users.info` `team_id`
+is this workspace's and who is not a guest, bot or `is_stranger`. Slack Connect
+partners are not `is_stranger`, so the `team_id` check is what keeps them out
+unless listed. Enterprise Grid: members of a sibling workspace count as external
+(list them by ID).
+
+A hold has no timeout and only the user who set it can remove it, so a listed
+partner's hold can be ended by the home team only with a drop.
 
 ## Mechanism, not policy
 
