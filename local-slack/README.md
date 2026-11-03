@@ -165,6 +165,11 @@ neither set the per-session cap is shared by everyone on the box.
 
 Controllers (who may `ready`/`hold`/`drop`) default to full workspace members,
 looked up with `users.info`; a failed lookup counts as not a member.
+Set `controllers` to a list of user IDs to allow only those. Put the keyword
+`"members"` in the list to also allow every full home-workspace member, for
+example `"controllers": ["members", "U0123EXTERNAL"]` for a Slack Connect
+channel where a partner's operator steers the bot with the home team. An empty
+list keeps the default.
 
 ## Mechanism, not policy
 

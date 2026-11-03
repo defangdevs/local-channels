@@ -161,6 +161,16 @@ class TestTracker(Rig):
         self.tr.handle(reaction('1.1', 'white_check_mark', user='UG'))
         self.assertEqual(self.actions(), ['message.posted'])
 
+    def test_controllers_members_keyword_adds_listed_users(self):
+        look = {'UM': {'guest': False, 'external': False}, 'UG': {'guest': True, 'external': False},
+                'UX': {'guest': False, 'external': True}, 'UL': {'guest': False, 'external': True}}
+        self.tr.users = lambda uid: look[uid]
+        self.cfg['controllers'] = ['members', 'UL']
+        for uid, ok in (('UM', True), ('UL', True), ('UG', False), ('UX', False)):
+            self.assertEqual(self.tr._controller_ok(self.cfg, uid), ok, uid)
+        self.cfg['controllers'] = ['UL']
+        self.assertFalse(self.tr._controller_ok(self.cfg, 'UM'))
+
     def test_hold_blocks_settle_until_removed(self):
         self.tr.handle(msg('1.1'))
         self.tr.handle(reaction('1.1', 'raised_hand'))

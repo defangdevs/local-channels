@@ -591,8 +591,11 @@ class Tracker:
         return p
 
     def _controller_ok(self, cfg, uid):
-        if cfg['controllers']:
-            return uid in cfg['controllers']
+        ctl = cfg['controllers']
+        if uid in ctl:
+            return True
+        if ctl and 'members' not in ctl:
+            return False
         u = self.users(uid)
         return not u.get('guest') and not u.get('external')
 
@@ -1393,6 +1396,8 @@ USAGE = '''local-slack %s
   slack.py channels
   slack.py channel add CHANNEL_ID [--track all|mention|reaction:EMOJI] [--quiet MIN]
                        [--write] [--allow-external]
+                       (who may react ready/hold/drop: edit "controllers" in the file; a list of
+                       user IDs, optionally with "members" = any full home-workspace member)
   slack.py channel rm CHANNEL_ID
   slack.py thread CHANNEL TS               messages, with each one's files listed
   slack.py file CHANNEL TS FILE_ID         save one allowed file; prints its local path
