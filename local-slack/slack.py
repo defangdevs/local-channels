@@ -377,9 +377,26 @@ def load_config(path=None):
     except (OSError, ValueError):
         return {}, json.loads(json.dumps(DEFAULT_DEFAULTS))
     defaults = _merge(DEFAULT_DEFAULTS, raw.get('_defaults'))
-    channels = {k: _merge(DEFAULT_CHANNEL, v) for k, v in raw.items()
-                if not k.startswith('_') and isinstance(v, dict)}
+    channels = {}
+    for k, v in raw.items():
+        if k.startswith('_') or not isinstance(v, dict):
+            continue
+        c = _merge(DEFAULT_CHANNEL, v)
+        bad = _bad_controllers(c['controllers'])
+        if bad:
+            # The config is the allowlist: a typo must not quietly turn into
+            # "listed users only" (or, worse, widen), so the channel is skipped.
+            print('local-slack: %s skipped: invalid controllers %s (use "members" or user IDs like U0123ABC)'
+                  % (k, bad), file=sys.stderr)
+            continue
+        channels[k] = c
     return channels, defaults
+
+
+def _bad_controllers(ctl):
+    if not isinstance(ctl, list):
+        return [ctl]     # a list, so a falsy null/false/0/"" still counts as bad
+    return [x for x in ctl if not (x == 'members' or (isinstance(x, str) and re.fullmatch(r'[UW][A-Z0-9]+', x)))]
 
 
 def read_raw(path=None):
@@ -591,8 +608,11 @@ class Tracker:
         return p
 
     def _controller_ok(self, cfg, uid):
-        if cfg['controllers']:
-            return uid in cfg['controllers']
+        ctl = cfg['controllers']
+        if uid in ctl:
+            return True
+        if ctl and 'members' not in ctl:
+            return False
         u = self.users(uid)
         return not u.get('guest') and not u.get('external')
 
@@ -1202,10 +1222,13 @@ def drain_outbox(store, emitter, limit=1000):
     return n
 
 
-def make_users_lookup(web, ttl=3600):
+def make_users_lookup(web, home_team, ttl=3600):
     """users.info as {'guest','external'}, cached. Fails CLOSED: on any error
     the user counts as both, so a control reaction from someone Slack could not
-    vouch for is ignored."""
+    vouch for is ignored. A Slack Connect partner is not flagged by
+    `is_stranger` (it is false for users in channels shared with the app), so
+    external is also any user whose `team_id` is not `home_team`; a missing
+    `team_id` counts as external."""
     cache = {}
 
     def users(uid):
@@ -1216,7 +1239,7 @@ def make_users_lookup(web, ttl=3600):
             u = web.call('users.info', {'user': uid})['user']
             out = {'guest': bool(u.get('is_restricted') or u.get('is_ultra_restricted')
                                  or u.get('is_bot') or u.get('deleted')),
-                   'external': bool(u.get('is_stranger'))}
+                   'external': bool(u.get('is_stranger')) or not home_team or u.get('team_id') != home_team}
         except (SlackError, KeyError):
             return {'guest': True, 'external': True}   # not cached: ask again next time
         cache[uid] = (time.time(), out)
@@ -1287,7 +1310,7 @@ def run_daemon():
         threading.Thread(target=go, daemon=True).start()
 
     tracker = Tracker(store, channels, bot, store.outbox_put, lookup=lookup, react=react,
-                      users=make_users_lookup(web), retention_days=defaults['retention_days'],
+                      users=make_users_lookup(web, bot['team']), retention_days=defaults['retention_days'],
                       defaults=defaults)
 
     def prime_channels():
@@ -1393,6 +1416,8 @@ USAGE = '''local-slack %s
   slack.py channels
   slack.py channel add CHANNEL_ID [--track all|mention|reaction:EMOJI] [--quiet MIN]
                        [--write] [--allow-external]
+                       (who may react ready/hold/drop: edit "controllers" in the file; a list of
+                       user IDs, optionally with "members" = any full home-workspace member)
   slack.py channel rm CHANNEL_ID
   slack.py thread CHANNEL TS               messages, with each one's files listed
   slack.py file CHANNEL TS FILE_ID         save one allowed file; prints its local path
@@ -2167,9 +2192,9 @@ def _main(cmd, rest):
     channels, defaults = load_config()
     if cmd == 'channels':
         for cid, c in sorted(channels.items()):
-            print('%s track=%s quiet=%dm write=%s/%s external_ok=%s' % (
+            print('%s track=%s quiet=%dm write=%s/%s external_ok=%s controllers=%s' % (
                 cid, c['track'], c['quiet_minutes'], c['write']['allowed'], c['write']['mode'],
-                c['allow_external']))
+                c['allow_external'], ','.join(c['controllers']) or 'members'))
         return 0
     if cmd == 'channel' and rest[:1] == ['add'] and len(rest) >= 2:
         token = None if os.environ.get('LOCAL_SLACK_SOCKET') else credential('SLACK_BOT_TOKEN')

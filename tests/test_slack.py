@@ -161,6 +161,47 @@ class TestTracker(Rig):
         self.tr.handle(reaction('1.1', 'white_check_mark', user='UG'))
         self.assertEqual(self.actions(), ['message.posted'])
 
+    def test_controllers_members_keyword_adds_listed_users(self):
+        look = {'UM': {'guest': False, 'external': False}, 'UG': {'guest': True, 'external': False},
+                'UX': {'guest': False, 'external': True}, 'UL': {'guest': False, 'external': True}}
+        self.tr.users = lambda uid: look[uid]
+        self.cfg['controllers'] = ['members', 'UL']
+        for uid, ok in (('UM', True), ('UL', True), ('UG', False), ('UX', False)):
+            self.assertEqual(self.tr._controller_ok(self.cfg, uid), ok, uid)
+        self.cfg['controllers'] = ['UL']
+        self.assertFalse(self.tr._controller_ok(self.cfg, 'UM'))
+
+    def test_members_and_listed_partner_through_handle(self):
+        self.cfg['controllers'] = ['members', 'UL']
+        calls = []
+        look = {'UL': {'guest': False, 'external': True}, 'UP': {'guest': False, 'external': True}}
+
+        def users(uid):
+            calls.append(uid)
+            return look[uid]
+        self.tr.users = users
+        self.tr.handle(msg('1.1'))
+        self.tr.handle(reaction('1.1', 'white_check_mark', user='UP'))
+        self.assertEqual(self.actions(), ['message.posted'])
+        self.tr.handle(reaction('1.1', 'white_check_mark', user='UL'))
+        self.assertEqual(self.actions()[-1], 'thread.settled')
+        self.assertEqual(calls, ['UP'])          # a listed ID never needs users.info
+
+    def test_members_with_failed_lookup_is_refused(self):
+        self.cfg['controllers'] = ['members']
+        self.tr.users = lambda uid: {'guest': True, 'external': True}
+        self.assertFalse(self.tr._controller_ok(self.cfg, 'UM'))
+
+    def test_bad_controllers_skip_the_channel(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'c.json')
+            open(p, 'w').write(json.dumps({'C1': {'controllers': ['Members']}, 'C2': {'controllers': 'U1'},
+                                           'C3': {'controllers': ['members', 'U1']}, 'C4': {},
+                                           'C5': {'controllers': None}, 'C6': {'controllers': False},
+                                           'C7': {'controllers': 0}, 'C8': {'controllers': ''}}))
+            ch, _ = slack.load_config(p)
+            self.assertEqual(sorted(ch), ['C3', 'C4'])
+
     def test_hold_blocks_settle_until_removed(self):
         self.tr.handle(msg('1.1'))
         self.tr.handle(reaction('1.1', 'raised_hand'))
@@ -680,12 +721,22 @@ class TestReviewRegressions(Rig):
             def call(s, m, p=None, **kw):
                 if p['user'] == 'UERR':
                     raise slack.SlackError('boom')
-                return {'user': {'is_restricted': p['user'] == 'UG', 'is_stranger': p['user'] == 'UX'}}
-        look = slack.make_users_lookup(W())
+                return {'user': {'is_restricted': p['user'] == 'UG', 'is_stranger': p['user'] == 'UX',
+                                 'team_id': 'T2' if p['user'] == 'UP' else 'T1'}}
+        look = slack.make_users_lookup(W(), 'T1')
         self.assertEqual(look('UERR'), {'guest': True, 'external': True})
         self.assertEqual(look('UG'), {'guest': True, 'external': False})
         self.assertEqual(look('UX'), {'guest': False, 'external': True})
         self.assertEqual(look('UM'), {'guest': False, 'external': False})
+        # A Slack Connect partner has no is_stranger, only a foreign team_id.
+        self.assertEqual(look('UP'), {'guest': False, 'external': True})
+
+    def test_lookup_treats_missing_team_id_as_external(self):
+        class W:
+            def call(s, m, p=None, **kw):
+                return {'user': {}}
+        self.assertTrue(slack.make_users_lookup(W(), 'T1')('U1')['external'])
+        self.assertTrue(slack.make_users_lookup(W(), '')('U1')['external'])
 
     def test_reads_are_form_encoded_and_writes_are_json(self):
         sent = []

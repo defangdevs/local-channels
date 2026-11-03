@@ -4,6 +4,7 @@
     "quiet_minutes": 30,
     "max_wait_hours": 24,
     "resettle": true,
+    "controllers": [],
     "reactions": {
       "ready": "white_check_mark",
       "hold": "raised_hand",
