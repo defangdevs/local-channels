@@ -28,7 +28,8 @@ jobs:
           npm test
 
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04, which has no Python 3.9 build for setup-python.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
