@@ -1835,7 +1835,7 @@ IPC_SOCK = os.path.join(INSTANCE_DIR, '%s.%d.sock' % (FILTER_KEY, os.getpid()))
 # left is the key itself: the fd route is ~29 bytes plus the basename, so a
 # key beyond ~70 bytes still cannot bind and fails loudly with ENAMETOOLONG
 # (the codex peer then refuses to start) rather than being silently renamed.
-SUN_PATH_SAFE = 100
+SUN_PATH_SAFE = 107
 
 
 def _sock_open(path):
@@ -1843,11 +1843,14 @@ def _sock_open(path):
     otherwise a short /proc/self/fd route to the same file."""
     if len(os.fsencode(path)) <= SUN_PATH_SAFE:
         return path, (lambda: None)
+    # The fd number differs between processes (the peer that binds and the
+    # ingress owner that connects), so the length is checked against a
+    # worst-case 7-digit fd: a name that fits for one process fits for all.
+    route = '/proc/self/fd/%s/%s' % ('9' * 7, os.path.basename(path))
+    if len(os.fsencode(route)) > SUN_PATH_SAFE:
+        raise OSError(errno.ENAMETOOLONG, 'socket name too long: %s' % path)
     fd = os.open(os.path.dirname(path), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
     addr = '/proc/self/fd/%d/%s' % (fd, os.path.basename(path))
-    if len(os.fsencode(addr)) > SUN_PATH_SAFE:
-        os.close(fd)
-        raise OSError(errno.ENAMETOOLONG, 'socket name too long: %s' % path)
     return addr, (lambda: os.close(fd))
 
 
@@ -3216,7 +3219,15 @@ def broadcast(env, spool=None):
         try:
             c = socket.socket(socket.AF_UNIX)
             c.settimeout(5)
-            _addr, _close = _sock_open(p)
+            try:
+                _addr, _close = _sock_open(p)
+            except OSError as e:
+                # We cannot BUILD an address for it; that says nothing about
+                # whether the peer is alive, so its socket and marker stay.
+                c.close()
+                print('local-webhook: cannot address peer socket %s (%s) — skipped, not removed'
+                      % (f, e), file=sys.stderr)
+                continue
             try:
                 c.connect(_addr)
             finally:
