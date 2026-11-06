@@ -24,6 +24,7 @@
 import atexit
 import base64
 import contextlib
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -46,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.0'
+VERSION = '0.37.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1823,6 +1824,36 @@ os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
 IPC_SOCK = os.path.join(INSTANCE_DIR, '%s.%d.sock' % (FILTER_KEY, os.getpid()))
 
 
+# AF_UNIX addresses are capped at ~107 bytes (sun_path), and the peer socket's
+# basename carries the session key — a dispatcher-generated hook name such as
+# "agent-hook-<team uuid>-<suffix>" under a normal /home/agent state dir
+# overflows it, the bind fails and a codex peer exits with nothing able to
+# reach it (agent-box#1004). The kernel limits only the string handed to
+# bind()/connect(), not the file's real name, so a long path is reached
+# through an open fd of its directory (/proc/self/fd/N/<name>) instead. The
+# on-disk name — and so peer_scope() and every unlink — is unchanged. What is
+# left is the key itself: the fd route is ~29 bytes plus the basename, so a
+# key beyond ~70 bytes still cannot bind and fails loudly with ENAMETOOLONG
+# (the codex peer then refuses to start) rather than being silently renamed.
+SUN_PATH_SAFE = 107
+
+
+def _sock_open(path):
+    """(address, close) for bind()/connect(): `path` itself when it fits,
+    otherwise a short /proc/self/fd route to the same file."""
+    if len(os.fsencode(path)) <= SUN_PATH_SAFE:
+        return path, (lambda: None)
+    # The fd number differs between processes (the peer that binds and the
+    # ingress owner that connects), so the length is checked against a
+    # worst-case 7-digit fd: a name that fits for one process fits for all.
+    route = '/proc/self/fd/%s/%s' % ('9' * 7, os.path.basename(path))
+    if len(os.fsencode(route)) > SUN_PATH_SAFE:
+        raise OSError(errno.ENAMETOOLONG, 'socket name too long: %s' % path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    addr = '/proc/self/fd/%d/%s' % (fd, os.path.basename(path))
+    return addr, (lambda: os.close(fd))
+
+
 def peer_scope(name):
     """(filter key, pid) encoded in an instance socket filename, or None when
     the name carries no scope — a pre-0.10.0 peer, or something else entirely."""
@@ -3188,7 +3219,19 @@ def broadcast(env, spool=None):
         try:
             c = socket.socket(socket.AF_UNIX)
             c.settimeout(5)
-            c.connect(p)
+            try:
+                _addr, _close = _sock_open(p)
+            except OSError as e:
+                # We cannot BUILD an address for it; that says nothing about
+                # whether the peer is alive, so its socket and marker stay.
+                c.close()
+                print('local-webhook: cannot address peer socket %s (%s) — skipped, not removed'
+                      % (f, e), file=sys.stderr)
+                continue
+            try:
+                c.connect(_addr)
+            finally:
+                _close()
             c.sendall(line)
             c.close()
         except OSError as e:
@@ -3290,7 +3333,11 @@ if not RECEIVER_ONLY and not CLI:
             pass
     try:
         _ipc_srv = socket.socket(socket.AF_UNIX)
-        _ipc_srv.bind(IPC_SOCK)
+        _addr, _close = _sock_open(IPC_SOCK)
+        try:
+            _ipc_srv.bind(_addr)
+        finally:
+            _close()
         _ipc_srv.listen(16)
         threading.Thread(target=_ipc_serve, args=(_ipc_srv,), daemon=True).start()
 

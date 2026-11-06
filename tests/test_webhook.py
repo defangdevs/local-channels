@@ -613,6 +613,25 @@ class TestPeerScope(StateDirCase):
         self.assertEqual(mod.peer_scope(os.path.basename(mod.IPC_SOCK)),
                          ('agent-main', os.getpid()))
 
+    def test_unaddressable_peer_socket_is_skipped_not_unlinked(self):
+        # CodeRabbit on #117: failing to BUILD an address is not proof the
+        # peer is dead; broadcast must leave its socket and marker alone.
+        inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
+        name = 'k' * 120 + '.%d.sock' % os.getpid()
+        sock = os.path.join(inst, name)
+        marker = sock[:-len('.sock')] + '.inbox'
+        open(sock, 'w').close()
+        open(marker, 'w').close()
+        self.mod.broadcast({'source': 'github', 'key': 'o/r', 'event': 'issues', 'payload': {}})
+        self.assertTrue(os.path.exists(sock))
+        self.assertTrue(os.path.exists(marker))
+
+    def test_short_path_is_used_as_is(self):
+        addr, close = self.mod._sock_open('/tmp/a.1.sock')
+        self.assertEqual(addr, '/tmp/a.1.sock')
+        close()
+
     def test_parsing(self):
         p = self.mod.peer_scope
         self.assertEqual(p('agent-main.123.sock'), ('agent-main', 123))
@@ -4028,6 +4047,20 @@ class TestEndToEnd(EndToEndCase):
 
         msg = self.read_peer_line(peer)
         self.assertEqual(msg['params']['meta']['key'], 'acme/repo')
+
+    def test_long_session_key_receives_a_signed_delivery(self):
+        """agent-box#1004: through the REAL listener and broadcast, with the
+        spool off so inbox polling cannot hide a failed socket write."""
+        key = 'agent-hook-0123456789abcdef-0123-4567-89ab-0123456789ab-abcd-wxyz'
+        self.assertGreater(len(os.path.join(self.state, 'instances', key + '.12345.sock')), 107)
+        r = self.cli('subscribe', 'o/r', '--note', 'long key', session=key,
+                     extra_env={'LOCAL_WEBHOOK_SPOOL': 'off'})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon(LOCAL_WEBHOOK_SPOOL='off')
+        peer = self.start_peer(key, LOCAL_WEBHOOK_SPOOL='off')
+        self.assertEqual(self.post(self.ISSUE, event='issues')[0], 200)
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['params']['meta']['event'], 'issues')
 
     def test_gitlab_style_token_source_rejects_wrong_token(self):
         self.add_source('gitlab', format='generic', verification='token',
