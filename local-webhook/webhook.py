@@ -1831,7 +1831,10 @@ IPC_SOCK = os.path.join(INSTANCE_DIR, '%s.%d.sock' % (FILTER_KEY, os.getpid()))
 # reach it (agent-box#1004). The kernel limits only the string handed to
 # bind()/connect(), not the file's real name, so a long path is reached
 # through an open fd of its directory (/proc/self/fd/N/<name>) instead. The
-# on-disk name — and so peer_scope() and every unlink — is unchanged.
+# on-disk name — and so peer_scope() and every unlink — is unchanged. What is
+# left is the key itself: the fd route is ~29 bytes plus the basename, so a
+# key beyond ~70 bytes still cannot bind and fails loudly with ENAMETOOLONG
+# (the codex peer then refuses to start) rather than being silently renamed.
 SUN_PATH_SAFE = 100
 
 
