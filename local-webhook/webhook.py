@@ -24,6 +24,7 @@
 import atexit
 import base64
 import contextlib
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -46,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.0'
+VERSION = '0.37.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1823,6 +1824,30 @@ os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
 IPC_SOCK = os.path.join(INSTANCE_DIR, '%s.%d.sock' % (FILTER_KEY, os.getpid()))
 
 
+# AF_UNIX addresses are capped at ~107 bytes (sun_path), and the peer socket's
+# basename carries the session key — a dispatcher-generated hook name such as
+# "agent-hook-<team uuid>-<suffix>" under a normal /home/agent state dir
+# overflows it, the bind fails and a codex peer exits with nothing able to
+# reach it (agent-box#1004). The kernel limits only the string handed to
+# bind()/connect(), not the file's real name, so a long path is reached
+# through an open fd of its directory (/proc/self/fd/N/<name>) instead. The
+# on-disk name — and so peer_scope() and every unlink — is unchanged.
+SUN_PATH_SAFE = 100
+
+
+def _sock_open(path):
+    """(address, close) for bind()/connect(): `path` itself when it fits,
+    otherwise a short /proc/self/fd route to the same file."""
+    if len(os.fsencode(path)) <= SUN_PATH_SAFE:
+        return path, (lambda: None)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    addr = '/proc/self/fd/%d/%s' % (fd, os.path.basename(path))
+    if len(os.fsencode(addr)) > SUN_PATH_SAFE:
+        os.close(fd)
+        raise OSError(errno.ENAMETOOLONG, 'socket name too long: %s' % path)
+    return addr, (lambda: os.close(fd))
+
+
 def peer_scope(name):
     """(filter key, pid) encoded in an instance socket filename, or None when
     the name carries no scope — a pre-0.10.0 peer, or something else entirely."""
@@ -3188,7 +3213,11 @@ def broadcast(env, spool=None):
         try:
             c = socket.socket(socket.AF_UNIX)
             c.settimeout(5)
-            c.connect(p)
+            _addr, _close = _sock_open(p)
+            try:
+                c.connect(_addr)
+            finally:
+                _close()
             c.sendall(line)
             c.close()
         except OSError as e:
@@ -3290,7 +3319,11 @@ if not RECEIVER_ONLY and not CLI:
             pass
     try:
         _ipc_srv = socket.socket(socket.AF_UNIX)
-        _ipc_srv.bind(IPC_SOCK)
+        _addr, _close = _sock_open(IPC_SOCK)
+        try:
+            _ipc_srv.bind(_addr)
+        finally:
+            _close()
         _ipc_srv.listen(16)
         threading.Thread(target=_ipc_serve, args=(_ipc_srv,), daemon=True).start()
 

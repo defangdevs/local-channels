@@ -613,6 +613,40 @@ class TestPeerScope(StateDirCase):
         self.assertEqual(mod.peer_scope(os.path.basename(mod.IPC_SOCK)),
                          ('agent-main', os.getpid()))
 
+    def test_long_session_key_still_binds_and_receives(self):
+        # agent-box#1004: a dispatcher-generated hook name pushed the socket
+        # path past the AF_UNIX limit and the codex peer exited unreachable.
+        key = 'agent-hook-%s-abcd' % ('0123456789abcdef-0123-4567-89ab' * 1)
+        state = os.path.join(self.state, 'x' * 40)
+        os.makedirs(state)
+        mod = self.load(LOCAL_WEBHOOK_STATE_DIR=state, LOCAL_WEBHOOK_SESSION=key)
+        self.assertGreater(len(mod.IPC_SOCK), 107)
+        self.assertEqual(mod.peer_scope(os.path.basename(mod.IPC_SOCK)), (key, os.getpid()))
+        # The module under test does not bind at import (CLI mode); do what the
+        # peer does with its own path.
+        srv = socket.socket(socket.AF_UNIX)
+        self.addCleanup(srv.close)
+        addr, close = mod._sock_open(mod.IPC_SOCK)
+        try:
+            srv.bind(addr)
+        finally:
+            close()
+        srv.listen(1)
+        self.assertTrue(os.path.exists(mod.IPC_SOCK))
+        addr, close = mod._sock_open(mod.IPC_SOCK)
+        try:
+            c = socket.socket(socket.AF_UNIX)
+            self.addCleanup(c.close)
+            c.settimeout(5)
+            c.connect(addr)
+        finally:
+            close()
+
+    def test_short_path_is_used_as_is(self):
+        addr, close = self.mod._sock_open('/tmp/a.1.sock')
+        self.assertEqual(addr, '/tmp/a.1.sock')
+        close()
+
     def test_parsing(self):
         p = self.mod.peer_scope
         self.assertEqual(p('agent-main.123.sock'), ('agent-main', 123))
