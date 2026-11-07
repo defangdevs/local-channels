@@ -3184,11 +3184,14 @@ class CodexFake:
         bindir = os.path.join(dirpath, 'fake-bin')
         os.makedirs(bindir, exist_ok=True)
         self.log = os.path.join(bindir, 'codex-calls.jsonl')
+        self.cwd_log = os.path.join(bindir, 'codex-cwds.txt')
         self.path = os.path.join(bindir, 'codex')
         with open(self.path, 'w', encoding='utf-8') as f:
             f.write('#!%s\n' % PYTHON)
             f.write('import json, sys\n')
             f.write('open(%r, "a").write(json.dumps(sys.argv[1:]) + "\\n")\n' % self.log)
+            # getcwd() raises when the launch directory is gone, like real codex.
+            f.write('import os\nopen(%r, "a").write(os.getcwd() + "\\n")\n' % self.cwd_log)
             f.write('sys.stdout.write(%r)\n' % (message or ''))
             f.write('sys.exit(%d)\n' % exit_code)
         os.chmod(self.path, 0o755)
@@ -3258,6 +3261,42 @@ class TestCodexDelivery(StateDirCase):
         ok, detail = mod.codex_queue('thr-1', hostile)
         self.assertTrue(ok, detail)
         self.assertEqual(fake.calls(), [['queue', '--thread', 'thr-1', '--message', hostile]])
+
+    def test_queue_survives_a_removed_launch_directory(self):
+        """#119: the caller's cwd was a temporary worktree, deleted after
+        subscribing. The stub calls getcwd(), so inheriting it would fail."""
+        fake = CodexFake(self.state)
+        home = os.path.join(self.state, 'stable-home')
+        os.makedirs(home)
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path, LOCAL_WEBHOOK_CODEX_CWD=home)
+        gone = os.path.join(self.state, 'gone-worktree')
+        os.makedirs(gone)
+        old = os.getcwd()
+        os.chdir(gone)
+        try:
+            os.rmdir(gone)
+            ok, detail = mod.codex_queue('thr-1', 'hi')
+        finally:
+            os.chdir(old)
+        self.assertTrue(ok, detail)
+        with open(fake.cwd_log, encoding='utf-8') as f:
+            self.assertEqual([os.path.realpath(l.strip()) for l in f],
+                             [os.path.realpath(home)])
+
+    def test_codex_cwd_falls_back_when_the_override_is_gone(self):
+        mod = self.load(LOCAL_WEBHOOK_CODEX_CWD=os.path.join(self.state, 'missing'))
+        self.assertTrue(os.path.isdir(mod.codex_cwd()))
+        self.assertNotEqual(mod.codex_cwd(), os.path.join(self.state, 'missing'))
+
+    def test_relative_codex_bin_is_made_absolute(self):
+        old = os.getcwd()
+        os.chdir(self.state)
+        try:
+            mod = self.load(LOCAL_WEBHOOK_CODEX_BIN='./bin/codex')
+        finally:
+            os.chdir(old)
+        self.assertEqual(os.path.realpath(mod.CODEX_BIN),
+                         os.path.realpath(os.path.join(self.state, 'bin', 'codex')))
 
     def test_queue_truncates_a_pathological_payload(self):
         fake = CodexFake(self.state)
