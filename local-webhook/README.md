@@ -1051,6 +1051,7 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` | `200` | max event lines waiting per key; past it the oldest are dropped |
 | `LOCAL_WEBHOOK_CODEX_THREAD` | — | codex thread (UUID or exact session name) this process delivers to; wins over `CODEX_THREAD_ID` / `CODEX_SESSION_ID`, which codex itself exports |
 | `LOCAL_WEBHOOK_CODEX_BIN` | `codex` | the codex CLI to hand deliveries to (`codex queue`) |
+| `LOCAL_WEBHOOK_CODEX_CWD` | home directory | working directory of the codex peer and its `codex queue` calls; never the subscribing shell's cwd, so removing a temporary worktree cannot kill the peer (#119) |
 | `LOCAL_WEBHOOK_CODEX_IDLE` | `300` | seconds with no live subscription before a codex peer exits (min 30) |
 | `LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT` | `30` | seconds before one `codex queue` call is abandoned |
 | `LOCAL_WEBHOOK_CODEX_FAIL_MAX` | `3` | consecutive `codex queue` failures before the peer gives up |

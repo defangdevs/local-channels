@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.1'
+VERSION = '0.37.2'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1450,6 +1450,12 @@ def filter_claims(path, source, key, sender, event, payload=None, at=None):
 #     That is what the idle exit below is for, and why the peer's life is
 #     bounded by the subscriptions rather than by a signal from codex.
 CODEX_BIN = (os.environ.get('LOCAL_WEBHOOK_CODEX_BIN') or '').strip() or 'codex'
+# A relative path (./codex, bin/codex) names a file under the directory the
+# process started in, and codex children now run elsewhere (see codex_cwd), so
+# pin it to an absolute path while the launch directory is still the one the
+# user meant. A bare name ('codex') is a PATH lookup and stays as it is.
+if os.sep in CODEX_BIN:
+    CODEX_BIN = os.path.abspath(CODEX_BIN)
 CODEX_DIR = os.path.join(STATE_DIR, 'codex')
 # Grace period before a peer with no live subscriptions left exits. Not a
 # heartbeat: it is the answer to "this session has stopped subscribing", so it
@@ -1561,6 +1567,31 @@ def pid_alive(pid):
     return True
 
 
+CODEX_CWD = (os.environ.get('LOCAL_WEBHOOK_CODEX_CWD') or '').strip()
+if CODEX_CWD:
+    # Same reason as CODEX_BIN: a relative override means "relative to where
+    # this was launched", which the peer (started elsewhere) cannot know.
+    CODEX_CWD = os.path.abspath(CODEX_CWD)
+
+
+def codex_cwd():
+    """A working directory for the codex peer and its `codex queue` calls that
+    outlives any project checkout (#119).
+
+    Both used to inherit the cwd of whoever ran `subscribe`, typically a
+    disposable git worktree. Once it was removed, `codex queue` failed with
+    "failed to resolve config cwd", the peer hit its failure threshold and
+    exited, and deliveries queued silently. `codex queue` addresses a thread by
+    id, so it needs no particular project: use LOCAL_WEBHOOK_CODEX_CWD if set,
+    else the home directory, else the state dir. The first that still exists
+    wins, so a removed override degrades instead of failing.
+    """
+    for d in (CODEX_CWD, os.path.expanduser('~'), STATE_DIR):
+        if d and os.path.isabs(d) and os.path.isdir(d):
+            return d
+    return os.sep
+
+
 def codex_queue(thread, text):
     """Hand one delivery to a codex session. Returns (ok, detail).
 
@@ -1577,7 +1608,7 @@ def codex_queue(thread, text):
     try:
         p = subprocess.run([CODEX_BIN, 'queue', '--thread', thread, '--message', msg],
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=CODEX_QUEUE_TIMEOUT_S)
+                           timeout=CODEX_QUEUE_TIMEOUT_S, cwd=codex_cwd())
     except FileNotFoundError:
         return False, '%s: command not found (set LOCAL_WEBHOOK_CODEX_BIN)' % CODEX_BIN
     except subprocess.TimeoutExpired:
@@ -1685,12 +1716,19 @@ def ensure_codex_peer(thread, key=None, argv0=None):
     env['LOCAL_WEBHOOK_SESSION'] = key
     env['LOCAL_WEBHOOK_CODEX_THREAD'] = thread
     env['LOCAL_WEBHOOK_PORT'] = '0'
+    # Hand the peer the RESOLVED paths: it starts in codex_cwd(), so a relative
+    # value inherited from our environment would resolve against the wrong
+    # directory there and every delivery would fail after a successful subscribe.
+    env['LOCAL_WEBHOOK_CODEX_BIN'] = CODEX_BIN
+    if CODEX_CWD:
+        env['LOCAL_WEBHOOK_CODEX_CWD'] = CODEX_CWD
     env.pop('LOCAL_WEBHOOK_RECEIVER_ONLY', None)
     try:
         with log:
             p = subprocess.Popen([sys.executable, script, 'codex-peer', '--thread', thread],
                                  stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 env=env, start_new_session=True, close_fds=True)
+                                 env=env, start_new_session=True, close_fds=True,
+                                 cwd=codex_cwd())
     except OSError as e:
         return {'state': 'failed', 'error': 'could not start the peer (%s)' % e}
     info = {'pid': p.pid, 'thread': thread, 'key': key, 'version': VERSION,
