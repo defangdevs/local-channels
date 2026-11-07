@@ -1568,6 +1568,10 @@ def pid_alive(pid):
 
 
 CODEX_CWD = (os.environ.get('LOCAL_WEBHOOK_CODEX_CWD') or '').strip()
+if CODEX_CWD:
+    # Same reason as CODEX_BIN: a relative override means "relative to where
+    # this was launched", which the peer (started elsewhere) cannot know.
+    CODEX_CWD = os.path.abspath(CODEX_CWD)
 
 
 def codex_cwd():
@@ -1712,6 +1716,12 @@ def ensure_codex_peer(thread, key=None, argv0=None):
     env['LOCAL_WEBHOOK_SESSION'] = key
     env['LOCAL_WEBHOOK_CODEX_THREAD'] = thread
     env['LOCAL_WEBHOOK_PORT'] = '0'
+    # Hand the peer the RESOLVED paths: it starts in codex_cwd(), so a relative
+    # value inherited from our environment would resolve against the wrong
+    # directory there and every delivery would fail after a successful subscribe.
+    env['LOCAL_WEBHOOK_CODEX_BIN'] = CODEX_BIN
+    if CODEX_CWD:
+        env['LOCAL_WEBHOOK_CODEX_CWD'] = CODEX_CWD
     env.pop('LOCAL_WEBHOOK_RECEIVER_ONLY', None)
     try:
         with log:

@@ -3285,8 +3285,27 @@ class TestCodexDelivery(StateDirCase):
 
     def test_codex_cwd_falls_back_when_the_override_is_gone(self):
         mod = self.load(LOCAL_WEBHOOK_CODEX_CWD=os.path.join(self.state, 'missing'))
-        self.assertTrue(os.path.isdir(mod.codex_cwd()))
-        self.assertNotEqual(mod.codex_cwd(), os.path.join(self.state, 'missing'))
+        home = os.path.join(self.state, 'home')
+        os.makedirs(home)
+        real = mod.os.path.expanduser
+        try:
+            mod.os.path.expanduser = lambda p: home
+            self.assertEqual(mod.codex_cwd(), home)
+            mod.os.path.expanduser = lambda p: os.path.join(self.state, 'missing-home')
+            self.assertEqual(mod.codex_cwd(), self.state)
+        finally:
+            mod.os.path.expanduser = real
+
+    def test_relative_codex_cwd_is_made_absolute(self):
+        os.makedirs(os.path.join(self.state, 'stable'))
+        old = os.getcwd()
+        os.chdir(self.state)
+        try:
+            mod = self.load(LOCAL_WEBHOOK_CODEX_CWD='./stable')
+        finally:
+            os.chdir(old)
+        self.assertEqual(os.path.realpath(mod.codex_cwd()),
+                         os.path.realpath(os.path.join(self.state, 'stable')))
 
     def test_relative_codex_bin_is_made_absolute(self):
         old = os.getcwd()
