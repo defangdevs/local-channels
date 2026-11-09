@@ -31,7 +31,7 @@ function connectPeer() {
           jsonrpc: '2.0',
           method: 'notifications/claude/channel',
           params: {
-            content: `WhatsApp Message Yourself (${message.id}): ${message.text}${attachmentNotice(message)}\nReply with whatsapp_reply or whatsapp_reply_image using this message id. ${REPLY_GUIDANCE}`,
+            content: `WhatsApp Message Yourself (${message.id}): ${message.text}${attachmentNotice(message)}\nWhen you begin working on this message, call whatsapp_ack with its message id. Reply with whatsapp_reply or whatsapp_reply_image using this message id. ${REPLY_GUIDANCE}`,
             meta: { source: 'local-whatsapp', messageId: message.id, receivedAt: message.receivedAt },
           },
         });
@@ -88,6 +88,10 @@ reader.on('line', async (line) => {
       };
     } else if (message.method === 'tools/list') {
       result = { tools: [{
+        name: 'whatsapp_ack',
+        description: 'Acknowledge that you have begun working on an incoming WhatsApp message.',
+        inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'], additionalProperties: false },
+      }, {
         name: 'whatsapp_reply',
         description: 'Reply to an incoming WhatsApp message in its original chat. Requires its message id.',
         inputSchema: { type: 'object', properties: {
@@ -100,9 +104,10 @@ reader.on('line', async (line) => {
           id: { type: 'string' }, path: { type: 'string', description: 'Absolute local image path' }, caption: { type: 'string', maxLength: 4000 },
         }, required: ['id', 'path'], additionalProperties: false },
       }] };
-    } else if (message.method === 'tools/call' && ['whatsapp_reply', 'whatsapp_reply_image'].includes(message.params?.name)) {
+    } else if (message.method === 'tools/call' && ['whatsapp_ack', 'whatsapp_reply', 'whatsapp_reply_image'].includes(message.params?.name)) {
       const args = message.params.arguments || {};
-      const value = message.params.name === 'whatsapp_reply_image'
+      const value = message.params.name === 'whatsapp_ack' ? { op: 'ack', id: args.id }
+        : message.params.name === 'whatsapp_reply_image'
         ? { op: 'reply-image', id: args.id, path: args.path, caption: args.caption ?? '' }
         : { op: 'reply', id: args.id, text: args.text };
       const reply = await requestReply(value);

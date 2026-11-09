@@ -95,6 +95,8 @@ esac
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
           return 'TEST1234';
         }, async sendMessage(jid, payload) {
+        if (payload.react && process.env.FAKE_HANG_REACTION) return new Promise(() => {});
+        if (payload.react && process.env.FAKE_FAIL_REACTION) throw new Error('simulated reaction failure');
         if (payload.image && process.env.FAKE_FAIL_IMAGE) {
           appendFileSync(process.env.FAKE_FAIL_IMAGE, 'attempt\\n');
           throw new Error('simulated media upload failure');
@@ -247,17 +249,23 @@ test(`bridge delivers ${plain ? 'plain' : 'prefixed'} text and replies with debu
     const delivery = output.find((item) => item.method === 'notifications/claude/channel');
     const id = delivery.params.meta.messageId;
     assert.match(delivery.params.content, /hello/);
+    const beforeAck = existsSync(fixture.fakeOut) ? readFileSync(fixture.fakeOut, 'utf8') : '';
+    assert.ok(!beforeAck.includes('\"react\"'));
+    peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'whatsapp_ack', arguments: { id } } })}\n`);
+    await waitUntil(() => output.some((item) => item.id === 3), 'ack tool');
+    await waitUntil(() => existsSync(fixture.fakeOut) && readFileSync(fixture.fakeOut, 'utf8').includes('\"react\"'), 'reaction');
     peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'whatsapp_reply', arguments: { id, text: 'answer' } } })}\n`);
     await waitUntil(() => output.some((item) => item.id === 2), 'reply tool');
     await waitUntil(() => existsSync(fixture.fakeOut) && readFileSync(fixture.fakeOut, 'utf8').includes('answer'), 'WhatsApp send');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(outbound.every((item) => item.jid === '14155551234@s.whatsapp.net'));
     assert.ok(outbound.some((item) => item.payload.text === 'answer'));
-    assert.equal(outbound.some((item) => item.payload.text.includes('Box: received')), debug === '1');
+    assert.equal(outbound.some((item) => item.payload.text?.includes('Box: received')), debug === '1');
     await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages[id].reply?.status === 'sent', 'persisted reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages[id].reply.status, 'sent');
-    assert.equal(saved.messages[id].ack?.status, debug === '1' ? 'sent' : undefined);
+    assert.equal(saved.messages[id].ack?.status, 'sent');
+    assert.deepEqual(outbound.find((item) => item.payload.react)?.payload.react, { text: '\u{1F440}', key: { id: 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' } });
   } finally {
     if (peer) await stop(peer);
     await stop(daemon);
@@ -267,6 +275,64 @@ test(`bridge delivers ${plain ? 'plain' : 'prefixed'} text and replies with debu
 
 }
 }
+
+test('queued messages cannot be acknowledged before delivery', async () => {
+  const f = setup();
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_FAIL_REACTION: '1' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const saved = () => JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+  try {
+    await waitUntil(() => existsSync(join(f.state, 'messages.json')), 'inbound');
+    const id = Object.keys(saved().messages)[0];
+    assert.equal(saved().messages[id].ack, undefined);
+    const early = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', id], { env, encoding: 'utf8' });
+    assert.notEqual(early.status, 0);
+    assert.equal(saved().messages[id].ack, undefined);
+  } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('a stalled reaction does not block a reply', async () => {
+  const f = setup();
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    m: { id: 'm', chat: '14155551234@s.whatsapp.net', text: 'request', deliveredTo: 'codex:thread',
+      reactionKey: { id: 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, reply: null },
+  }, sentIds: {} }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_INBOUND_TEXT: 'not addressed', FAKE_HANG_REACTION: '1' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(join(f.state, 'bridge.sock')), 'socket');
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', 'm'], { env }).status, 0);
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', 'm', 'answer'], { env }).status, 0);
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('answer'), 'reply despite stalled reaction');
+  } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('reaction failure leaves a reply sendable and retries after restart', async () => {
+  const f = setup();
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    m: { id: 'm', chat: '14155551234@s.whatsapp.net', text: 'request', deliveredTo: 'codex:thread',
+      reactionKey: { id: 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, reply: null },
+  }, sentIds: {} }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_INBOUND_TEXT: 'not addressed' };
+  let daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...env, FAKE_FAIL_REACTION: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const saved = () => JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).messages.m;
+  try {
+    await waitUntil(() => existsSync(join(f.state, 'bridge.sock')), 'socket');
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', 'm'], { env }).status, 0);
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', 'm', 'answer'], { env }).status, 0);
+    await waitUntil(() => saved().reply?.status === 'sent', 'reply');
+    assert.equal(saved().ack.status, 'queued');
+    await stop(daemon);
+    daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitUntil(() => saved().ack.status === 'sent', 'reaction retry');
+    const outbound = readFileSync(f.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(outbound.filter((item) => item.payload.text === 'answer').length, 1);
+    assert.equal(outbound.filter((item) => item.payload.react).length, 1);
+  } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
+});
 
 test('default mode suppresses previously queued receipts while preserving replies', async () => {
   const fixture = setup();
@@ -283,7 +349,7 @@ test('default mode suppresses previously queued receipts while preserving replie
   try {
     await waitUntil(() => existsSync(fixture.fakeOut), 'queued reply');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.deepEqual(outbound.map((item) => item.payload.text), ['old answer']);
+    assert.deepEqual(outbound.filter((item) => item.payload.text).map((item) => item.payload.text), ['old answer']);
     await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages.old.reply?.status === 'sent', 'persisted queued reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages.old.ack.status, 'suppressed');
@@ -315,7 +381,7 @@ test(`bridge routes to Codex after activation returns ${activationResult}`, asyn
     const args = readFileSync(argsFile, 'utf8');
     assert.match(args, /queue\n--thread\ncodex\n--message\n/);
     assert.match(args, /WhatsApp Message Yourself/);
-    assert.match(args, /reply right away with a one-line acknowledgement/);
+    assert.match(args, /send a short progress update/);
   } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });
@@ -466,11 +532,12 @@ test('reply-image CLI queues a durable image, retries after restart, and cleans 
     daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     await waitUntil(() => saved().messages[id].reply.status === 'sent', 'native image sent');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.equal(outbound.length, 1);
-    assert.equal(outbound[0].jid, '14155551234@s.whatsapp.net');
-    assert.equal(outbound[0].payload.caption, 'my picture');
-    assert.equal(outbound[0].payload.mimetype, 'image/png');
-    assert.deepEqual(Buffer.from(outbound[0].payload.image.data), png);
+    const images = outbound.filter((item) => item.payload.image);
+    assert.equal(images.length, 1);
+    assert.equal(images[0].jid, '14155551234@s.whatsapp.net');
+    assert.equal(images[0].payload.caption, 'my picture');
+    assert.equal(images[0].payload.mimetype, 'image/png');
+    assert.deepEqual(Buffer.from(images[0].payload.image.data), png);
     await waitUntil(() => !existsSync(join(fixture.state, 'media-outbox', image)), 'media cleanup');
   } finally {
     await stop(daemon);

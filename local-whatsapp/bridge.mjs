@@ -18,8 +18,8 @@ const configPath = join(dir, 'config.json');
 const codexThreadsPath = join(dir, 'codex-threads.json');
 const authPath = join(dir, 'auth');
 const command = process.argv[2];
-const logger = pino({ level: 'silent' });
 const debugReceipts = process.env.LOCAL_WHATSAPP_DEBUG === '1';
+const logger = pino({ level: 'silent' });
 // LOCAL_WHATSAPP_PREFIX names the agent (default `@<linux user>`). Set it empty
 // to accept every self-chat text without a prefix.
 const addressPrefix = (() => {
@@ -360,6 +360,7 @@ async function serve() {
   let whatsapp = null;
   let connected = false;
   let draining = false;
+  let drainingAcks = false;
   let dispatching = false;
   let dispatchFinished = null;
   let resetting = false;
@@ -367,7 +368,7 @@ async function serve() {
   let inboundQueue = Promise.resolve();
 
   async function sendViaCodex(name, message) {
-    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}${attachmentNotice(message)}\nReply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption]. ${REPLY_GUIDANCE}`;
+    const text = `WhatsApp Message Yourself (${message.id}): ${message.text}${attachmentNotice(message)}\nWhen you begin working on this message, acknowledge it with: node ${fileURLToPath(import.meta.url)} ack ${message.id}. Reply in WhatsApp using: node ${fileURLToPath(import.meta.url)} reply ${message.id} <reply text>. For an image, use: node ${fileURLToPath(import.meta.url)} reply-image ${message.id} <absolute image path> [caption]. ${REPLY_GUIDANCE}`;
     return new Promise((resolve) => {
       const child = spawn(codexBin, ['queue', '--thread', name, '--message', text], { stdio: 'ignore' });
       const timeout = setTimeout(() => child.kill(), 10000);
@@ -412,26 +413,54 @@ async function serve() {
     }
   }
 
+  async function drainAcks() {
+    if (!connected || !whatsapp || drainingAcks) return;
+    drainingAcks = true;
+    try {
+      for (const entry of Object.values(state.messages)) {
+        if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
+        if (entry.clearedAt) continue;
+        if (entry.ack?.status === 'queued') {
+          // Old text receipts cannot identify the original WhatsApp message.
+          if (!entry.reactionKey) {
+            entry.ack.status = 'suppressed';
+            saveState(dir, state);
+          } else {
+            try {
+              await whatsapp.sendMessage(entry.chat, { react: { text: '\u{1F440}', key: entry.reactionKey } });
+              entry.ack.status = 'sent';
+              saveState(dir, state);
+            } catch (error) {
+              // A receipt failure must not prevent the actual reply from sending.
+              process.stderr.write(`ack reaction failed: ${error.message}\n`);
+            }
+          }
+        }
+        if (entry.debugAck?.status === 'queued') {
+          if (!debugReceipts) {
+            entry.debugAck.status = 'suppressed';
+            saveState(dir, state);
+          } else {
+            try {
+              const sent = await whatsapp.sendMessage(entry.chat, { text: entry.debugAck.text });
+              if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
+              entry.debugAck.status = 'sent';
+              saveState(dir, state);
+            } catch (error) { process.stderr.write(`debug receipt failed: ${error.message}\n`); }
+          }
+        }
+      }
+    } finally { drainingAcks = false; }
+  }
+
   async function drainReplies() {
+    drainAcks().catch((error) => process.stderr.write(`ack drain failed: ${error.message}\n`));
     if (!connected || !whatsapp || draining) return;
     draining = true;
     try {
       for (const entry of Object.values(state.messages)) {
         if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
         if (entry.clearedAt) continue;
-        if (entry.ack?.status === 'queued' && !debugReceipts) {
-          // Do not replay old diagnostic receipts after debug mode is disabled.
-          entry.ack.status = 'suppressed';
-          saveState(dir, state);
-        }
-        if (entry.ack?.status === 'queued' && debugReceipts) {
-          try {
-            const sent = await whatsapp.sendMessage(entry.chat, { text: entry.ack.text });
-            if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
-            entry.ack.status = 'sent';
-            saveState(dir, state);
-          } catch (error) { process.stderr.write(`ack send failed: ${error.message}\n`); break; }
-        }
         if (entry.reply?.status !== 'queued') continue;
         try {
           const content = entry.reply.image ? imageReplyContent(dir, entry.reply) : { text: entry.reply.text };
@@ -443,7 +472,7 @@ async function serve() {
             if (timestamp < Date.now() - 30 * 24 * 3600 * 1000) delete state.sentIds[id];
           }
           const completed = Object.values(state.messages)
-            .filter((message) => message.reply?.status === 'sent' || message.clearedAt)
+            .filter((message) => (message.reply?.status === 'sent' && message.ack?.status !== 'queued' && message.debugAck?.status !== 'queued') || message.clearedAt)
             .sort((left, right) => (left.clearedAt || left.reply.sentAt).localeCompare(right.clearedAt || right.reply.sentAt));
           for (const old of completed.slice(0, Math.max(0, completed.length - 1000))) delete state.messages[old.id];
           saveState(dir, state);
@@ -547,6 +576,13 @@ async function serve() {
             }
             peers.set(peer, { session: value.session, id: `${runtimeId}:${++peerSerial}` });
             dispatch().catch((error) => process.stderr.write(`${error.message}\n`));
+          } else if (value.op === 'ack') {
+            const entry = state.messages[value.id];
+            if (!entry || entry.control || entry.clearedAt || !entry.reactionKey || !entry.deliveredTo) throw new Error('message is not available for acknowledgment');
+            if (!entry.ack) entry.ack = { status: 'queued' };
+            saveState(dir, state);
+            peer.write(`${JSON.stringify({ ok: true, status: 'acknowledgment queued', id: entry.id })}\n`);
+            drainReplies().catch((error) => process.stderr.write(`ack drain failed: ${error.message}\n`));
           } else if (value.op === 'reply' || value.op === 'reply-image') {
             const entry = value.op === 'reply-image'
               ? queueImageReply(state, dir, value.id, value.path, value.caption)
@@ -602,7 +638,9 @@ async function serve() {
               inbound.control = true;
               if (inbound.text === '/clear' && !state.resetPending) state.resetPending = inbound.id;
             }
-            else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
+            else {
+              if (debugReceipts) inbound.debugAck = { text: `Box: received ${inbound.id}.`, status: 'queued' };
+            }
             if (addInbound(state, inbound)) {
               saveState(dir, state);
               if (control) await handleControls();
@@ -610,13 +648,7 @@ async function serve() {
                 let dispatchError = null;
                 try { await dispatch(); }
                 catch (error) { dispatchError = error; }
-                const binding = target();
-                const destination = binding ? `${binding.harness} session ${binding.session}` : 'a new session';
-                const delivery = inbound.deliveredTo ? 'routed to' : 'waiting for';
                 if (dispatchError) process.stderr.write(`dispatch failed: ${dispatchError.message}\n`);
-                if (debugReceipts) inbound.ack = { text: dispatchError
-                  ? `Box: ${dispatchError.message}`
-                  : `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
               }
               saveState(dir, state);
               await drainReplies();
@@ -698,6 +730,11 @@ async function main() {
     process.stdout.write(`Target: ${harness} session ${name}\n`);
     return;
   }
+  if (command === 'ack') {
+    const result = await request({ op: 'ack', id: process.argv[3] });
+    process.stdout.write(`${result.status}\n`);
+    return;
+  }
   if (command === 'reply-image') {
     const [id, path, ...caption] = process.argv.slice(3);
     const result = await request({ op: 'reply-image', id, path, caption: caption.join(' ') });
@@ -720,7 +757,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ ...await request({ op: 'status' }), profile: config().profile }, null, 2)}\n`);
     return;
   }
-  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|receive-files|reply ID TEXT|reply-image ID ABSOLUTE_PATH [CAPTION]|status');
+  throw new Error('usage: bridge.mjs pair|serve|target claude|codex AGENT_BOX_SESSION|register codex|receive-files|ack ID|reply ID TEXT|reply-image ID ABSOLUTE_PATH [CAPTION]|status');
 }
 
 main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });

@@ -13,7 +13,7 @@ export const MAX_IMAGE_OUTBOX = 20;
 // The sender sees only WhatsApp. A turn that runs for many minutes while the
 // agent says nothing is indistinguishable from a dead session, and the bridge
 // cannot steer a running turn, so the nudge has to ride along with the message.
-export const REPLY_GUIDANCE = 'The sender only sees WhatsApp, not this session: reply right away with a one-line acknowledgement, even if it only says you have started; on work that runs more than a few minutes, send a short progress update every few minutes and a final reply when done.';
+export const REPLY_GUIDANCE = 'The sender only sees WhatsApp, not this session: on work that runs more than a few minutes, send a short progress update every few minutes and a final reply when done.';
 
 export function stateDir() {
   return process.env.LOCAL_WHATSAPP_STATE_DIR ||
@@ -82,6 +82,7 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   return {
     id: createHash('sha256').update(`${chat}\0${key.id}`).digest('hex').slice(0, 24),
     chat,
+    reactionKey: { remoteJid: key.remoteJid, id: key.id, fromMe: true },
     text,
     ...(media ? { attachment: {
       kind: content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document',
@@ -113,6 +114,7 @@ export function retireConversation(state, clearId) {
     if (entry.clearedAt) continue;
     entry.clearedAt = clearedAt;
     if (entry.ack?.status === 'queued') entry.ack.status = 'cleared';
+    if (entry.debugAck?.status === 'queued') entry.debugAck.status = 'cleared';
     if (entry.reply?.status === 'queued') entry.reply.status = 'cleared';
   }
   state.acceptMediaUntil = 0;
