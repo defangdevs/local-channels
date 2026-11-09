@@ -291,6 +291,31 @@ test('queued messages cannot be acknowledged before delivery', async () => {
   } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
 });
 
+test('reaction failure leaves a reply sendable and retries after restart', async () => {
+  const f = setup();
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    m: { id: 'm', chat: '14155551234@s.whatsapp.net', text: 'request', deliveredTo: 'codex:thread',
+      reactionKey: { id: 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, reply: null },
+  }, sentIds: {} }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_INBOUND_TEXT: 'not addressed' };
+  let daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...env, FAKE_FAIL_REACTION: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const saved = () => JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).messages.m;
+  try {
+    await waitUntil(() => existsSync(join(f.state, 'bridge.sock')), 'socket');
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', 'm'], { env }).status, 0);
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', 'm', 'answer'], { env }).status, 0);
+    await waitUntil(() => saved().reply?.status === 'sent', 'reply');
+    assert.equal(saved().ack.status, 'queued');
+    await stop(daemon);
+    daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitUntil(() => saved().ack.status === 'sent', 'reaction retry');
+    const outbound = readFileSync(f.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(outbound.filter((item) => item.payload.text === 'answer').length, 1);
+    assert.equal(outbound.filter((item) => item.payload.react).length, 1);
+  } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
 test('default mode suppresses previously queued receipts while preserving replies', async () => {
   const fixture = setup();
   writeFileSync(join(fixture.state, 'messages.json'), JSON.stringify({ messages: {
