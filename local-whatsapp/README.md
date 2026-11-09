@@ -79,8 +79,9 @@ On agent-box versions with built-in WhatsApp supervision, the bridge does not
 need this shell session.
 
 Send `@agent hello` in Message Yourself (or just `hello` with an empty `LOCAL_WHATSAPP_PREFIX`). Replies can be text or native images. The bridge
-acknowledges accepted messages with an eyes reaction. A reaction confirms receipt,
-not delivery to a session or completion. Agent replies and responses to explicit
+shows an eyes reaction when the session acknowledges that it has begun work.
+A queued message receives no reaction merely because the bridge accepted it. Set `LOCAL_WHATSAPP_DEBUG=1` to also
+send diagnostic text receipts; these are off by default. Agent replies and responses to explicit
 commands remain enabled, and delivery errors are logged to stderr. Pairing failures also
 write JSON diagnostics with an opaque attempt ID, failure stage, stable category,
 and provider status code when available. They never include the phone number,

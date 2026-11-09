@@ -248,13 +248,18 @@ test(`bridge delivers ${plain ? 'plain' : 'prefixed'} text and replies with debu
     const delivery = output.find((item) => item.method === 'notifications/claude/channel');
     const id = delivery.params.meta.messageId;
     assert.match(delivery.params.content, /hello/);
+    const beforeAck = existsSync(fixture.fakeOut) ? readFileSync(fixture.fakeOut, 'utf8') : '';
+    assert.ok(!beforeAck.includes('\"react\"'));
+    peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'whatsapp_ack', arguments: { id } } })}\n`);
+    await waitUntil(() => output.some((item) => item.id === 3), 'ack tool');
+    await waitUntil(() => existsSync(fixture.fakeOut) && readFileSync(fixture.fakeOut, 'utf8').includes('\"react\"'), 'reaction');
     peer.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'whatsapp_reply', arguments: { id, text: 'answer' } } })}\n`);
     await waitUntil(() => output.some((item) => item.id === 2), 'reply tool');
     await waitUntil(() => existsSync(fixture.fakeOut) && readFileSync(fixture.fakeOut, 'utf8').includes('answer'), 'WhatsApp send');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(outbound.every((item) => item.jid === '14155551234@s.whatsapp.net'));
     assert.ok(outbound.some((item) => item.payload.text === 'answer'));
-    assert.equal(outbound.some((item) => item.payload.text?.includes('Box: received')), false);
+    assert.equal(outbound.some((item) => item.payload.text?.includes('Box: received')), debug === '1');
     await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages[id].reply?.status === 'sent', 'persisted reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages[id].reply.status, 'sent');
@@ -270,27 +275,20 @@ test(`bridge delivers ${plain ? 'plain' : 'prefixed'} text and replies with debu
 }
 }
 
-test('failed reaction does not block a queued reply and retries on restart', async () => {
-  const fixture = setup();
-  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state,
-    FAKE_OUT: fixture.fakeOut, LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
-  let daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'],
-    { env: { ...env, FAKE_FAIL_REACTION: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
-  const saved = () => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+test('queued messages cannot be acknowledged before delivery', async () => {
+  const f = setup();
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_FAIL_REACTION: '1' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const saved = () => JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
   try {
-    await waitUntil(() => existsSync(join(fixture.state, 'messages.json')), 'inbound');
+    await waitUntil(() => existsSync(join(f.state, 'messages.json')), 'inbound');
     const id = Object.keys(saved().messages)[0];
-    const result = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'reply', id, 'answer'], { env, encoding: 'utf8' });
-    assert.equal(result.status, 0, result.stderr);
-    await waitUntil(() => saved().messages[id].reply?.status === 'sent', 'reply after reaction failure');
-    assert.equal(saved().messages[id].ack.status, 'queued');
-    await stop(daemon);
-    daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-    await waitUntil(() => saved().messages[id].ack.status === 'sent', 'reaction retry');
-    const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.equal(outbound.filter((item) => item.payload.text === 'answer').length, 1);
-    assert.equal(outbound.filter((item) => item.payload.react).length, 1);
-  } finally { await stop(daemon); rmSync(fixture.dir, { recursive: true, force: true }); }
+    assert.equal(saved().messages[id].ack, undefined);
+    const early = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', id], { env, encoding: 'utf8' });
+    assert.notEqual(early.status, 0);
+    assert.equal(saved().messages[id].ack, undefined);
+  } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
 });
 
 test('default mode suppresses previously queued receipts while preserving replies', async () => {
@@ -340,7 +338,7 @@ test(`bridge routes to Codex after activation returns ${activationResult}`, asyn
     const args = readFileSync(argsFile, 'utf8');
     assert.match(args, /queue\n--thread\ncodex\n--message\n/);
     assert.match(args, /WhatsApp Message Yourself/);
-    assert.match(args, /reply right away with a one-line acknowledgement/);
+    assert.match(args, /send a short progress update/);
   } finally {
     await stop(daemon);
     rmSync(fixture.dir, { recursive: true, force: true });
