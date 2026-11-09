@@ -95,6 +95,7 @@ esac
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
           return 'TEST1234';
         }, async sendMessage(jid, payload) {
+        if (payload.react && process.env.FAKE_HANG_REACTION) return new Promise(() => {});
         if (payload.react && process.env.FAKE_FAIL_REACTION) throw new Error('simulated reaction failure');
         if (payload.image && process.env.FAKE_FAIL_IMAGE) {
           appendFileSync(process.env.FAKE_FAIL_IMAGE, 'attempt\\n');
@@ -288,6 +289,23 @@ test('queued messages cannot be acknowledged before delivery', async () => {
     const early = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', id], { env, encoding: 'utf8' });
     assert.notEqual(early.status, 0);
     assert.equal(saved().messages[id].ack, undefined);
+  } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('a stalled reaction does not block a reply', async () => {
+  const f = setup();
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    m: { id: 'm', chat: '14155551234@s.whatsapp.net', text: 'request', deliveredTo: 'codex:thread',
+      reactionKey: { id: 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, reply: null },
+  }, sentIds: {} }));
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, FAKE_OUT: f.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, FAKE_INBOUND_TEXT: 'not addressed', FAKE_HANG_REACTION: '1' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(join(f.state, 'bridge.sock')), 'socket');
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'ack', 'm'], { env }).status, 0);
+    assert.equal(spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'reply', 'm', 'answer'], { env }).status, 0);
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('answer'), 'reply despite stalled reaction');
   } finally { await stop(daemon); rmSync(f.dir, { recursive: true, force: true }); }
 });
 

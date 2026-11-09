@@ -360,6 +360,7 @@ async function serve() {
   let whatsapp = null;
   let connected = false;
   let draining = false;
+  let drainingAcks = false;
   let dispatching = false;
   let dispatchFinished = null;
   let resetting = false;
@@ -412,9 +413,9 @@ async function serve() {
     }
   }
 
-  async function drainReplies() {
-    if (!connected || !whatsapp || draining) return;
-    draining = true;
+  async function drainAcks() {
+    if (!connected || !whatsapp || drainingAcks) return;
+    drainingAcks = true;
     try {
       for (const entry of Object.values(state.messages)) {
         if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
@@ -448,6 +449,18 @@ async function serve() {
             } catch (error) { process.stderr.write(`debug receipt failed: ${error.message}\n`); }
           }
         }
+      }
+    } finally { drainingAcks = false; }
+  }
+
+  async function drainReplies() {
+    drainAcks().catch((error) => process.stderr.write(`ack drain failed: ${error.message}\n`));
+    if (!connected || !whatsapp || draining) return;
+    draining = true;
+    try {
+      for (const entry of Object.values(state.messages)) {
+        if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
+        if (entry.clearedAt) continue;
         if (entry.reply?.status !== 'queued') continue;
         try {
           const content = entry.reply.image ? imageReplyContent(dir, entry.reply) : { text: entry.reply.text };
@@ -459,7 +472,7 @@ async function serve() {
             if (timestamp < Date.now() - 30 * 24 * 3600 * 1000) delete state.sentIds[id];
           }
           const completed = Object.values(state.messages)
-            .filter((message) => message.reply?.status === 'sent' || message.clearedAt)
+            .filter((message) => (message.reply?.status === 'sent' && message.ack?.status !== 'queued' && message.debugAck?.status !== 'queued') || message.clearedAt)
             .sort((left, right) => (left.clearedAt || left.reply.sentAt).localeCompare(right.clearedAt || right.reply.sentAt));
           for (const old of completed.slice(0, Math.max(0, completed.length - 1000))) delete state.messages[old.id];
           saveState(dir, state);
