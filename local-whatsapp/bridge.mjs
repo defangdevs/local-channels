@@ -19,7 +19,6 @@ const codexThreadsPath = join(dir, 'codex-threads.json');
 const authPath = join(dir, 'auth');
 const command = process.argv[2];
 const logger = pino({ level: 'silent' });
-const debugReceipts = process.env.LOCAL_WHATSAPP_DEBUG === '1';
 // LOCAL_WHATSAPP_PREFIX names the agent (default `@<linux user>`). Set it empty
 // to accept every self-chat text without a prefix.
 const addressPrefix = (() => {
@@ -419,18 +418,21 @@ async function serve() {
       for (const entry of Object.values(state.messages)) {
         if (state.resetPending && entry.id !== state.resetPending && !entry.control) continue;
         if (entry.clearedAt) continue;
-        if (entry.ack?.status === 'queued' && !debugReceipts) {
-          // Do not replay old diagnostic receipts after debug mode is disabled.
-          entry.ack.status = 'suppressed';
-          saveState(dir, state);
-        }
-        if (entry.ack?.status === 'queued' && debugReceipts) {
-          try {
-            const sent = await whatsapp.sendMessage(entry.chat, { text: entry.ack.text });
-            if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
-            entry.ack.status = 'sent';
+        if (entry.ack?.status === 'queued') {
+          // Old text receipts cannot identify the original WhatsApp message.
+          if (!entry.reactionKey) {
+            entry.ack.status = 'suppressed';
             saveState(dir, state);
-          } catch (error) { process.stderr.write(`ack send failed: ${error.message}\n`); break; }
+          } else {
+            try {
+              await whatsapp.sendMessage(entry.chat, { react: { text: '\u{1F440}', key: entry.reactionKey } });
+              entry.ack.status = 'sent';
+              saveState(dir, state);
+            } catch (error) {
+              // A receipt failure must not prevent the actual reply from sending.
+              process.stderr.write(`ack reaction failed: ${error.message}\n`);
+            }
+          }
         }
         if (entry.reply?.status !== 'queued') continue;
         try {
@@ -559,7 +561,7 @@ async function serve() {
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, until: new Date(state.acceptMediaUntil).toISOString() })}\n`);
           } else if (value.op === 'status') {
-            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, resetPending: Boolean(state.resetPending), acceptMediaUntil: state.acceptMediaUntil || null, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply && !entry.clearedAt).length })}\n`);
+            peer.write(`${JSON.stringify({ ok: true, connected, resetPending: Boolean(state.resetPending), acceptMediaUntil: state.acceptMediaUntil || null, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply && !entry.clearedAt).length })}\n`);
           } else {
             peer.write(`${JSON.stringify({ ok: false, error: 'unknown operation' })}\n`);
           }
@@ -602,7 +604,7 @@ async function serve() {
               inbound.control = true;
               if (inbound.text === '/clear' && !state.resetPending) state.resetPending = inbound.id;
             }
-            else if (debugReceipts) inbound.ack = { text: `Box: received ${inbound.id}; waiting for session selection.`, status: 'queued' };
+            else inbound.ack = { status: 'queued' };
             if (addInbound(state, inbound)) {
               saveState(dir, state);
               if (control) await handleControls();
@@ -610,13 +612,7 @@ async function serve() {
                 let dispatchError = null;
                 try { await dispatch(); }
                 catch (error) { dispatchError = error; }
-                const binding = target();
-                const destination = binding ? `${binding.harness} session ${binding.session}` : 'a new session';
-                const delivery = inbound.deliveredTo ? 'routed to' : 'waiting for';
                 if (dispatchError) process.stderr.write(`dispatch failed: ${dispatchError.message}\n`);
-                if (debugReceipts) inbound.ack = { text: dispatchError
-                  ? `Box: ${dispatchError.message}`
-                  : `Box: received ${inbound.id}; ${delivery} ${destination}.`, status: 'queued' };
               }
               saveState(dir, state);
               await drainReplies();

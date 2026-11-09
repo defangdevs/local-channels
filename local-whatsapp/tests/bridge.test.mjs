@@ -95,6 +95,7 @@ esac
           setTimeout(() => ev.emit('connection.update', { connection: 'open' }), 20);
           return 'TEST1234';
         }, async sendMessage(jid, payload) {
+        if (payload.react && process.env.FAKE_FAIL_REACTION) throw new Error('simulated reaction failure');
         if (payload.image && process.env.FAKE_FAIL_IMAGE) {
           appendFileSync(process.env.FAKE_FAIL_IMAGE, 'attempt\\n');
           throw new Error('simulated media upload failure');
@@ -253,11 +254,12 @@ test(`bridge delivers ${plain ? 'plain' : 'prefixed'} text and replies with debu
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(outbound.every((item) => item.jid === '14155551234@s.whatsapp.net'));
     assert.ok(outbound.some((item) => item.payload.text === 'answer'));
-    assert.equal(outbound.some((item) => item.payload.text.includes('Box: received')), debug === '1');
+    assert.equal(outbound.some((item) => item.payload.text?.includes('Box: received')), false);
     await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages[id].reply?.status === 'sent', 'persisted reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages[id].reply.status, 'sent');
-    assert.equal(saved.messages[id].ack?.status, debug === '1' ? 'sent' : undefined);
+    assert.equal(saved.messages[id].ack?.status, 'sent');
+    assert.deepEqual(outbound.find((item) => item.payload.react)?.payload.react, { text: '\u{1F440}', key: { id: 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' } });
   } finally {
     if (peer) await stop(peer);
     await stop(daemon);
@@ -267,6 +269,29 @@ test(`bridge delivers ${plain ? 'plain' : 'prefixed'} text and replies with debu
 
 }
 }
+
+test('failed reaction does not block a queued reply and retries on restart', async () => {
+  const fixture = setup();
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state,
+    FAKE_OUT: fixture.fakeOut, LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin };
+  let daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'],
+    { env: { ...env, FAKE_FAIL_REACTION: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const saved = () => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+  try {
+    await waitUntil(() => existsSync(join(fixture.state, 'messages.json')), 'inbound');
+    const id = Object.keys(saved().messages)[0];
+    const result = spawnSync(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'reply', id, 'answer'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    await waitUntil(() => saved().messages[id].reply?.status === 'sent', 'reply after reaction failure');
+    assert.equal(saved().messages[id].ack.status, 'queued');
+    await stop(daemon);
+    daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitUntil(() => saved().messages[id].ack.status === 'sent', 'reaction retry');
+    const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(outbound.filter((item) => item.payload.text === 'answer').length, 1);
+    assert.equal(outbound.filter((item) => item.payload.react).length, 1);
+  } finally { await stop(daemon); rmSync(fixture.dir, { recursive: true, force: true }); }
+});
 
 test('default mode suppresses previously queued receipts while preserving replies', async () => {
   const fixture = setup();
@@ -283,7 +308,7 @@ test('default mode suppresses previously queued receipts while preserving replie
   try {
     await waitUntil(() => existsSync(fixture.fakeOut), 'queued reply');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.deepEqual(outbound.map((item) => item.payload.text), ['old answer']);
+    assert.deepEqual(outbound.filter((item) => item.payload.text).map((item) => item.payload.text), ['old answer']);
     await waitUntil(() => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8')).messages.old.reply?.status === 'sent', 'persisted queued reply');
     const saved = JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
     assert.equal(saved.messages.old.ack.status, 'suppressed');
@@ -466,11 +491,12 @@ test('reply-image CLI queues a durable image, retries after restart, and cleans 
     daemon = spawn(process.execPath, [join(fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     await waitUntil(() => saved().messages[id].reply.status === 'sent', 'native image sent');
     const outbound = readFileSync(fixture.fakeOut, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.equal(outbound.length, 1);
-    assert.equal(outbound[0].jid, '14155551234@s.whatsapp.net');
-    assert.equal(outbound[0].payload.caption, 'my picture');
-    assert.equal(outbound[0].payload.mimetype, 'image/png');
-    assert.deepEqual(Buffer.from(outbound[0].payload.image.data), png);
+    const images = outbound.filter((item) => item.payload.image);
+    assert.equal(images.length, 1);
+    assert.equal(images[0].jid, '14155551234@s.whatsapp.net');
+    assert.equal(images[0].payload.caption, 'my picture');
+    assert.equal(images[0].payload.mimetype, 'image/png');
+    assert.deepEqual(Buffer.from(images[0].payload.image.data), png);
     await waitUntil(() => !existsSync(join(fixture.state, 'media-outbox', image)), 'media cleanup');
   } finally {
     await stop(daemon);

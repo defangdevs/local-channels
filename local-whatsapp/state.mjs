@@ -82,6 +82,7 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   return {
     id: createHash('sha256').update(`${chat}\0${key.id}`).digest('hex').slice(0, 24),
     chat,
+    reactionKey: { remoteJid: key.remoteJid, id: key.id, fromMe: true },
     text,
     ...(media ? { attachment: {
       kind: content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document',
