@@ -793,6 +793,17 @@ class Tracker:
             return
         m = self.store.q('SELECT * FROM msgs WHERE team=? AND channel=? AND ts=?',
                          team, ev.get('channel'), new.get('ts'))
+        tag = '<@%s>' % self.bot.get('user_id')
+        if cfg['track'] == 'mention' and tag in (new.get('text') or '') \
+                and tag not in (old.get('text') or ''):
+            # An edit that ADDS the mention is the first mention: if nothing
+            # tracks this message yet, start the record as a fresh post would.
+            ts = new.get('ts')
+            tts = (m[0]['thread_ts'] if m else None) or new.get('thread_ts') or ts
+            if self._row(self._key(team, ev.get('channel'), tts)) is None:
+                fresh = dict(new, channel=ev.get('channel'))
+                fresh.pop('subtype', None)
+                return self._message(team, fresh, now)
         if not m:
             return
         key = self._key(team, ev.get('channel'), m[0]['thread_ts'])
