@@ -80,7 +80,7 @@ function setTarget(harness, session, name) {
 async function resetCodexThread(binding) {
   const socket = process.env.LOCAL_WHATSAPP_CODEX_SOCKET ||
     join(process.env.CODEX_HOME || join(process.env.HOME, '.codex'), 'app-server-control', 'app-server-control.sock');
-  if (!isAbsolute(socket) || socket.includes(':')) throw new Error('Codex control socket must be an absolute Unix path');
+  if (!isAbsolute(socket) || socket.includes(':')) throw Object.assign(new Error('Codex control socket must be an absolute Unix path'), { resetUnsupported: true });
   const ws = new WebSocket(`ws+unix://${socket}:/`, { handshakeTimeout: 10000, maxPayload: 8 * 1024 * 1024 });
   const pending = new Map();
   let serial = 0;
@@ -511,6 +511,7 @@ async function serve() {
               await resetCodexThread(binding);
               retireConversation(state, inbound.id);
               saveState(dir, state);
+              delete state.resetUncertain;
               state.resetPending = Object.values(state.messages).find((entry) => entry.id !== inbound.id && entry.control && entry.text === '/clear' && !entry.reply && !entry.clearedAt)?.id || null;
               queueReply(state, inbound.id, 'Context cleared in the existing Codex thread and process. The system/workspace instructions and settings remain; previous chat turns have been removed.');
             } finally { resetting = false; }
@@ -547,7 +548,8 @@ async function serve() {
             }
           }
         } catch (error) {
-          if (error.resetUnsupported) state.resetPending = null;
+          if (inbound.text === '/clear' && !error.resetUnsupported) state.resetUncertain = true; // possibly mutated: keep barrier until a /clear succeeds
+          else if (error.resetUnsupported && !state.resetUncertain) state.resetPending = null;
           queueReply(state, inbound.id, `Box: ${error.message}`);
         }
         saveState(dir, state);
