@@ -119,6 +119,27 @@ class TestTracker(Rig):
             'previous_message': {'ts': '1.1', 'text': 'old', 'user': 'U1'}}})
         self.assertEqual(self.actions()[-1], 'message.edited')
 
+    def _edit(self, ts, old, new, **kw):
+        self.tr.handle({'team_id': 'T1', 'event_id': 'e' + ts + new, 'event': {
+            'type': 'message', 'subtype': 'message_changed', 'channel': 'C1',
+            'message': dict({'ts': ts, 'text': new, 'user': 'U1'}, **kw),
+            'previous_message': dict({'ts': ts, 'text': old, 'user': 'U1'}, **kw)}})
+
+    def test_edit_adding_mention_starts_record(self):
+        self.cfg['track'] = 'mention'
+        self.tr.handle(msg('1.1', 'please look'))
+        self.assertEqual(self.events, [])
+        self._edit('1.1', 'please look', 'please look <@UBOT>')
+        self.assertEqual(self.actions()[0], 'message.posted')
+        self.assertEqual(self.events[0][1]['identifier'], 'T1/C1/1.1')
+
+    def test_edit_without_mention_change_stays_ignored(self):
+        self.cfg['track'] = 'mention'
+        self.tr.handle(msg('1.1', 'please look'))
+        self._edit('1.1', 'please look', 'please look again')
+        self._edit('1.1', 'a <@UBOT>', 'b <@UBOT>')
+        self.assertEqual(self.events, [])
+
     def test_edit_by_bot_ignored(self):
         self.tr.handle(msg('1.1', 'old'))
         n = len(self.events)
