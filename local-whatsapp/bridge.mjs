@@ -112,6 +112,7 @@ async function resetCodexThread(binding) {
       });
     });
   }
+  let mutating = false;
   try {
     await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
     await rpc('initialize', { clientInfo: { name: 'local_whatsapp', version: '0.5.0' }, capabilities: { experimentalApi: true } });
@@ -129,11 +130,17 @@ async function resetCodexThread(binding) {
       // Native revert removes this turn and every later turn from the model
       // context and durable thread history. It leaves instructions/settings,
       // the thread identity and the existing harness process intact.
+      mutating = true;
       await rpc('thread/revert', { threadId: thread.id, beforeTurnId: firstTurn });
     }
     const checked = await rpc('thread/turns/list', { threadId: thread.id, sortDirection: 'asc', limit: 1 });
     if (!Array.isArray(checked.data) || checked.data.length) throw new Error('Codex history is not empty after clear');
     return binding;
+  } catch (error) {
+    // Failures before thread/revert leave history untouched, so the routing
+    // barrier can be released; later ones are uncertain and keep it.
+    if (!mutating && error && typeof error === 'object') error.resetUnsupported = true;
+    throw error;
   } finally { rejectPending(new Error('Codex reset finished')); ws.close(); }
 }
 
