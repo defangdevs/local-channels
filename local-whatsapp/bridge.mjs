@@ -80,7 +80,7 @@ function setTarget(harness, session, name) {
 async function resetCodexThread(binding) {
   const socket = process.env.LOCAL_WHATSAPP_CODEX_SOCKET ||
     join(process.env.CODEX_HOME || join(process.env.HOME, '.codex'), 'app-server-control', 'app-server-control.sock');
-  if (!isAbsolute(socket) || socket.includes(':')) throw new Error('Codex control socket must be an absolute Unix path');
+  if (!isAbsolute(socket) || socket.includes(':')) throw Object.assign(new Error('Codex control socket must be an absolute Unix path'), { resetUnsupported: true });
   const ws = new WebSocket(`ws+unix://${socket}:/`, { handshakeTimeout: 10000, maxPayload: 8 * 1024 * 1024 });
   const pending = new Map();
   let serial = 0;
@@ -112,6 +112,7 @@ async function resetCodexThread(binding) {
       });
     });
   }
+  let mutating = false;
   try {
     await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
     await rpc('initialize', { clientInfo: { name: 'local_whatsapp', version: '0.5.0' }, capabilities: { experimentalApi: true } });
@@ -129,11 +130,17 @@ async function resetCodexThread(binding) {
       // Native revert removes this turn and every later turn from the model
       // context and durable thread history. It leaves instructions/settings,
       // the thread identity and the existing harness process intact.
+      mutating = true;
       await rpc('thread/revert', { threadId: thread.id, beforeTurnId: firstTurn });
     }
     const checked = await rpc('thread/turns/list', { threadId: thread.id, sortDirection: 'asc', limit: 1 });
     if (!Array.isArray(checked.data) || checked.data.length) throw new Error('Codex history is not empty after clear');
     return binding;
+  } catch (error) {
+    // Failures before thread/revert leave history untouched, so the routing
+    // barrier can be released; later ones are uncertain and keep it.
+    if (!mutating && error && typeof error === 'object') error.resetUnsupported = true;
+    throw error;
   } finally { rejectPending(new Error('Codex reset finished')); ws.close(); }
 }
 
@@ -504,6 +511,7 @@ async function serve() {
               await resetCodexThread(binding);
               retireConversation(state, inbound.id);
               saveState(dir, state);
+              delete state.resetUncertain;
               state.resetPending = Object.values(state.messages).find((entry) => entry.id !== inbound.id && entry.control && entry.text === '/clear' && !entry.reply && !entry.clearedAt)?.id || null;
               queueReply(state, inbound.id, 'Context cleared in the existing Codex thread and process. The system/workspace instructions and settings remain; previous chat turns have been removed.');
             } finally { resetting = false; }
@@ -540,7 +548,8 @@ async function serve() {
             }
           }
         } catch (error) {
-          if (error.resetUnsupported) state.resetPending = null;
+          if (inbound.text === '/clear' && !error.resetUnsupported) state.resetUncertain = true; // possibly mutated: keep barrier until a /clear succeeds
+          else if (error.resetUnsupported && !state.resetUncertain) state.resetPending = null;
           queueReply(state, inbound.id, `Box: ${error.message}`);
         }
         saveState(dir, state);
