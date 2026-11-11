@@ -1560,7 +1560,7 @@ class Writer:
                 raise Refused('at most %d writes per session per %d seconds' % (cap, window))
         cap = lim.get('top_level_per_hour')
         if top_level and cap:
-            c = self.store.q("SELECT COUNT(*) c FROM audit WHERE channel=? AND kind='post' AND at>?",
+            c = self.store.q("SELECT COUNT(*) c FROM audit WHERE channel=? AND kind IN ('post','upload_top') AND at>?",
                              channel, now - 3600)[0]['c']
             if c >= cap:
                 raise Refused('at most %d top-level posts per channel per hour' % cap)
@@ -1723,7 +1723,7 @@ class Writer:
             ts = self._parent(channel, self._ts(ts))
         cfg = self._check(channel, ts, top)
         checked = self.upload_checked(files)
-        self._rate(channel, False)
+        self._rate(channel, top)
         unresolved, body = [], ''
         if comment:
             body = compose(comment, self.resolver, cfg, self.defaults, unresolved)
@@ -1743,7 +1743,7 @@ class Writer:
         if body:
             params['initial_comment'] = body
         self.web.call('files.completeUploadExternal', params, write=True, form=True)
-        self.audit('upload', channel, ts, None, '%s\n%s' % (body, '; '.join(
+        self.audit('upload_top' if top else 'upload', channel, ts, None, '%s\n%s' % (body, '; '.join(
             '%s (%s, %d bytes, sha256 %s)' % (n, m, len(d), hashlib.sha256(d).hexdigest()[:16])
             for n, m, d in checked)))
         return {'files': [f['id'] for f in done], 'unresolved': unresolved}
@@ -1781,10 +1781,12 @@ class Writer:
 # Protective bounds. Constants here; read when used, so they can be tuned.
 MAX_REQUEST = 64 * 1024
 MAX_CONNECTIONS = 32
+UPLOAD_SLOTS = threading.BoundedSemaphore(2)   # requests larger than MAX_REQUEST held in memory at once
 MAX_UPLOAD_CALL = 64 * 1024 * 1024   # ceiling on _defaults.uploads.call_bytes through the socket
 SERVER_TIMEOUT_S = 10    # a connected peer must send its request within this
 LOCK_WAIT_S = 10         # a write waits this long for the one write lock
 CLIENT_TIMEOUT_S = 90    # must exceed LOCK_WAIT_S plus a Slack round trip
+UPLOAD_FILE_TIMEOUT_S = 90   # added per file: one URL request plus the byte upload, serially
 SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread', 'file', 'dm', 'upload')
 
 
@@ -2041,6 +2043,14 @@ def handle_request(ctx, uid, req, conn=None):
                     isinstance(f, dict) and isinstance(f.get('name'), str) and isinstance(f.get('data'), str)
                     for f in raw):
                 raise Refused('upload needs files: [{name, data}]')
+            u = dict(DEFAULT_DEFAULTS['uploads'], **(ctx.defaults().get('uploads') or {}))
+            cap = int(u.get('max_bytes') or 0)
+            if cap <= 0:
+                raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
+            if (len(raw) > int(u.get('max_files') or 10) or
+                    any(len(f['data']) > cap * 4 // 3 + 8 for f in raw) or
+                    sum(len(f['data']) for f in raw) > int(u.get('call_bytes') or cap) * 4 // 3 + 8 * len(raw)):
+                raise Refused('upload is over the size limits')   # before anything is decoded
             try:
                 files = [(f['name'], base64.b64decode(f['data'], validate=True)) for f in raw]
             except ValueError:
@@ -2091,8 +2101,8 @@ def request_limit(defaults):
     return MAX_REQUEST + min(int(u.get('call_bytes') or 0), MAX_UPLOAD_CALL) * 4 // 3 + 4096
 
 
-def _read_line(conn, limit=MAX_REQUEST):
-    buf, size = [], 0
+def _read_line(conn, limit=MAX_REQUEST, on_big=None):
+    buf, size, big = [], 0, False
     while True:
         chunk = conn.recv(65536)
         if not chunk:
@@ -2101,6 +2111,9 @@ def _read_line(conn, limit=MAX_REQUEST):
         size += len(chunk)
         if b'\n' in chunk:
             break
+        if size > MAX_REQUEST and not big and limit > MAX_REQUEST and on_big:
+            big = True
+            on_big()
         if size > limit:
             raise Refused('request too large')
     line = b''.join(buf).split(b'\n', 1)[0]
@@ -2119,14 +2132,26 @@ def serve_connection(conn, allowed, ctx):
                       file=sys.stderr)
                 resp = {'ok': False, 'error': 'uid %d is not allowed' % uid}
             else:
+                held = []
+
+                def on_big():
+                    # Only a request past the small cap needs a slot, so a flood of
+                    # uploads cannot pin gigabytes while one writer works.
+                    if not UPLOAD_SLOTS.acquire(timeout=LOCK_WAIT_S):
+                        raise Refused('daemon is busy with other uploads; try again')
+                    held.append(1)
                 try:
-                    req = json.loads(_read_line(conn, request_limit(ctx.defaults())).decode())
-                    if not isinstance(req, dict):
-                        raise ValueError
-                except (ValueError, UnicodeDecodeError):
-                    resp = {'ok': False, 'error': 'bad request'}
-                else:
-                    resp = handle_request(ctx, uid, req, conn)
+                    try:
+                        req = json.loads(_read_line(conn, request_limit(ctx.defaults()), on_big).decode())
+                        if not isinstance(req, dict):
+                            raise ValueError
+                    except (ValueError, UnicodeDecodeError):
+                        resp = {'ok': False, 'error': 'bad request'}
+                    else:
+                        resp = handle_request(ctx, uid, req, conn)
+                finally:
+                    if held:
+                        UPLOAD_SLOTS.release()
             conn.sendall(json.dumps(resp).encode() + b'\n')
         except Refused as e:
             conn.sendall(json.dumps({'ok': False, 'error': str(e)}).encode() + b'\n')
@@ -2236,7 +2261,7 @@ def socket_call(path, cmd, args, session=None, files=None):
     """The CLI side: one request, one answer. Holds no token."""
     session = session or os.environ.get('AGENT_BOX_SESSION_ID') or os.environ.get('AGENT_BOX_SESSION', '')
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.settimeout(CLIENT_TIMEOUT_S)
+    c.settimeout(CLIENT_TIMEOUT_S + UPLOAD_FILE_TIMEOUT_S * len(files or ()))
     try:
         c.connect(path)
         sent = None
@@ -2310,9 +2335,14 @@ def parse_upload(rest, defaults):
     for path in rest:
         try:
             with open(path, 'rb') as f:
-                files.append((os.path.basename(path), f.read(cap + 1)))
+                data = f.read(cap + 1)
         except OSError as e:
             raise Refused('cannot read %s: %s' % (path, e.strerror))
+        if cap <= 0:
+            raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
+        if len(data) > cap:
+            raise Refused('%s is larger than %d bytes' % (path, cap))
+        files.append((os.path.basename(path), data))
     return channel, ts, files, comment
 
 

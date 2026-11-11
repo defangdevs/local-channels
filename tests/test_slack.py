@@ -1497,6 +1497,36 @@ class TestUploadAndDm(unittest.TestCase):
         with self.assertRaises(slack.Refused):
             slack.socket_call(path, 'upload', ['C1', TS, ''], files=[('a.png', big)])
 
+    def test_top_level_uploads_share_the_hourly_cap(self):
+        self.cfg['write'].update(top_level=True)
+        self.defaults['limits'] = {'session_writes': 0, 'session_window_s': 600, 'top_level_per_hour': 2}
+        self.w.upload('C1', '', [('a.png', self.PNG)])
+        self.w.post('C1', 'hi')
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', '', [('a.png', self.PNG)])
+        with self.assertRaises(slack.Refused):
+            self.w.post('C1', 'hi')
+        self.w.upload('C1', TS, [('a.png', self.PNG)])              # a thread upload is not top-level
+
+    def test_oversized_encoded_upload_is_refused_before_decoding(self):
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        self.defaults['uploads'] = {'max_bytes': 100}
+        r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                          'files': [{'name': 'a.png', 'data': 'A' * 1000}]})
+        self.assertIn('size limits', r['error'])
+
+    def test_upload_slot_is_released_after_a_bad_big_request(self):
+        import socket as sk
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        a, b = sk.socketpair()
+        b.sendall(b'{"x":"' + b'y' * (slack.MAX_REQUEST + 10) + b'"}\n')
+        slack.serve_connection(a, {os.getuid()}, ctx)
+        for _ in range(2):                                          # both slots still free
+            self.assertTrue(slack.UPLOAD_SLOTS.acquire(blocking=False))
+        slack.UPLOAD_SLOTS.release()
+        slack.UPLOAD_SLOTS.release()
+        b.close()
+
     def test_parse_upload(self):
         d = tempfile.mkdtemp(dir='/tmp')
         self.addCleanup(shutil.rmtree, d, True)
@@ -1506,6 +1536,9 @@ class TestUploadAndDm(unittest.TestCase):
         self.assertEqual(slack.parse_upload(['C1', TS, f, '--comment', 'x'], self.defaults),
                          ('C1', TS, [('a.png', self.PNG)], 'x'))
         self.assertEqual(slack.parse_upload(['C1', f], self.defaults)[1], '')
+        self.defaults['uploads'] = {'max_bytes': 10}                 # a cut-off read is a refusal, not a short file
+        with self.assertRaises(slack.Refused):
+            slack.parse_upload(['C1', f], self.defaults)
         for bad in (['C1'], ['C1', TS], ['C1', os.path.join(d, 'none')]):
             with self.assertRaises(slack.Refused):
                 slack.parse_upload(bad, self.defaults)

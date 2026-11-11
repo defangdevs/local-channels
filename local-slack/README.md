@@ -243,15 +243,19 @@ default; any type in the `file` table can be added) pass; at most
 `max_bytes` per file (5 MiB), `call_bytes` per call (15 MiB) and `max_files` (10);
 `max_bytes: 0` turns uploads off. The sent name is sanitised and its extension
 comes from the type. Text files are secret-scanned whole, and so are a PDF's raw
-bytes, which catches an uncompressed text layer. Compressed PDF text and image
-contents are only type- and size-checked. Each upload counts as one write for
+bytes, which catches an uncompressed text layer. Compressed PDF text, image
+contents, audio and file metadata are only type- and size-checked. Each upload counts as one write for
 the session rate and is audited with the name, size and a SHA-256 prefix.
 
 `slack.py dm USER TEXT` opens a DM and posts to a user listed in
 `_defaults.dm_allowlist` (exact string match; a user not listed is refused). It
 sends only and nothing reads a DM, so the text should point back to the thread.
-Needs `im:write`. `doctor` shows whether the token has `files:write` and
-`im:write` and which setting each one enables.
+Needs `im:write`. `doctor` (plain mode, with the token) shows whether the token has
+`files:write` and `im:write` and which setting each one enables. In socket mode
+`doctor` only checks that the socket is reachable, so run it as the daemon's
+user with `LOCAL_SLACK_SOCKET` unset to see the scopes.
+A socket client waits 90 s plus 90 s per file for the answer; if it still times
+out, check the thread before retrying, or the upload may post twice.
 
 Not yet checked against Slack: that the upload URL accepts a `POST` of the raw
 bytes (Slack's docs say POST), and that `files.completeUploadExternal` takes the
