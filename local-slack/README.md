@@ -6,7 +6,7 @@ Single file (`slack.py`), stdlib only, python ≥ 3.9. Design: the spec in that 
 **0.1.0 is the core.** It covers event shaping, the settle timer, the send
 guardrails, a Socket Mode client and a small CLI, in *plain mode* (tokens in the
 agent user's env) or *socket-service mode* (below). Not yet built: grants, MCP
-tools, the classifier command runner, `dm` and `upload`, the HTTP Events API
+tools, the classifier command runner, the HTTP Events API
 transport, the settings card and the agent-box supervisor unit. In plain mode an
 agent that can read the bot token can bypass the guardrails — use it only where
 the agent user is the only author of its input, or use socket-service mode.
@@ -58,7 +58,8 @@ may reach it are the deployment's choice.
 1. Create an internal Slack app in your own workspace with Socket Mode on, an
    app-level token with the `connections:write` scope, bot scopes
    `channels:history groups:history channels:read groups:read chat:write
-   reactions:read reactions:write users:read files:read`, and bot events
+   reactions:read reactions:write users:read files:read`
+   (add `files:write` for `upload` and `im:write` for `dm`), and bot events
    `message.channels message.groups reaction_added reaction_removed
    channel_shared channel_unshared member_left_channel member_joined_channel`. Do **not** add
    `app_mentions:read` (mentions are read from `message` events; subscribing to
@@ -224,6 +225,37 @@ GitHub echo exclude). The settle timer already ignores them. When grants land
 (a later step of socket-service mode) they take the scope as given, with no built-in rule that a
 watch-started session is limited to its thread: deciding that is agent-box's
 spawn path.
+
+## Sending files and DMs
+
+`slack.py upload CHANNEL [TS] FILE... [--comment TEXT]` sends one message that
+holds all the files: `files.getUploadURLExternal`, the bytes, then one
+`files.completeUploadExternal` (the old `files.upload` is gone). With a `TS` it
+goes into that thread under the same write mode as `reply`; without one it is a
+top-level post and needs `write.top_level`. `--comment` is composed like a
+reply (mentions, links, secret scan, disclosure). Needs the `files:write` bot
+scope, so an app set up for `file` alone must be reinstalled.
+
+Guards, in plain and socket mode alike (the CLI reads the files and the daemon
+checks and sends them, so agents never hold the token): the type comes from the
+bytes, never the name, and only `_defaults.uploads.types` (PDF, PNG and JPEG by
+default; any type in the `file` table can be added) pass; at most
+`max_bytes` per file (5 MiB), `call_bytes` per call (15 MiB) and `max_files` (10);
+`max_bytes: 0` turns uploads off. The sent name is sanitised and its extension
+comes from the type. Text files are secret-scanned whole, and so are a PDF's raw
+bytes, which catches an uncompressed text layer. Compressed PDF text and image
+contents are only type- and size-checked. Each upload counts as one write for
+the session rate and is audited with the name, size and a SHA-256 prefix.
+
+`slack.py dm USER TEXT` opens a DM and posts to a user listed in
+`_defaults.dm_allowlist` (exact string match; a user not listed is refused). It
+sends only and nothing reads a DM, so the text should point back to the thread.
+Needs `im:write`. `doctor` shows whether the token has `files:write` and
+`im:write` and which setting each one enables.
+
+Not yet checked against Slack: that the upload URL accepts a `POST` of the raw
+bytes (Slack's docs say POST), and that `files.completeUploadExternal` takes the
+form-encoded `files` JSON string as sent here.
 
 ## Not yet verified against Slack
 
