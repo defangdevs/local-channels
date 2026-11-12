@@ -1813,6 +1813,7 @@ UPLOAD_SLOTS = threading.BoundedSemaphore(2)   # requests larger than MAX_REQUES
 MAX_UPLOAD_CALL = 64 * 1024 * 1024   # ceiling on _defaults.uploads.call_bytes through the socket,
                                      # and all a socket client reads (the daemon applies the real caps)
 SERVER_TIMEOUT_S = 10    # a connected peer must send its request within this
+READ_DEADLINE_S = 90     # ...and the whole request line must arrive within this, so a trickle cannot hold an upload slot
 LOCK_WAIT_S = 10         # a write waits this long for the one write lock
 CLIENT_TIMEOUT_S = 90    # must exceed LOCK_WAIT_S plus a Slack round trip
 UPLOAD_FILE_TIMEOUT_S = 90   # added per file: one URL request plus the byte upload, serially
@@ -2138,10 +2139,18 @@ def request_limit(defaults):
     return MAX_REQUEST + min(call, MAX_UPLOAD_CALL) * 4 // 3 + 4096
 
 
-def _read_line(conn, limit=MAX_REQUEST, on_big=None):
+def _read_line(conn, limit=MAX_REQUEST, on_big=None, deadline_s=None):
     buf, size, big = [], 0, False
+    end = time.monotonic() + (READ_DEADLINE_S if deadline_s is None else deadline_s)
     while True:
-        chunk = conn.recv(65536)
+        left = end - time.monotonic()
+        if left <= 0:
+            raise Refused('request read timed out')
+        conn.settimeout(min(SERVER_TIMEOUT_S, left))
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            raise Refused('request read timed out')
         if not chunk:
             break
         buf.append(chunk)

@@ -1634,6 +1634,25 @@ class TestUploadAndDm(unittest.TestCase):
         slack.UPLOAD_SLOTS.release()
         b.close()
 
+    def test_a_trickling_upload_read_hits_the_deadline_and_frees_its_slot(self):
+        import socket as sk
+        a, b = sk.socketpair()
+        b.sendall(b'x' * (slack.MAX_REQUEST + 10))          # past the small cap, no newline, then silence
+        slots = []
+
+        def on_big():
+            slack.UPLOAD_SLOTS.acquire()
+            slots.append(1)
+        try:
+            with self.assertRaises(slack.Refused):
+                slack._read_line(a, slack.MAX_REQUEST * 4, on_big, deadline_s=0.3)
+        finally:
+            for _ in slots:
+                slack.UPLOAD_SLOTS.release()
+            a.close()
+            b.close()
+        self.assertEqual(len(slots), 1)
+
     def test_parse_upload(self):
         d = tempfile.mkdtemp(dir='/tmp')
         self.addCleanup(shutil.rmtree, d, True)
