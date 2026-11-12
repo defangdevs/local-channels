@@ -78,19 +78,24 @@ def sanitize_title(text, limit=200):
 # of the gitleaks rule set, chosen for the credentials an agent on this box can
 # actually hold; a deployment extends it with channels.json _defaults.secret_patterns.
 SECRET_PATTERNS = [
-    re.compile(r'xox[abprs]-[A-Za-z0-9-]{10,}'),
-    re.compile(r'xapp-\d-[A-Za-z0-9-]{10,}'),
-    re.compile(r'gh[pousr]_[A-Za-z0-9]{30,}'),
-    re.compile(r'github_pat_[A-Za-z0-9_]{40,}'),
+    # Every quantifier here is bounded: no `+` or `*`, and no `{n,}`. A scan
+    # only needs to know that a token exists, so a prefix of the minimum length
+    # is enough, and a bounded repeat keeps the work per start position
+    # constant. A scan of megabytes is then linear whatever the input looks like.
+    re.compile(r'xox[abprs]-[A-Za-z0-9-]{10}'),
+    re.compile(r'xapp-\d-[A-Za-z0-9-]{10}'),
+    re.compile(r'gh[pousr]_[A-Za-z0-9]{30}'),
+    re.compile(r'github_pat_[A-Za-z0-9_]{40}'),
     re.compile(r'AKIA[0-9A-Z]{16}'),
-    # Needs a digit: a kebab-case branch name is not a key (`sk-` + 32 letters).
-    # The `sk-` and `eyJ` shapes must start a token (the lookbehind). Without
-    # that, a long run of `sk-sk-sk-…` or `eyJeyJ…` is retried from every
-    # offset and the scan is quadratic: 64 KiB took 11 s, and an upload scans
-    # megabytes. It also stops `task-…` matching as `sk-…`.
-    re.compile(r'(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}'),
-    re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
-    re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
+    # Needs a digit in the 32 characters after `sk-`: a kebab-case branch name
+    # is not a key. A letter, digit or `_` before `sk-` means a longer word
+    # (`task-…`), not a key; a `-` before it does not (`prod-sk-…` is a key).
+    re.compile(r'(?<![A-Za-z0-9_])sk-(?=[A-Za-z0-9_-]{0,31}\d)[A-Za-z0-9_-]{32}'),
+    re.compile(r'-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----'),
+    # The lookbehind makes each match start at the beginning of a run of token
+    # characters, and a segment never reads past its run, so the total work
+    # stays linear. A JWT segment longer than 8192 characters is not matched.
+    re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,8192}\.eyJ[A-Za-z0-9_-]{10,8192}\.[A-Za-z0-9_-]{10}'),
 ]
 
 

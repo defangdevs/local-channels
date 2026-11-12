@@ -1497,6 +1497,32 @@ class TestUploadAndDm(unittest.TestCase):
                 slack.scan_secrets(real)
         slack.scan_secrets('see branch fix/task-123-make-the-upload-work-for-everyone')  # `task-` is not `sk-`
 
+    def test_secret_scan_finds_a_key_after_a_hyphen(self):
+        key = 'sk-' + 'a1' * 20
+        for text in ('prod-' + key, 'my-key-' + key, 'x-' + key + '-tail', 'KEY=' + key):
+            with self.assertRaises(slack.Refused, msg=text):
+                slack.scan_secrets(text)
+        # A letter or `_` before `sk-` is still a longer word, not a key.
+        for text in ('task-' + 'a1' * 20, 'my_' + key):
+            slack.scan_secrets(text)
+
+    def test_secret_scan_is_linear_on_more_crafted_runs(self):
+        import time
+        crafted = ('-sk-', 'sk-1' * 3, 'eyJ.' * 4, 'eyJ' + 'a' * 9000 + '.', 'a' * 4096 + '-',
+                   '-----BEGIN ' + 'A ' * 4, 'xox' * 3, 'ghp_' * 4)
+        for unit in crafted:
+            start = time.time()
+            try:
+                slack.scan_secrets(unit * (1024 * 1024 // len(unit)))
+            except slack.Refused:
+                pass  # some of these really are key-shaped; only the time matters here
+            self.assertLess(time.time() - start, 5, unit[:12])
+
+    def test_secret_patterns_have_no_unbounded_quantifier(self):
+        import re
+        for pat in slack.SECRET_PATTERNS:
+            self.assertIsNone(re.search(r'(?<!\\)(?:[+*]|\{\d+,\})', pat.pattern), pat.pattern)
+
     def test_files_are_checked_before_the_write_lock(self):
         # The scan can take seconds; it must not hold up other sessions' writes.
         ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
