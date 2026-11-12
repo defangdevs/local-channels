@@ -42,7 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 
 API_HOST = 'slack.com'
 
@@ -368,6 +368,37 @@ DEFAULT_DEFAULTS = {
 
 def upload_settings(defaults):
     return dict(DEFAULT_DEFAULTS['uploads'], **((defaults or {}).get('uploads') or {}))
+
+
+def scope_report(scopes, defaults):
+    """doctor's lines for the scopes behind `upload` and `dm`. Each says whether
+    the token has the scope, then whether the command is on right now, and only
+    then how to switch it. 0.2.0 named the off switch where the state belonged
+    ("enables `upload`; turned off with ... = 0"), which reads as "off"."""
+    have = set((scopes or '').replace(' ', '').split(',')) - {''}
+    up = upload_settings(defaults)
+    lines = []
+    for scope, cmd, on, to_off, to_on in (
+            ('files:write', 'upload', int(up.get('max_bytes') or 0) > 0 and bool(up.get('types')),
+             '_defaults.uploads.max_bytes: 0 turns it off',
+             '_defaults.uploads needs max_bytes above 0 and at least one type'),
+            ('im:write', 'dm', bool((defaults or {}).get('dm_allowlist')),
+             'an empty _defaults.dm_allowlist turns it off',
+             'listing users in _defaults.dm_allowlist turns it on')):
+        if not scopes:
+            has = 'unknown (Slack sent no X-OAuth-Scopes)'
+        else:
+            has = 'yes' if scope in have else 'MISSING'
+        if on and has == 'MISSING':
+            state = '`%s` is ON, so it fails until the scope is added to the app and the app is reinstalled' % cmd
+        elif on:
+            state = '`%s` is ON' % cmd
+        elif has == 'MISSING':
+            state = '`%s` is off, so the scope is not needed yet' % cmd
+        else:
+            state = '`%s` is off' % cmd
+        lines.append('scope %s: %s. %s (%s).' % (scope, has, state, to_off if on else to_on))
+    return lines
 
 
 def upload_limits(defaults):
@@ -2512,20 +2543,8 @@ def _main(cmd, rest):
         me = web.call('auth.test')
         print('team %s user %s bot %s token …%s' % (me.get('team_id'), me.get('user_id'),
                                                   me.get('bot_id'), bot_token[-4:]))
-        have = set((web.scopes or '').replace(' ', '').split(',')) - {''}
-        up = upload_settings(defaults)
-        for scope, on, flag in (
-                ('files:write', int(up.get('max_bytes') or 0) > 0 and bool(up.get('types')),
-                 '`upload`; turned off with _defaults.uploads.max_bytes = 0'),
-                ('im:write', bool(defaults.get('dm_allowlist')),
-                 '`dm`; used when _defaults.dm_allowlist is not empty')):
-            if not web.scopes:
-                print('scope %s: unknown (Slack sent no X-OAuth-Scopes); enables %s' % (scope, flag))
-            elif scope in have:
-                print('scope %s: yes; enables %s' % (scope, flag))
-            else:
-                print('scope %s: MISSING%s; enables %s. Add it to the app and reinstall it.' % (
-                    scope, '' if on else ' (not needed while that command is off)', flag))
+        for line in scope_report(web.scopes, defaults):
+            print(line)
         print('app token: %s' % ('set …' + os.environ['SLACK_APP_TOKEN'][-4:]
                                  if os.environ.get('SLACK_APP_TOKEN') else 'MISSING'))
         print('channels configured: %d (config %s)' % (len(channels), config_path()))

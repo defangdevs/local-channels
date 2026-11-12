@@ -1326,6 +1326,25 @@ class TestCredentials(unittest.TestCase):
             slack.run_daemon()
         self.assertEqual(seen, [('x-slack_bot_token', 'x-slack_app_token')])
 
+    def test_doctor_scope_lines_say_whether_each_command_is_on(self):
+        # 0.2.0 printed "enables `upload`; turned off with ... = 0" for an
+        # upload that was on, and a reader took it for off.
+        missing = slack.scope_report('chat:write,files:read', {})
+        self.assertTrue(missing[0].startswith('scope files:write: MISSING. `upload` is ON, so it fails'))
+        self.assertIn('max_bytes: 0 turns it off', missing[0])
+        self.assertTrue(missing[1].startswith('scope im:write: MISSING. `dm` is off, so the scope is not needed'))
+        self.assertIn('dm_allowlist turns it on', missing[1])
+        flipped = slack.scope_report('chat:write, files:write,im:write',
+                                     {'uploads': {'max_bytes': 0}, 'dm_allowlist': ['U1']})
+        self.assertTrue(flipped[0].startswith('scope files:write: yes. `upload` is off ('))
+        self.assertIn('max_bytes above 0', flipped[0])
+        self.assertTrue(flipped[1].startswith('scope im:write: yes. `dm` is ON ('))
+        self.assertIn('empty _defaults.dm_allowlist turns it off', flipped[1])
+        unknown = slack.scope_report('', {'uploads': {'types': []}})
+        self.assertTrue(unknown[0].startswith('scope files:write: unknown (Slack sent no X-OAuth-Scopes). `upload` is off'))
+        for line in missing + flipped + unknown:
+            self.assertNotIn('enables', line)
+
     def test_doctor_warns_about_a_visible_token_in_socket_mode(self):
         import io
         import contextlib

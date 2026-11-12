@@ -1,6 +1,6 @@
 {
   "name": "local-slack",
   "description": "Slack connection: threads from chosen channels become events on the local-webhook bus (source slack) with a settle timer, and a guarded CLI lets agents reply, post, keep one status message, react, upload files and DM allowlisted people.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "keywords": ["channel", "slack", "socket-mode"]
 }
