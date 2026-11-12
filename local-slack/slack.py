@@ -379,9 +379,12 @@ def scope_report(scopes, defaults):
     up = upload_settings(defaults)
     lines = []
     for scope, cmd, on, to_off, to_on in (
-            ('files:write', 'upload', int(up.get('max_bytes') or 0) > 0 and bool(up.get('types')),
+            # upload_checked drops a type FILE_TYPES has no signature for, so
+            # an allowlist of only such types is off too.
+            ('files:write', 'upload', int(up.get('max_bytes') or 0) > 0
+             and any(t in FILE_TYPES for t in up.get('types') or ()),
              '_defaults.uploads.max_bytes: 0 turns it off',
-             '_defaults.uploads needs max_bytes above 0 and at least one type'),
+             '_defaults.uploads needs max_bytes above 0 and at least one supported type'),
             ('im:write', 'dm', bool((defaults or {}).get('dm_allowlist')),
              'an empty _defaults.dm_allowlist turns it off',
              'listing users in _defaults.dm_allowlist turns it on')):

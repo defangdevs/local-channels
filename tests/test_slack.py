@@ -1342,7 +1342,14 @@ class TestCredentials(unittest.TestCase):
         self.assertIn('empty _defaults.dm_allowlist turns it off', flipped[1])
         unknown = slack.scope_report('', {'uploads': {'types': []}})
         self.assertTrue(unknown[0].startswith('scope files:write: unknown (Slack sent no X-OAuth-Scopes). `upload` is off'))
-        for line in missing + flipped + unknown:
+        # A type with no signature in FILE_TYPES is dropped by upload_checked,
+        # so an allowlist of only those is off, not "ON, so it fails".
+        unsupported = slack.scope_report('chat:write', {'uploads': {'types': ['image/svg+xml']}})
+        self.assertTrue(unsupported[0].startswith('scope files:write: MISSING. `upload` is off, so the scope is not needed'))
+        self.assertIn('at least one supported type', unsupported[0])
+        mixed = slack.scope_report('chat:write', {'uploads': {'types': ['image/svg+xml', 'application/pdf']}})
+        self.assertIn('`upload` is ON, so it fails', mixed[0])
+        for line in missing + flipped + unknown + unsupported + mixed:
             self.assertNotIn('enables', line)
 
     def test_doctor_warns_about_a_visible_token_in_socket_mode(self):
