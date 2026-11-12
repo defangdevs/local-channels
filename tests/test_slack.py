@@ -1326,6 +1326,32 @@ class TestCredentials(unittest.TestCase):
             slack.run_daemon()
         self.assertEqual(seen, [('x-slack_bot_token', 'x-slack_app_token')])
 
+    def test_doctor_scope_lines_say_whether_each_command_is_on(self):
+        # 0.2.0 printed "enables `upload`; turned off with ... = 0" for an
+        # upload that was on, and a reader took it for off.
+        missing = slack.scope_report('chat:write,files:read', {})
+        self.assertTrue(missing[0].startswith('scope files:write: MISSING. `upload` is ON, so it fails'))
+        self.assertIn('max_bytes: 0 turns it off', missing[0])
+        self.assertTrue(missing[1].startswith('scope im:write: MISSING. `dm` is off, so the scope is not needed'))
+        self.assertIn('dm_allowlist turns it on', missing[1])
+        flipped = slack.scope_report('chat:write, files:write,im:write',
+                                     {'uploads': {'max_bytes': 0}, 'dm_allowlist': ['U1']})
+        self.assertTrue(flipped[0].startswith('scope files:write: yes. `upload` is off ('))
+        self.assertIn('max_bytes above 0', flipped[0])
+        self.assertTrue(flipped[1].startswith('scope im:write: yes. `dm` is ON ('))
+        self.assertIn('empty _defaults.dm_allowlist turns it off', flipped[1])
+        unknown = slack.scope_report('', {'uploads': {'types': []}})
+        self.assertTrue(unknown[0].startswith('scope files:write: unknown (Slack sent no X-OAuth-Scopes). `upload` is off'))
+        # A type with no signature in FILE_TYPES is dropped by upload_checked,
+        # so an allowlist of only those is off, not "ON, so it fails".
+        unsupported = slack.scope_report('chat:write', {'uploads': {'types': ['image/svg+xml']}})
+        self.assertTrue(unsupported[0].startswith('scope files:write: MISSING. `upload` is off, so the scope is not needed'))
+        self.assertIn('at least one supported type', unsupported[0])
+        mixed = slack.scope_report('chat:write', {'uploads': {'types': ['image/svg+xml', 'application/pdf']}})
+        self.assertIn('`upload` is ON, so it fails', mixed[0])
+        for line in missing + flipped + unknown + unsupported + mixed:
+            self.assertNotIn('enables', line)
+
     def test_doctor_warns_about_a_visible_token_in_socket_mode(self):
         import io
         import contextlib
@@ -1633,6 +1659,25 @@ class TestUploadAndDm(unittest.TestCase):
         slack.UPLOAD_SLOTS.release()
         slack.UPLOAD_SLOTS.release()
         b.close()
+
+    def test_a_trickling_upload_read_hits_the_deadline_and_frees_its_slot(self):
+        import socket as sk
+        a, b = sk.socketpair()
+        b.sendall(b'x' * (slack.MAX_REQUEST + 10))          # past the small cap, no newline, then silence
+        slots = []
+
+        def on_big():
+            slack.UPLOAD_SLOTS.acquire()
+            slots.append(1)
+        try:
+            with self.assertRaises(slack.Refused):
+                slack._read_line(a, slack.MAX_REQUEST * 4, on_big, deadline_s=0.3)
+        finally:
+            for _ in slots:
+                slack.UPLOAD_SLOTS.release()
+            a.close()
+            b.close()
+        self.assertEqual(len(slots), 1)
 
     def test_parse_upload(self):
         d = tempfile.mkdtemp(dir='/tmp')
