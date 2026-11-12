@@ -5,7 +5,8 @@ Single file (`slack.py`), stdlib only, python ≥ 3.9. Design: the spec in that 
 
 **0.1.0 is the core.** It covers event shaping, the settle timer, the send
 guardrails, a Socket Mode client and a small CLI, in *plain mode* (tokens in the
-agent user's env) or *socket-service mode* (below). Not yet built: grants, MCP
+agent user's env) or *socket-service mode* (below). **0.2.0** adds `upload` and
+`dm` ([Sending files and DMs](#sending-files-and-dms)). Not yet built: grants, MCP
 tools, the classifier command runner, the HTTP Events API
 transport, the settings card and the agent-box supervisor unit. In plain mode an
 agent that can read the bot token can bypass the guardrails — use it only where
