@@ -84,9 +84,13 @@ SECRET_PATTERNS = [
     re.compile(r'github_pat_[A-Za-z0-9_]{40,}'),
     re.compile(r'AKIA[0-9A-Z]{16}'),
     # Needs a digit: a kebab-case branch name is not a key (`sk-` + 32 letters).
-    re.compile(r'sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}'),
+    # The `sk-` and `eyJ` shapes must start a token (the lookbehind). Without
+    # that, a long run of `sk-sk-sk-…` or `eyJeyJ…` is retried from every
+    # offset and the scan is quadratic: 64 KiB took 11 s, and an upload scans
+    # megabytes. It also stops `task-…` matching as `sk-…`.
+    re.compile(r'(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}'),
     re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
-    re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
+    re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
 ]
 
 
@@ -354,12 +358,30 @@ DEFAULT_DEFAULTS = {
                         'audio/wav'],
               'max_bytes': 20 * 1024 * 1024, 'total_bytes': 200 * 1024 * 1024},
     # What `upload` may send. Same signature table as `file`, narrower default:
-    # a PDF and screenshots. max_bytes caps one file, call_bytes one call, and
-    # max_files the files in one message. max_bytes 0 turns uploads off. Needs
-    # the files:write scope.
+    # a PDF and screenshots. max_bytes caps one file, call_bytes one call (0 or
+    # null: max_bytes), and max_files the files in one message. max_bytes 0
+    # turns uploads off. Needs the files:write scope.
     'uploads': {'types': ['image/png', 'image/jpeg', 'application/pdf'],
                 'max_bytes': 5 * 1024 * 1024, 'call_bytes': 15 * 1024 * 1024, 'max_files': 10},
 }
+
+
+def upload_settings(defaults):
+    return dict(DEFAULT_DEFAULTS['uploads'], **((defaults or {}).get('uploads') or {}))
+
+
+def upload_limits(defaults):
+    """(per-file cap, per-call cap, most files) from _defaults.uploads. One
+    reading for every place that checks them, so a call_bytes of 0 or null
+    means max_bytes in plain and socket mode alike."""
+    u = upload_settings(defaults)
+    cap = int(u.get('max_bytes') or 0)
+    return cap, int(u.get('call_bytes') or cap), int(u.get('max_files') or 10)
+
+
+class CheckedFiles(list):
+    """Files that already passed Writer.upload_checked. Only the daemon makes
+    one, after its own check; nothing from a request is ever this type."""
 
 
 def _merge(base, over):
@@ -1681,36 +1703,42 @@ class Writer:
 
     def upload_checked(self, files):
         """[(name, bytes)] -> [(safe name, mime, bytes)], or Refused. The type
-        comes from the bytes' signature, never from the file name."""
-        cfg = dict(DEFAULT_DEFAULTS['uploads'], **(self.defaults.get('uploads') or {}))
-        cap = int(cfg.get('max_bytes') or 0)
+        comes from the bytes' signature, never from the file name. The socket
+        runs this before taking the write lock, since the scan is the slow
+        part, and hands the result to upload() as it is."""
+        if isinstance(files, CheckedFiles):
+            return files
+        cap, call, max_files = upload_limits(self.defaults)
         if cap <= 0:
             raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
         if not files:
             raise Refused('upload needs at least one file')
-        if len(files) > int(cfg.get('max_files') or 10):
-            raise Refused('at most %d files per upload' % int(cfg.get('max_files') or 10))
-        allowed = [t for t in cfg.get('types', []) if t in FILE_TYPES]
+        if len(files) > max_files:
+            raise Refused('at most %d files per upload' % max_files)
+        allowed = [t for t in upload_settings(self.defaults).get('types', []) if t in FILE_TYPES]
         extra = self.defaults.get('secret_patterns', ())
-        total, out = 0, []
+        total, out = 0, CheckedFiles()
         for name, data in files:
             if len(data) > cap:
                 raise Refused('%s is larger than %d bytes' % (name, cap))
             total += len(data)
-            if total > int(cfg.get('call_bytes') or cap):
-                raise Refused('files total more than %d bytes' % int(cfg.get('call_bytes') or cap))
+            if total > call:
+                raise Refused('files total more than %d bytes' % call)
             mime = next((t for t in allowed if FILE_TYPES[t][1](data)), None)
             if mime is None:
                 raise Refused('%s is not an allowed file type (allowed: %s)' % (name, ', '.join(allowed) or 'none'))
             base = re.sub(r'[^A-Za-z0-9._ -]', '_', os.path.basename(str(name)))
             base = re.sub(r'\.[A-Za-z0-9]{1,8}$', '', base).strip('. ')[:80] or 'file'
-            # Text is scanned whole. A PDF has a text layer only when it is not
-            # compressed, so its raw bytes are scanned too: compressed PDF text
-            # and image contents are only type- and size-checked.
-            if mime == 'application/pdf':
-                scan_secrets(data.decode('latin-1'), extra)
-            elif mime.startswith('text/') or mime == 'application/json':
+            # Every file's raw bytes are scanned, whatever its type: the type
+            # check reads only the first bytes, so a PNG header can carry a
+            # key in plain text after it. Text types are read as UTF-8 so the
+            # zero-width stripping works; the rest as latin-1, one character
+            # per byte. What is compressed (most PDF text, image pixels, audio)
+            # is not plain text and is only type- and size-checked.
+            if mime.startswith('text/') or mime == 'application/json':
                 scan_secrets(data.decode('utf-8'), extra)
+            else:
+                scan_secrets(data.decode('latin-1'), extra)
             scan_secrets(base, extra)
             out.append(('%s.%s' % (base, FILE_TYPES[mime][0]), mime, data))
         return out
@@ -1782,7 +1810,8 @@ class Writer:
 MAX_REQUEST = 64 * 1024
 MAX_CONNECTIONS = 32
 UPLOAD_SLOTS = threading.BoundedSemaphore(2)   # requests larger than MAX_REQUEST held in memory at once
-MAX_UPLOAD_CALL = 64 * 1024 * 1024   # ceiling on _defaults.uploads.call_bytes through the socket
+MAX_UPLOAD_CALL = 64 * 1024 * 1024   # ceiling on _defaults.uploads.call_bytes through the socket,
+                                     # and all a socket client reads (the daemon applies the real caps)
 SERVER_TIMEOUT_S = 10    # a connected peer must send its request within this
 LOCK_WAIT_S = 10         # a write waits this long for the one write lock
 CLIENT_TIMEOUT_S = 90    # must exceed LOCK_WAIT_S plus a Slack round trip
@@ -2036,6 +2065,11 @@ def handle_request(ctx, uid, req, conn=None):
             raise Refused('unknown command %r' % (cmd,))
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise Refused('args must be a list of strings')
+        # Only an upload's files may take a request past MAX_REQUEST. The text
+        # (a reply, an upload's comment) stays within it, because it is
+        # composed and scanned while the write lock is held.
+        if sum(len(a) for a in args) > MAX_REQUEST:
+            raise Refused('request too large')
         files = None
         if cmd == 'upload':
             raw = req.get('files')
@@ -2043,13 +2077,12 @@ def handle_request(ctx, uid, req, conn=None):
                     isinstance(f, dict) and isinstance(f.get('name'), str) and isinstance(f.get('data'), str)
                     for f in raw):
                 raise Refused('upload needs files: [{name, data}]')
-            u = dict(DEFAULT_DEFAULTS['uploads'], **(ctx.defaults().get('uploads') or {}))
-            cap = int(u.get('max_bytes') or 0)
+            cap, call, max_files = upload_limits(ctx.defaults())
             if cap <= 0:
                 raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
-            if (len(raw) > int(u.get('max_files') or 10) or
+            if (len(raw) > max_files or
                     any(len(f['data']) > cap * 4 // 3 + 8 for f in raw) or
-                    sum(len(f['data']) for f in raw) > int(u.get('call_bytes') or cap) * 4 // 3 + 8 * len(raw)):
+                    sum(len(f['data']) for f in raw) > call * 4 // 3 + 8 * len(raw)):
                 raise Refused('upload is over the size limits')   # before anything is decoded
             try:
                 files = [(f['name'], base64.b64decode(f['data'], validate=True)) for f in raw]
@@ -2071,6 +2104,10 @@ def handle_request(ctx, uid, req, conn=None):
                                        session=session), cmd, args), ok=True)
         w = Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot, session=session)
         w.team = ctx.bot.get('team') or ''
+        if files is not None:
+            # Type, size and secret scan before the lock: scanning megabytes
+            # takes seconds, and every other session's write waits on the lock.
+            files = w.upload_checked(files)
         if not ctx.write_lock.acquire(timeout=LOCK_WAIT_S):
             raise Refused('daemon is busy with another write; try again')
         try:
@@ -2095,10 +2132,10 @@ def peer_uid(conn):
 def request_limit(defaults):
     """Bytes one request line may hold: the small default, or room for a whole
     upload call (base64 is 4/3 of the bytes) when uploads are on."""
-    u = dict(DEFAULT_DEFAULTS['uploads'], **((defaults or {}).get('uploads') or {}))
-    if int(u.get('max_bytes') or 0) <= 0:
+    cap, call, _ = upload_limits(defaults)
+    if cap <= 0:
         return MAX_REQUEST
-    return MAX_REQUEST + min(int(u.get('call_bytes') or 0), MAX_UPLOAD_CALL) * 4 // 3 + 4096
+    return MAX_REQUEST + min(call, MAX_UPLOAD_CALL) * 4 // 3 + 4096
 
 
 def _read_line(conn, limit=MAX_REQUEST, on_big=None):
@@ -2142,13 +2179,17 @@ def serve_connection(conn, allowed, ctx):
                     held.append(1)
                 try:
                     try:
-                        req = json.loads(_read_line(conn, request_limit(ctx.defaults()), on_big).decode())
+                        line = _read_line(conn, request_limit(ctx.defaults()), on_big)
+                        req = json.loads(line.decode())
                         if not isinstance(req, dict):
                             raise ValueError
                     except (ValueError, UnicodeDecodeError):
                         resp = {'ok': False, 'error': 'bad request'}
                     else:
-                        resp = handle_request(ctx, uid, req, conn)
+                        if len(line) > MAX_REQUEST and req.get('cmd') != 'upload':
+                            resp = {'ok': False, 'error': 'request too large'}
+                        else:
+                            resp = handle_request(ctx, uid, req, conn)
                 finally:
                     if held:
                         UPLOAD_SLOTS.release()
@@ -2315,10 +2356,17 @@ def _opt(args, name, default=None, flag=False):
     return False if flag else default
 
 
-def parse_upload(rest, defaults):
+def parse_upload(rest, defaults=None, ceiling=None):
     """`upload CHANNEL [TS] FILE... [--comment TEXT]` -> (channel, ts, files,
     comment). Files are read here, on the caller's side, at most one byte over
-    the per-file cap so an oversized one is refused without reading all of it."""
+    the per-file cap so an oversized one is refused without reading all of it.
+
+    In plain mode the caps are this config's, the one the Writer enforces. In
+    socket mode the caller's config is not the daemon's (the agent user usually
+    has no channels.json at all), so it would apply the default 5 MiB whatever
+    the daemon allows. There the caller passes `ceiling` instead: a fixed bound
+    on what it reads into memory, per file and in all, and the daemon applies
+    the real limits."""
     rest = list(rest)
     comment = _opt(rest, '--comment', '')
     if len(rest) < 2:
@@ -2329,19 +2377,26 @@ def parse_upload(rest, defaults):
         ts, rest = rest[0], rest[1:]
     if not rest:
         raise Refused('usage: upload')
-    u = dict(DEFAULT_DEFAULTS['uploads'], **(defaults.get('uploads') or {}))
-    cap = int(u.get('max_bytes') or 0)
-    files = []
+    if ceiling is None:
+        cap, call, _ = upload_limits(defaults)
+        what = '_defaults.uploads'
+    else:
+        cap = call = ceiling
+        what = "the socket client's ceiling"
+    if cap <= 0:
+        raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
+    files, total = [], 0
     for path in rest:
         try:
             with open(path, 'rb') as f:
-                data = f.read(cap + 1)
+                data = f.read(min(cap, call - total) + 1)
         except OSError as e:
             raise Refused('cannot read %s: %s' % (path, e.strerror))
-        if cap <= 0:
-            raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
         if len(data) > cap:
-            raise Refused('%s is larger than %d bytes' % (path, cap))
+            raise Refused('%s is larger than %d bytes (%s)' % (path, cap, what))
+        total += len(data)
+        if total > call:
+            raise Refused('files total more than %d bytes (%s)' % (call, what))
         files.append((os.path.basename(path), data))
     return channel, ts, files, comment
 
@@ -2449,7 +2504,7 @@ def _main(cmd, rest):
         print('team %s user %s bot %s token …%s' % (me.get('team_id'), me.get('user_id'),
                                                   me.get('bot_id'), bot_token[-4:]))
         have = set((web.scopes or '').replace(' ', '').split(',')) - {''}
-        up = dict(DEFAULT_DEFAULTS['uploads'], **(defaults.get('uploads') or {}))
+        up = upload_settings(defaults)
         for scope, on, flag in (
                 ('files:write', int(up.get('max_bytes') or 0) > 0 and bool(up.get('types')),
                  '`upload`; turned off with _defaults.uploads.max_bytes = 0'),
@@ -2548,7 +2603,7 @@ def _socket_main(sock, cmd, rest):
     files = None
     if cmd == 'upload':
         try:
-            channel, ts, files, comment = parse_upload(rest, load_config()[1])
+            channel, ts, files, comment = parse_upload(rest, ceiling=MAX_UPLOAD_CALL)
         except Refused as e:
             if str(e) == 'usage: upload':
                 print(USAGE, file=sys.stderr)

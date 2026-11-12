@@ -3,7 +3,10 @@
 # touches the network; Socket Mode and the Web API are exercised only through
 # their pure parts (the bucket, the frame codec is covered by the daemon e2e
 # a follow-up adds).
+import base64
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -1424,8 +1427,9 @@ class TestUploadAndDm(unittest.TestCase):
         self.defaults['uploads'] = {'max_bytes': 40, 'call_bytes': 60, 'max_files': 2}
         with self.assertRaises(slack.Refused):                      # one file too big
             self.w.upload('C1', TS, [('a.png', self.PNG + b'x' * 20)])
-        with self.assertRaises(slack.Refused):                      # call too big
-            self.w.upload('C1', TS, [('a.png', self.PNG)] * 2 + [('b.png', self.PNG)])
+        big = self.PNG + b'x' * 5                                   # 33 bytes: two fit max_files, not call_bytes
+        with self.assertRaisesRegex(slack.Refused, 'total'):        # call too big
+            self.w.upload('C1', TS, [('a.png', big), ('b.png', big)])
         with self.assertRaises(slack.Refused):                      # too many files
             self.w.upload('C1', TS, [('a.png', self.PNG)] * 3)
         self.defaults['uploads'] = {'max_bytes': 0}
@@ -1442,6 +1446,109 @@ class TestUploadAndDm(unittest.TestCase):
         with self.assertRaises(slack.Refused):
             self.w.upload('C1', TS, [('n.txt', b'AKIA' + b'A' * 16)])
         self.assertEqual(self.calls, [])
+
+    def test_every_file_is_scanned_not_only_pdf_and_text(self):
+        # The type check reads only the first bytes, so what follows a PNG or
+        # JPEG header is scanned like a PDF's raw bytes.
+        self.defaults['uploads'] = {'types': ['image/png', 'image/jpeg', 'application/pdf', 'audio/ogg']}
+        tail = b'\n-----BEGIN OPENSSH PRIVATE KEY-----\nGH_TOKEN=ghp_' + b'a' * 36 + b'\n'
+        for magic in (b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'%PDF-1.4\n', b'OggS'):
+            with self.assertRaisesRegex(slack.Refused, 'secret pattern'):
+                self.w.upload('C1', TS, [('a.bin', magic + b'\x00\xff' * 50 + tail)])
+        self.assertEqual(self.calls, [])
+
+    def test_secret_scan_is_linear_on_crafted_runs(self):
+        # Unanchored, `sk-` and `eyJ` were retried from every offset of a run:
+        # 64 KiB took 11 s. 1 MiB of each must now take well under a second.
+        import time
+        for unit in ('sk-', 'eyJ'):
+            start = time.time()
+            slack.scan_secrets(unit * (1024 * 1024 // 3))
+            self.assertLess(time.time() - start, 5, unit)
+        for real in ('OPENAI_API_KEY=sk-proj-' + 'a1' * 20, '"sk-' + 'Ab3' * 12 + '"',
+                     'Bearer eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.abcdefghijkl'):
+            with self.assertRaises(slack.Refused):
+                slack.scan_secrets(real)
+        slack.scan_secrets('see branch fix/task-123-make-the-upload-work-for-everyone')  # `task-` is not `sk-`
+
+    def test_files_are_checked_before_the_write_lock(self):
+        # The scan can take seconds; it must not hold up other sessions' writes.
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        bad = base64.b64encode(self.PNG + b'ghp_' + b'a' * 36).decode()
+        good = base64.b64encode(self.PNG).decode()
+        wait, slack.LOCK_WAIT_S = slack.LOCK_WAIT_S, 0.1
+        self.addCleanup(setattr, slack, 'LOCK_WAIT_S', wait)
+        with ctx.write_lock:                                        # another session is writing
+            r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                              'files': [{'name': 'a.png', 'data': bad}]})
+            self.assertIn('secret pattern', r['error'])             # refused without waiting
+            r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                              'files': [{'name': 'a.png', 'data': good}]})
+            self.assertIn('busy', r['error'])                       # a clean one then waits its turn
+        r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                          'files': [{'name': 'a.png', 'data': good}]})
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(len(self.puts), 1)
+
+    def test_only_upload_files_may_pass_the_small_request_cap(self):
+        import socket as sk
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        long = 'x' * (slack.MAX_REQUEST + 10)
+        for req in ({'cmd': 'reply', 'args': ['C1', TS, long]},
+                    {'cmd': 'post', 'args': ['C1', 'hi'], 'pad': long}):
+            a, b = sk.socketpair()
+            b.sendall(json.dumps(req).encode() + b'\n')
+            slack.serve_connection(a, {os.getuid()}, ctx)
+            self.assertIn('request too large', json.loads(b.recv(65536).decode())['error'])
+            b.close()
+        r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, long],   # a huge comment
+                                          'files': [{'name': 'a.png', 'data': base64.b64encode(self.PNG).decode()}]})
+        self.assertIn('request too large', r['error'])
+        self.assertEqual(self.calls, [])
+
+    def test_call_bytes_zero_or_null_means_max_bytes_everywhere(self):
+        for cb in (0, None):
+            d = slack._merge(slack.DEFAULT_DEFAULTS, {'uploads': {'max_bytes': 1000, 'call_bytes': cb}})
+            self.assertEqual(slack.upload_limits(d), (1000, 1000, 10))
+            self.assertEqual(slack.request_limit(d), slack.MAX_REQUEST + 1000 * 4 // 3 + 4096)
+        d = slack._merge(slack.DEFAULT_DEFAULTS, {'uploads': {'max_bytes': 0}})
+        self.assertEqual(slack.request_limit(d), slack.MAX_REQUEST)
+
+    def test_socket_client_uses_a_ceiling_not_its_own_config(self):
+        # The caller's channels.json is not the daemon's (the agent user usually
+        # has none), so in socket mode the daemon's limits decide.
+        d = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        f = os.path.join(d, 'proof.png')
+        data = self.PNG + b'z' * 500
+        with open(f, 'wb') as h:
+            h.write(data)
+        client = {'uploads': {'max_bytes': 10}}                     # would refuse a 528-byte file
+        with self.assertRaises(slack.Refused):
+            slack.parse_upload(['C1', TS, f], client)
+        self.assertEqual(slack.parse_upload(['C1', TS, f], client, ceiling=1000)[2], [('proof.png', data)])
+        with self.assertRaisesRegex(slack.Refused, 'larger'):       # over the ceiling: one file
+            slack.parse_upload(['C1', TS, f], ceiling=len(data) - 1)
+        with self.assertRaisesRegex(slack.Refused, 'total'):        # or in all
+            slack.parse_upload(['C1', TS, f, f], ceiling=len(data) + 100)
+        self.defaults['uploads'] = {'max_bytes': 1000}              # the daemon allows it
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        path = os.path.join(d, 's.sock')
+        slack.serve_socket(path, {os.getuid()}, ctx)
+        old = os.environ.get('LOCAL_SLACK_CONFIG')
+        cfg = os.path.join(d, 'client.json')
+        with open(cfg, 'w') as h:
+            json.dump({'_defaults': client}, h)
+        os.environ['LOCAL_SLACK_CONFIG'] = cfg
+        self.addCleanup(lambda: os.environ.pop('LOCAL_SLACK_CONFIG') if old is None
+                        else os.environ.__setitem__('LOCAL_SLACK_CONFIG', old))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(slack._socket_main(path, 'upload', ['C1', TS, f]), 0)
+        self.assertEqual(self.puts[-1][1], data)
+        self.defaults['uploads'] = {'max_bytes': 100}               # and its refusal is the daemon's
+        with self.assertRaises(slack.Refused):
+            slack._socket_main(path, 'upload', ['C1', TS, f])
 
     def test_upload_counts_against_the_session_rate(self):
         self.defaults['limits'] = {'session_writes': 1, 'session_window_s': 600, 'top_level_per_hour': 0}
