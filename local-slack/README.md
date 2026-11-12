@@ -5,7 +5,8 @@ Single file (`slack.py`), stdlib only, python ≥ 3.9. Design: the spec in that 
 
 **0.1.0 is the core.** It covers event shaping, the settle timer, the send
 guardrails, a Socket Mode client and a small CLI, in *plain mode* (tokens in the
-agent user's env) or *socket-service mode* (below). Not yet built: grants, MCP
+agent user's env) or *socket-service mode* (below). **0.2.0** adds `upload` and
+`dm` ([Sending files and DMs](#sending-files-and-dms)). Not yet built: grants, MCP
 tools, the classifier command runner, the HTTP Events API
 transport, the settings card and the agent-box supervisor unit. In plain mode an
 agent that can read the bot token can bypass the guardrails — use it only where
@@ -13,10 +14,10 @@ the agent user is the only author of its input, or use socket-service mode.
 
 ## Socket-service mode
 
-The daemon alone holds the tokens and serves `reply`, `post`, `status`, `react`
-and `thread` on a Unix socket, through the same `Writer` checks and audit as the
-CLI. Mechanism only: which user runs the daemon, where the socket lives and who
-may reach it are the deployment's choice.
+The daemon alone holds the tokens and serves `reply`, `post`, `status`, `react`,
+`thread`, `file`, `dm` and `upload` on a Unix socket, through the same `Writer`
+checks and audit as the CLI. Mechanism only: which user runs the daemon, where
+the socket lives and who may reach it are the deployment's choice.
 
 - Daemon: `LOCAL_SLACK_SOCKET=/path/slack.sock` and
   `LOCAL_SLACK_ALLOWED_UIDS=1000,alice` (numbers or user names; empty refuses to
@@ -31,7 +32,7 @@ may reach it are the deployment's choice.
   of that name (lower- or upper-case) in `$CREDENTIALS_DIRECTORY` (systemd
   `LoadCredential=`) or `LOCAL_SLACK_CREDENTIALS_DIR`. The daemon then needs no
   token in its environment.
-- CLI: with `LOCAL_SLACK_SOCKET` set, `slack.py reply|post|status|react|thread|file`
+- CLI: with `LOCAL_SLACK_SOCKET` set, `slack.py reply|post|status|react|thread|file|dm|upload`
   talk to the socket, read no token and never call Slack. `doctor` warns when a
   token is in the caller's environment; its credential-file warning only sees
   `CREDENTIALS_DIRECTORY` / `LOCAL_SLACK_CREDENTIALS_DIR` in the caller's own
@@ -46,8 +47,11 @@ may reach it are the deployment's choice.
   daemon log"; a shed connection answers "busy". The bounds (64 KiB request, 32
   connections, 10 s read, 10 s lock wait, 90 s client) are constants in
   `slack.py` (`MAX_REQUEST`, `MAX_CONNECTIONS`, `SERVER_TIMEOUT_S`,
-  `LOCK_WAIT_S`, `CLIENT_TIMEOUT_S`). A listed uid can hold all connection slots
-  for up to 10 s each: availability only, from a uid already trusted to write.
+  `LOCK_WAIT_S`, `CLIENT_TIMEOUT_S`). Only an `upload`'s files may take a
+  request past 64 KiB, up to the daemon's `call_bytes` as base64 and never
+  past `MAX_UPLOAD_CALL` (64 MiB); two slots (`UPLOAD_SLOTS`) bound how many
+  large requests are held in memory at once. A listed uid can hold all connection slots for up to 10 s
+  each: availability only, from a uid already trusted to write.
 - Audit: the `session` column is `uid<N>/<session name>`: the uid is verified,
   the name (from `AGENT_BOX_SESSION_ID`) is the caller's own claim. The
   per-session write cap counts per that pair.
@@ -236,16 +240,26 @@ top-level post and needs `write.top_level`. `--comment` is composed like a
 reply (mentions, links, secret scan, disclosure). Needs the `files:write` bot
 scope, so an app set up for `file` alone must be reinstalled.
 
-Guards, in plain and socket mode alike (the CLI reads the files and the daemon
-checks and sends them, so agents never hold the token): the type comes from the
-bytes, never the name, and only `_defaults.uploads.types` (PDF, PNG and JPEG by
-default; any type in the `file` table can be added) pass; at most
-`max_bytes` per file (5 MiB), `call_bytes` per call (15 MiB) and `max_files` (10);
-`max_bytes: 0` turns uploads off. The sent name is sanitised and its extension
-comes from the type. Text files are secret-scanned whole, and so are a PDF's raw
-bytes, which catches an uncompressed text layer. Compressed PDF text, image
-contents, audio and file metadata are only type- and size-checked. Each upload counts as one write for
-the session rate and is audited with the name, size and a SHA-256 prefix.
+The same guards run in plain and socket mode. In socket mode the CLI only reads
+the files and the daemon checks and sends them, so the agent never holds the
+token; in plain mode the agent holds it and can bypass every guard (see the
+top of this page). The type comes from the bytes, never the name, and only
+`_defaults.uploads.types` (PDF, PNG and JPEG by default; any type in the `file`
+table can be added) pass; at most `max_bytes` per file (5 MiB), `call_bytes`
+per call (15 MiB; 0 or null means `max_bytes`) and `max_files` (10);
+`max_bytes: 0` turns uploads off. In socket mode these are the daemon's
+settings: the CLI reads up to `MAX_UPLOAD_CALL` (64 MiB) and leaves the limits
+to the daemon. The sent name is sanitised and its extension comes from the
+type.
+
+Every file's raw bytes are secret-scanned, whatever its type (text as UTF-8,
+the rest byte for byte), so a key in plain text after an image header is
+refused. The daemon does this before it takes the write lock, so a large
+upload does not hold up other sessions' writes. What is compressed is not
+plain text and is only type- and size-checked: most PDF text, image pixels,
+and audio, including any audio type a deployment adds to `types`. Each upload
+counts as one write for the session rate and is audited with the name, size
+and a SHA-256 prefix.
 
 `slack.py dm USER TEXT` opens a DM and posts to a user listed in
 `_defaults.dm_allowlist` (exact string match; a user not listed is refused). It
@@ -257,9 +271,10 @@ user with `LOCAL_SLACK_SOCKET` unset to see the scopes.
 A socket client waits 90 s plus 90 s per file for the answer; if it still times
 out, check the thread before retrying, or the upload may post twice.
 
-Not yet checked against Slack: that the upload URL accepts a `POST` of the raw
-bytes (Slack's docs say POST), and that `files.completeUploadExternal` takes the
-form-encoded `files` JSON string as sent here.
+Checked against Slack's docs but not yet against a live workspace: the upload
+URL takes a `POST` of the raw bytes ([files.getUploadURLExternal](https://docs.slack.dev/reference/methods/files.getUploadURLExternal)),
+and `files.completeUploadExternal` takes `files` as a form-encoded JSON string
+([files.completeUploadExternal](https://docs.slack.dev/reference/methods/files.completeUploadExternal)).
 
 ## Not yet verified against Slack
 
