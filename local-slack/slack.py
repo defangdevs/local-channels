@@ -42,7 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 
 API_HOST = 'slack.com'
 
@@ -84,9 +84,13 @@ SECRET_PATTERNS = [
     re.compile(r'github_pat_[A-Za-z0-9_]{40,}'),
     re.compile(r'AKIA[0-9A-Z]{16}'),
     # Needs a digit: a kebab-case branch name is not a key (`sk-` + 32 letters).
-    re.compile(r'sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}'),
+    # The `sk-` and `eyJ` shapes must start a token (the lookbehind). Without
+    # that, a long run of `sk-sk-sk-…` or `eyJeyJ…` is retried from every
+    # offset and the scan is quadratic: 64 KiB took 11 s, and an upload scans
+    # megabytes. It also stops `task-…` matching as `sk-…`.
+    re.compile(r'(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}'),
     re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
-    re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
+    re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
 ]
 
 
@@ -353,7 +357,31 @@ DEFAULT_DEFAULTS = {
                         'audio/webm', 'audio/mp4', 'audio/x-m4a', 'audio/mpeg', 'audio/ogg',
                         'audio/wav'],
               'max_bytes': 20 * 1024 * 1024, 'total_bytes': 200 * 1024 * 1024},
+    # What `upload` may send. Same signature table as `file`, narrower default:
+    # a PDF and screenshots. max_bytes caps one file, call_bytes one call (0 or
+    # null: max_bytes), and max_files the files in one message. max_bytes 0
+    # turns uploads off. Needs the files:write scope.
+    'uploads': {'types': ['image/png', 'image/jpeg', 'application/pdf'],
+                'max_bytes': 5 * 1024 * 1024, 'call_bytes': 15 * 1024 * 1024, 'max_files': 10},
 }
+
+
+def upload_settings(defaults):
+    return dict(DEFAULT_DEFAULTS['uploads'], **((defaults or {}).get('uploads') or {}))
+
+
+def upload_limits(defaults):
+    """(per-file cap, per-call cap, most files) from _defaults.uploads. One
+    reading for every place that checks them, so a call_bytes of 0 or null
+    means max_bytes in plain and socket mode alike."""
+    u = upload_settings(defaults)
+    cap = int(u.get('max_bytes') or 0)
+    return cap, int(u.get('call_bytes') or cap), int(u.get('max_files') or 10)
+
+
+class CheckedFiles(list):
+    """Files that already passed Writer.upload_checked. Only the daemon makes
+    one, after its own check; nothing from a request is ever this type."""
 
 
 def _merge(base, over):
@@ -997,7 +1025,9 @@ class Web:
         self.t3, self.t2 = Bucket(45), Bucket(18)
         self.retry_after = 0.0
 
-    def call(self, method, params=None, write=False, token=None, tier=3):
+    scopes = None   # the X-OAuth-Scopes of the last answer, for `doctor`
+
+    def call(self, method, params=None, write=False, token=None, tier=3, form=False):
         if time.time() < self.retry_after:
             raise SlackError('rate_limited: retry in %ds' % (self.retry_after - time.time()))
         if not (self.t3 if tier == 3 else self.t2).take(write):
@@ -1006,7 +1036,7 @@ class Web:
         # methods (conversations.replies, users.list, ...) take form encoding and
         # may silently ignore a JSON body, so reads are form-encoded.
         headers = {'Authorization': 'Bearer ' + (token or self.bot)}
-        if write:
+        if write and not form:
             data = json.dumps(params or {}).encode()
             headers['Content-Type'] = 'application/json; charset=utf-8'
         else:
@@ -1018,6 +1048,7 @@ class Web:
                                      method='POST', headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
+                self.scopes = getattr(r, 'headers', {}).get('X-OAuth-Scopes', self.scopes)
                 out = json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             if e.code == 429:
@@ -1029,6 +1060,25 @@ class Web:
         if not out.get('ok'):
             raise SlackError(out.get('error', 'unknown_error'))
         return out
+
+    def upload_bytes(self, url, data):
+        """Send one file's bytes to the one-time URL files.getUploadURLExternal
+        returned. The URL is already authorised, so no token goes with it, and
+        it must be an exact Slack file host over https. Redirects are refused."""
+        u = urllib.parse.urlsplit(url or '')
+        if u.scheme != 'https' or u.hostname not in FILE_HOSTS or u.port not in (None, 443):
+            raise SlackError('upload_host_refused')
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, data=data, method='POST',
+                                     headers={'Content-Type': 'application/octet-stream'})
+        try:
+            with opener.open(req, timeout=60) as r:
+                if r.status != 200:
+                    raise SlackError('http %d' % r.status)
+        except urllib.error.HTTPError as e:
+            raise SlackError('upload_redirect_refused' if 300 <= e.code < 400 else 'http %d' % e.code)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise SlackError('network_error: %s' % type(e).__name__)
 
     def download(self, url, max_bytes):
         """Bytes of one Slack-hosted file, at most max_bytes. The bot token goes
@@ -1436,6 +1486,10 @@ USAGE = '''local-slack %s
   slack.py post CHANNEL TEXT
   slack.py status CHANNEL TS TEXT [--done|--failed]
   slack.py react CHANNEL TS EMOJI
+  slack.py upload CHANNEL [TS] FILE... [--comment TEXT]
+                                           files (PDF, PNG, JPEG by default) as one message;
+                                           needs files:write
+  slack.py dm USER TEXT                    to a user in _defaults.dm_allowlist; needs im:write
   slack.py purge
 
 Tokens come from SLACK_BOT_TOKEN / SLACK_APP_TOKEN, or a credentials file
@@ -1528,7 +1582,7 @@ class Writer:
                 raise Refused('at most %d writes per session per %d seconds' % (cap, window))
         cap = lim.get('top_level_per_hour')
         if top_level and cap:
-            c = self.store.q("SELECT COUNT(*) c FROM audit WHERE channel=? AND kind='post' AND at>?",
+            c = self.store.q("SELECT COUNT(*) c FROM audit WHERE channel=? AND kind IN ('post','upload_top') AND at>?",
                              channel, now - 3600)[0]['c']
             if c >= cap:
                 raise Refused('at most %d top-level posts per channel per hour' % cap)
@@ -1625,6 +1679,103 @@ class Writer:
                                [m for st, m in marks.items() if st != state] if e])
         return dict(r, unresolved=unresolved)
 
+    def dm(self, user, text):
+        """A short note to one allowlisted person. Sending only: nothing here
+        reads a DM, and a reply to it reaches no session."""
+        allowed = self.defaults.get('dm_allowlist') or []
+        if not isinstance(user, str) or user not in allowed:
+            raise Refused('%s is not in dm_allowlist' % (user,))
+        uid = user.split('@', 1)[0]
+        if not re.fullmatch(r'[UW][A-Z0-9]+', uid):
+            raise Refused('bad user id %r' % user)
+        self._rate('dm:' + user, False)
+        unresolved = []
+        body = compose(text, self.resolver, DEFAULT_CHANNEL, self.defaults, unresolved)
+        if self.defaults.get('disclosure'):
+            body += '\n\n' + self.defaults['disclosure']
+        if len(body) > 4000:
+            raise Refused('message over 4,000 characters')
+        chan = self.web.call('conversations.open', {'users': uid}, write=True)['channel']['id']
+        r = self.web.call('chat.postMessage', {'channel': chan, 'text': body, 'unfurl_links': False,
+                                                'unfurl_media': False}, write=True)
+        self.audit('dm', chan, None, r.get('ts'), body)
+        return dict(r, unresolved=unresolved)
+
+    def upload_checked(self, files):
+        """[(name, bytes)] -> [(safe name, mime, bytes)], or Refused. The type
+        comes from the bytes' signature, never from the file name. The socket
+        runs this before taking the write lock, since the scan is the slow
+        part, and hands the result to upload() as it is."""
+        if isinstance(files, CheckedFiles):
+            return files
+        cap, call, max_files = upload_limits(self.defaults)
+        if cap <= 0:
+            raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
+        if not files:
+            raise Refused('upload needs at least one file')
+        if len(files) > max_files:
+            raise Refused('at most %d files per upload' % max_files)
+        allowed = [t for t in upload_settings(self.defaults).get('types', []) if t in FILE_TYPES]
+        extra = self.defaults.get('secret_patterns', ())
+        total, out = 0, CheckedFiles()
+        for name, data in files:
+            if len(data) > cap:
+                raise Refused('%s is larger than %d bytes' % (name, cap))
+            total += len(data)
+            if total > call:
+                raise Refused('files total more than %d bytes' % call)
+            mime = next((t for t in allowed if FILE_TYPES[t][1](data)), None)
+            if mime is None:
+                raise Refused('%s is not an allowed file type (allowed: %s)' % (name, ', '.join(allowed) or 'none'))
+            base = re.sub(r'[^A-Za-z0-9._ -]', '_', os.path.basename(str(name)))
+            base = re.sub(r'\.[A-Za-z0-9]{1,8}$', '', base).strip('. ')[:80] or 'file'
+            # Every file's raw bytes are scanned, whatever its type: the type
+            # check reads only the first bytes, so a PNG header can carry a
+            # key in plain text after it. Text types are read as UTF-8 so the
+            # zero-width stripping works; the rest as latin-1, one character
+            # per byte. What is compressed (most PDF text, image pixels, audio)
+            # is not plain text and is only type- and size-checked.
+            if mime.startswith('text/') or mime == 'application/json':
+                scan_secrets(data.decode('utf-8'), extra)
+            else:
+                scan_secrets(data.decode('latin-1'), extra)
+            scan_secrets(base, extra)
+            out.append(('%s.%s' % (base, FILE_TYPES[mime][0]), mime, data))
+        return out
+
+    def upload(self, channel, ts, files, comment=''):
+        """Files into a thread (or, with write.top_level, a channel), as ONE
+        message. Scope, mode, compose and rate are the reply's."""
+        top = not ts
+        if ts:
+            ts = self._parent(channel, self._ts(ts))
+        cfg = self._check(channel, ts, top)
+        checked = self.upload_checked(files)
+        self._rate(channel, top)
+        unresolved, body = [], ''
+        if comment:
+            body = compose(comment, self.resolver, cfg, self.defaults, unresolved)
+            if self.defaults.get('disclosure'):
+                body += '\n\n' + self.defaults['disclosure']
+            if len(body) > 4000:
+                raise Refused('comment over 4,000 characters')
+        done = []
+        for name, mime, data in checked:
+            r = self.web.call('files.getUploadURLExternal', {'filename': name, 'length': len(data)},
+                              write=True, form=True)
+            self.web.upload_bytes(r['upload_url'], data)
+            done.append({'id': r['file_id'], 'title': name})
+        params = {'files': json.dumps(done), 'channel_id': channel}
+        if ts:
+            params['thread_ts'] = ts
+        if body:
+            params['initial_comment'] = body
+        self.web.call('files.completeUploadExternal', params, write=True, form=True)
+        self.audit('upload_top' if top else 'upload', channel, ts, None, '%s\n%s' % (body, '; '.join(
+            '%s (%s, %d bytes, sha256 %s)' % (n, m, len(d), hashlib.sha256(d).hexdigest()[:16])
+            for n, m, d in checked)))
+        return {'files': [f['id'] for f in done], 'unresolved': unresolved}
+
     def react(self, channel, ts, emoji):
         ts = self._ts(ts)
         cfg = self.channels.get(channel)
@@ -1658,10 +1809,14 @@ class Writer:
 # Protective bounds. Constants here; read when used, so they can be tuned.
 MAX_REQUEST = 64 * 1024
 MAX_CONNECTIONS = 32
+UPLOAD_SLOTS = threading.BoundedSemaphore(2)   # requests larger than MAX_REQUEST held in memory at once
+MAX_UPLOAD_CALL = 64 * 1024 * 1024   # ceiling on _defaults.uploads.call_bytes through the socket,
+                                     # and all a socket client reads (the daemon applies the real caps)
 SERVER_TIMEOUT_S = 10    # a connected peer must send its request within this
 LOCK_WAIT_S = 10         # a write waits this long for the one write lock
 CLIENT_TIMEOUT_S = 90    # must exceed LOCK_WAIT_S plus a Slack round trip
-SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread', 'file')
+UPLOAD_FILE_TIMEOUT_S = 90   # added per file: one URL request plus the byte upload, serially
+SOCKET_COMMANDS = ('reply', 'post', 'status', 'react', 'thread', 'file', 'dm', 'upload')
 
 
 def parse_uids(spec):
@@ -1693,7 +1848,7 @@ class Ctx:
         self.write_lock = threading.Lock()
 
 
-def execute(w, cmd, rest):
+def execute(w, cmd, rest, files=None):
     """One write or read command against a Writer; shared by the CLI (plain
     mode) and the socket, so a guardrail cannot differ between them."""
     if cmd == 'reply' and len(rest) == 3:
@@ -1703,6 +1858,11 @@ def execute(w, cmd, rest):
     elif cmd == 'status' and len(rest) >= 3:
         args = rest[3:]
         r = w.status(rest[0], rest[1], rest[2], 'done' if '--done' in args else 'failed' if '--failed' in args else None)
+    elif cmd == 'upload' and len(rest) == 3:
+        r = w.upload(rest[0], rest[1], files or [], rest[2])
+        return {k: v for k, v in r.items() if v}
+    elif cmd == 'dm' and len(rest) == 2:
+        r = w.dm(*rest)
     elif cmd == 'react' and len(rest) == 3:
         w.react(*rest)
         r = {}
@@ -1905,6 +2065,29 @@ def handle_request(ctx, uid, req, conn=None):
             raise Refused('unknown command %r' % (cmd,))
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise Refused('args must be a list of strings')
+        # Only an upload's files may take a request past MAX_REQUEST. The text
+        # (a reply, an upload's comment) stays within it, because it is
+        # composed and scanned while the write lock is held.
+        if sum(len(a) for a in args) > MAX_REQUEST:
+            raise Refused('request too large')
+        files = None
+        if cmd == 'upload':
+            raw = req.get('files')
+            if not isinstance(raw, list) or not all(
+                    isinstance(f, dict) and isinstance(f.get('name'), str) and isinstance(f.get('data'), str)
+                    for f in raw):
+                raise Refused('upload needs files: [{name, data}]')
+            cap, call, max_files = upload_limits(ctx.defaults())
+            if cap <= 0:
+                raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
+            if (len(raw) > max_files or
+                    any(len(f['data']) > cap * 4 // 3 + 8 for f in raw) or
+                    sum(len(f['data']) for f in raw) > call * 4 // 3 + 8 * len(raw)):
+                raise Refused('upload is over the size limits')   # before anything is decoded
+            try:
+                files = [(f['name'], base64.b64decode(f['data'], validate=True)) for f in raw]
+            except ValueError:
+                raise Refused('upload file data is not base64')
         name = req.get('session')
         session = 'uid%d/%s' % (uid, name[:64] if isinstance(name, str) else '')
         channels = ctx.channels()
@@ -1921,12 +2104,16 @@ def handle_request(ctx, uid, req, conn=None):
                                        session=session), cmd, args), ok=True)
         w = Writer(ctx.web, ctx.store, channels, ctx.defaults(), ctx.bot, session=session)
         w.team = ctx.bot.get('team') or ''
+        if files is not None:
+            # Type, size and secret scan before the lock: scanning megabytes
+            # takes seconds, and every other session's write waits on the lock.
+            files = w.upload_checked(files)
         if not ctx.write_lock.acquire(timeout=LOCK_WAIT_S):
             raise Refused('daemon is busy with another write; try again')
         try:
             if client_gone(conn):
                 return {'ok': False, 'error': 'client went away before the write started'}
-            return dict(execute(w, cmd, args), ok=True)
+            return dict(execute(w, cmd, args, files), ok=True)
         finally:
             ctx.write_lock.release()
     except (Refused, SlackError) as e:
@@ -1942,16 +2129,34 @@ def peer_uid(conn):
     return uid
 
 
-def _read_line(conn):
-    buf = b''
-    while b'\n' not in buf:
-        chunk = conn.recv(4096)
+def request_limit(defaults):
+    """Bytes one request line may hold: the small default, or room for a whole
+    upload call (base64 is 4/3 of the bytes) when uploads are on."""
+    cap, call, _ = upload_limits(defaults)
+    if cap <= 0:
+        return MAX_REQUEST
+    return MAX_REQUEST + min(call, MAX_UPLOAD_CALL) * 4 // 3 + 4096
+
+
+def _read_line(conn, limit=MAX_REQUEST, on_big=None):
+    buf, size, big = [], 0, False
+    while True:
+        chunk = conn.recv(65536)
         if not chunk:
             break
-        buf += chunk
-        if len(buf) > MAX_REQUEST:
+        buf.append(chunk)
+        size += len(chunk)
+        if b'\n' in chunk:
+            break
+        if size > MAX_REQUEST and not big and limit > MAX_REQUEST and on_big:
+            big = True
+            on_big()
+        if size > limit:
             raise Refused('request too large')
-    return buf.split(b'\n', 1)[0]
+    line = b''.join(buf).split(b'\n', 1)[0]
+    if len(line) > limit:
+        raise Refused('request too large')
+    return line
 
 
 def serve_connection(conn, allowed, ctx):
@@ -1964,14 +2169,30 @@ def serve_connection(conn, allowed, ctx):
                       file=sys.stderr)
                 resp = {'ok': False, 'error': 'uid %d is not allowed' % uid}
             else:
+                held = []
+
+                def on_big():
+                    # Only a request past the small cap needs a slot, so a flood of
+                    # uploads cannot pin gigabytes while one writer works.
+                    if not UPLOAD_SLOTS.acquire(timeout=LOCK_WAIT_S):
+                        raise Refused('daemon is busy with other uploads; try again')
+                    held.append(1)
                 try:
-                    req = json.loads(_read_line(conn).decode())
-                    if not isinstance(req, dict):
-                        raise ValueError
-                except (ValueError, UnicodeDecodeError):
-                    resp = {'ok': False, 'error': 'bad request'}
-                else:
-                    resp = handle_request(ctx, uid, req, conn)
+                    try:
+                        line = _read_line(conn, request_limit(ctx.defaults()), on_big)
+                        req = json.loads(line.decode())
+                        if not isinstance(req, dict):
+                            raise ValueError
+                    except (ValueError, UnicodeDecodeError):
+                        resp = {'ok': False, 'error': 'bad request'}
+                    else:
+                        if len(line) > MAX_REQUEST and req.get('cmd') != 'upload':
+                            resp = {'ok': False, 'error': 'request too large'}
+                        else:
+                            resp = handle_request(ctx, uid, req, conn)
+                finally:
+                    if held:
+                        UPLOAD_SLOTS.release()
             conn.sendall(json.dumps(resp).encode() + b'\n')
         except Refused as e:
             conn.sendall(json.dumps({'ok': False, 'error': str(e)}).encode() + b'\n')
@@ -2077,16 +2298,19 @@ def serve_socket(path, allowed, ctx):
     threading.Thread(target=loop, daemon=True).start()
 
 
-def socket_call(path, cmd, args, session=None):
+def socket_call(path, cmd, args, session=None, files=None):
     """The CLI side: one request, one answer. Holds no token."""
     session = session or os.environ.get('AGENT_BOX_SESSION_ID') or os.environ.get('AGENT_BOX_SESSION', '')
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.settimeout(CLIENT_TIMEOUT_S)
+    c.settimeout(CLIENT_TIMEOUT_S + UPLOAD_FILE_TIMEOUT_S * len(files or ()))
     try:
         c.connect(path)
         sent = None
         try:
-            c.sendall(json.dumps({'cmd': cmd, 'args': args, 'session': session}).encode() + b'\n')
+            req = {'cmd': cmd, 'args': args, 'session': session}
+            if files:
+                req['files'] = [{'name': n, 'data': base64.b64encode(d).decode()} for n, d in files]
+            c.sendall(json.dumps(req).encode() + b'\n')
         except (BrokenPipeError, ConnectionResetError) as e:
             # A daemon that sheds us answers and closes before we write; the
             # answer is still readable, so read it rather than hide it.
@@ -2130,6 +2354,51 @@ def _opt(args, name, default=None, flag=False):
         del args[i:i + 2]
         return v
     return False if flag else default
+
+
+def parse_upload(rest, defaults=None, ceiling=None):
+    """`upload CHANNEL [TS] FILE... [--comment TEXT]` -> (channel, ts, files,
+    comment). Files are read here, on the caller's side, at most one byte over
+    the per-file cap so an oversized one is refused without reading all of it.
+
+    In plain mode the caps are this config's, the one the Writer enforces. In
+    socket mode the caller's config is not the daemon's (the agent user usually
+    has no channels.json at all), so it would apply the default 5 MiB whatever
+    the daemon allows. There the caller passes `ceiling` instead: a fixed bound
+    on what it reads into memory, per file and in all, and the daemon applies
+    the real limits."""
+    rest = list(rest)
+    comment = _opt(rest, '--comment', '')
+    if len(rest) < 2:
+        raise Refused('usage: upload')
+    channel, rest = rest[0], rest[1:]
+    ts = ''
+    if _TS_RE.fullmatch(rest[0]):
+        ts, rest = rest[0], rest[1:]
+    if not rest:
+        raise Refused('usage: upload')
+    if ceiling is None:
+        cap, call, _ = upload_limits(defaults)
+        what = '_defaults.uploads'
+    else:
+        cap = call = ceiling
+        what = "the socket client's ceiling"
+    if cap <= 0:
+        raise Refused('uploads are turned off (_defaults.uploads.max_bytes)')
+    files, total = [], 0
+    for path in rest:
+        try:
+            with open(path, 'rb') as f:
+                data = f.read(min(cap, call - total) + 1)
+        except OSError as e:
+            raise Refused('cannot read %s: %s' % (path, e.strerror))
+        if len(data) > cap:
+            raise Refused('%s is larger than %d bytes (%s)' % (path, cap, what))
+        total += len(data)
+        if total > call:
+            raise Refused('files total more than %d bytes (%s)' % (call, what))
+        files.append((os.path.basename(path), data))
+    return channel, ts, files, comment
 
 
 def channel_add(cid, args, web=None, path=None):
@@ -2234,6 +2503,20 @@ def _main(cmd, rest):
         me = web.call('auth.test')
         print('team %s user %s bot %s token …%s' % (me.get('team_id'), me.get('user_id'),
                                                   me.get('bot_id'), bot_token[-4:]))
+        have = set((web.scopes or '').replace(' ', '').split(',')) - {''}
+        up = upload_settings(defaults)
+        for scope, on, flag in (
+                ('files:write', int(up.get('max_bytes') or 0) > 0 and bool(up.get('types')),
+                 '`upload`; turned off with _defaults.uploads.max_bytes = 0'),
+                ('im:write', bool(defaults.get('dm_allowlist')),
+                 '`dm`; used when _defaults.dm_allowlist is not empty')):
+            if not web.scopes:
+                print('scope %s: unknown (Slack sent no X-OAuth-Scopes); enables %s' % (scope, flag))
+            elif scope in have:
+                print('scope %s: yes; enables %s' % (scope, flag))
+            else:
+                print('scope %s: MISSING%s; enables %s. Add it to the app and reinstall it.' % (
+                    scope, '' if on else ' (not needed while that command is off)', flag))
         print('app token: %s' % ('set …' + os.environ['SLACK_APP_TOKEN'][-4:]
                                  if os.environ.get('SLACK_APP_TOKEN') else 'MISSING'))
         print('channels configured: %d (config %s)' % (len(channels), config_path()))
@@ -2259,12 +2542,22 @@ def _main(cmd, rest):
     if cmd not in SOCKET_COMMANDS:
         print(USAGE, file=sys.stderr)
         return 2
+    upload = None
+    if cmd == 'upload':
+        try:
+            channel, ts, files, comment = parse_upload(rest, defaults)
+        except Refused as e:
+            if str(e) == 'usage: upload':
+                print(USAGE, file=sys.stderr)
+                return 2
+            raise
+        rest, upload = [channel, ts, comment], files
     me = web.call('auth.test')
     store = Store(os.path.join(state_dir(), 'slack.db'))
     w = Writer(web, store, channels, defaults, {'user_id': me['user_id']})
     w.team = me.get('team_id') or ''
     try:
-        out = execute(w, cmd, rest)
+        out = execute(w, cmd, rest, upload)
     except Refused as e:
         if str(e).startswith('usage: '):
             print(USAGE, file=sys.stderr)
@@ -2307,7 +2600,17 @@ def _socket_main(sock, cmd, rest):
         print(save_file(r['id'], r['ext'], base64.b64decode(r['data']),
                         load_config()[1]['files'].get('total_bytes') or 0))
         return 0
-    r = socket_call(sock, cmd, rest)
+    files = None
+    if cmd == 'upload':
+        try:
+            channel, ts, files, comment = parse_upload(rest, ceiling=MAX_UPLOAD_CALL)
+        except Refused as e:
+            if str(e) == 'usage: upload':
+                print(USAGE, file=sys.stderr)
+                return 2
+            raise
+        rest = [channel, ts, comment]
+    r = socket_call(sock, cmd, rest, files=files)
     print(json.dumps({k: v for k, v in r.items() if k != 'ok'}))
     return 0
 

@@ -3,7 +3,10 @@
 # touches the network; Socket Mode and the Web API are exercised only through
 # their pure parts (the bucket, the frame codec is covered by the daemon e2e
 # a follow-up adds).
+import base64
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -1334,6 +1337,318 @@ class TestCredentials(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             slack._socket_main('/nonexistent/s.sock', 'doctor', [])
         self.assertIn('WARNING: SLACK_BOT_TOKEN', buf.getvalue())
+
+
+class TestUploadAndDm(unittest.TestCase):
+    """upload and dm: every guard of reply, a signature check on the bytes, the
+    three-step Slack flow, and the same path through the socket."""
+    PNG = b'\x89PNG\r\n\x1a\n' + b'x' * 20
+    PDF = b'%PDF-1.4\n1 0 obj<<>>endobj\n'
+    UP = 'https://files.slack.com/upload/v1/abc'
+
+    def setUp(self):
+        self.calls, self.puts = [], []
+        outer = self
+
+        class W:
+            scopes = 'chat:write,files:write'
+
+            def call(s, method, params=None, **kw):
+                self.calls.append((method, params, kw))
+                if method == 'files.getUploadURLExternal':
+                    return {'ok': True, 'upload_url': outer.UP, 'file_id': 'F%d' % len(outer.puts)}
+                if method == 'conversations.open':
+                    return {'ok': True, 'channel': {'id': 'D1'}}
+                return {'ok': True, 'ts': '1700000009.000900', 'members': [], 'channels': []}
+
+            def upload_bytes(s, url, data):
+                self.puts.append((url, data))
+        self.store = slack.Store(':memory:')
+        self.cfg = slack._merge(slack.DEFAULT_CHANNEL, {'write': {'allowed': True, 'mode': 'always'}})
+        self.defaults = slack._merge(slack.DEFAULT_DEFAULTS, {'dm_allowlist': ['U9']})
+        self.web = W()
+        self.w = slack.Writer(self.web, self.store, {'C1': self.cfg}, self.defaults, BOT, session='s1')
+
+    def methods(self):
+        return [c[0] for c in self.calls]
+
+    def test_three_step_upload_is_one_thread_message(self):
+        r = self.w.upload('C1', TS, [('../evil/shot.exe', self.PNG), ('report.pdf', self.PDF)], 'proof for #1')
+        self.assertEqual(self.methods(), ['files.getUploadURLExternal'] * 2 + ['files.completeUploadExternal'])
+        self.assertEqual([p[1] for p in self.puts], [self.PNG, self.PDF])
+        self.assertEqual([c[1]['filename'] for c in self.calls[:2]], ['shot.png', 'report.pdf'])
+        self.assertTrue(all(c[2].get('form') for c in self.calls))
+        done = self.calls[-1][1]
+        self.assertEqual((done['channel_id'], done['thread_ts']), ('C1', TS))
+        self.assertEqual([f['id'] for f in json.loads(done['files'])], r['files'])
+        self.assertEqual(done['initial_comment'], 'proof for #1')
+        row = self.store.q('SELECT kind, text FROM audit')[0]
+        self.assertEqual(row['kind'], 'upload')
+        self.assertIn('sha256', row['text'])
+
+    def test_comment_goes_through_compose(self):
+        for bad in ('see https://evil.example/x', 'ping @channel', 'key xoxb-1234567890-abcdefghij'):
+            with self.assertRaises(slack.Refused):
+                self.w.upload('C1', TS, [('a.png', self.PNG)], bad)
+        self.assertEqual(self.calls, [])
+
+    def test_scope_mode_and_thread_refusals(self):
+        with self.assertRaises(slack.Refused):                      # unconfigured channel
+            self.w.upload('C9', TS, [('a.png', self.PNG)])
+        with self.assertRaises(slack.Refused):                      # no ts: top_level needed
+            self.w.upload('C1', '', [('a.png', self.PNG)])
+        with self.assertRaises(slack.Refused):                      # bad ts
+            self.w.upload('C1', 'x', [('a.png', self.PNG)])
+        self.cfg['write']['mode'] = 'on_request'
+        with self.assertRaises(slack.Refused):                      # nobody asked
+            self.w.upload('C1', TS, [('a.png', self.PNG)])
+        self.cfg['write']['allowed'] = False
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', TS, [('a.png', self.PNG)])
+        self.assertEqual(self.calls, [])
+        self.cfg['write'].update(allowed=True, mode='always', top_level=True)
+        self.w.upload('C1', '', [('a.png', self.PNG)])
+        self.assertNotIn('thread_ts', self.calls[-1][1])
+
+    def test_type_is_checked_by_signature_not_name(self):
+        for name, data in (('a.png', b'<svg onload=1>'), ('a.txt', b'hello'), ('a.png', b'')):
+            with self.assertRaises(slack.Refused):
+                self.w.upload('C1', TS, [(name, data)])
+        self.assertEqual(self.calls, [])
+        self.w.upload('C1', TS, [('really-a-png.pdf', self.PNG)])   # the bytes decide, and the name follows
+        self.assertEqual(self.calls[0][1]['filename'], 'really-a-png.png')
+        self.calls.clear()
+        self.defaults['uploads'] = {'types': ['image/png']}
+        with self.assertRaises(slack.Refused):                      # pdf no longer allowed
+            self.w.upload('C1', TS, [('a.pdf', self.PDF)])
+        self.assertEqual(self.calls, [])
+
+    def test_size_count_and_off_switch(self):
+        self.defaults['uploads'] = {'max_bytes': 40, 'call_bytes': 60, 'max_files': 2}
+        with self.assertRaises(slack.Refused):                      # one file too big
+            self.w.upload('C1', TS, [('a.png', self.PNG + b'x' * 20)])
+        big = self.PNG + b'x' * 5                                   # 33 bytes: two fit max_files, not call_bytes
+        with self.assertRaisesRegex(slack.Refused, 'total'):        # call too big
+            self.w.upload('C1', TS, [('a.png', big), ('b.png', big)])
+        with self.assertRaises(slack.Refused):                      # too many files
+            self.w.upload('C1', TS, [('a.png', self.PNG)] * 3)
+        self.defaults['uploads'] = {'max_bytes': 0}
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', TS, [('a.png', self.PNG)])
+        self.assertEqual(self.calls, [])
+
+    def test_secret_in_pdf_text_layer_or_file_name_is_refused(self):
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', TS, [('a.pdf', self.PDF + b'(token ghp_' + b'a' * 36 + b')')])
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', TS, [('ghp_' + 'a' * 36 + '.png', self.PNG)])
+        self.defaults['uploads'] = {'types': ['text/plain']}
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', TS, [('n.txt', b'AKIA' + b'A' * 16)])
+        self.assertEqual(self.calls, [])
+
+    def test_every_file_is_scanned_not_only_pdf_and_text(self):
+        # The type check reads only the first bytes, so what follows a PNG or
+        # JPEG header is scanned like a PDF's raw bytes.
+        self.defaults['uploads'] = {'types': ['image/png', 'image/jpeg', 'application/pdf', 'audio/ogg']}
+        tail = b'\n-----BEGIN OPENSSH PRIVATE KEY-----\nGH_TOKEN=ghp_' + b'a' * 36 + b'\n'
+        for magic in (b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'%PDF-1.4\n', b'OggS'):
+            with self.assertRaisesRegex(slack.Refused, 'secret pattern'):
+                self.w.upload('C1', TS, [('a.bin', magic + b'\x00\xff' * 50 + tail)])
+        self.assertEqual(self.calls, [])
+
+    def test_secret_scan_is_linear_on_crafted_runs(self):
+        # Unanchored, `sk-` and `eyJ` were retried from every offset of a run:
+        # 64 KiB took 11 s. 1 MiB of each must now take well under a second.
+        import time
+        for unit in ('sk-', 'eyJ'):
+            start = time.time()
+            slack.scan_secrets(unit * (1024 * 1024 // 3))
+            self.assertLess(time.time() - start, 5, unit)
+        for real in ('OPENAI_API_KEY=sk-proj-' + 'a1' * 20, '"sk-' + 'Ab3' * 12 + '"',
+                     'Bearer eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.abcdefghijkl'):
+            with self.assertRaises(slack.Refused):
+                slack.scan_secrets(real)
+        slack.scan_secrets('see branch fix/task-123-make-the-upload-work-for-everyone')  # `task-` is not `sk-`
+
+    def test_files_are_checked_before_the_write_lock(self):
+        # The scan can take seconds; it must not hold up other sessions' writes.
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        bad = base64.b64encode(self.PNG + b'ghp_' + b'a' * 36).decode()
+        good = base64.b64encode(self.PNG).decode()
+        wait, slack.LOCK_WAIT_S = slack.LOCK_WAIT_S, 0.1
+        self.addCleanup(setattr, slack, 'LOCK_WAIT_S', wait)
+        with ctx.write_lock:                                        # another session is writing
+            r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                              'files': [{'name': 'a.png', 'data': bad}]})
+            self.assertIn('secret pattern', r['error'])             # refused without waiting
+            r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                              'files': [{'name': 'a.png', 'data': good}]})
+            self.assertIn('busy', r['error'])                       # a clean one then waits its turn
+        r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                          'files': [{'name': 'a.png', 'data': good}]})
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(len(self.puts), 1)
+
+    def test_only_upload_files_may_pass_the_small_request_cap(self):
+        import socket as sk
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        long = 'x' * (slack.MAX_REQUEST + 10)
+        for req in ({'cmd': 'reply', 'args': ['C1', TS, long]},
+                    {'cmd': 'post', 'args': ['C1', 'hi'], 'pad': long}):
+            a, b = sk.socketpair()
+            b.sendall(json.dumps(req).encode() + b'\n')
+            slack.serve_connection(a, {os.getuid()}, ctx)
+            self.assertIn('request too large', json.loads(b.recv(65536).decode())['error'])
+            b.close()
+        r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, long],   # a huge comment
+                                          'files': [{'name': 'a.png', 'data': base64.b64encode(self.PNG).decode()}]})
+        self.assertIn('request too large', r['error'])
+        self.assertEqual(self.calls, [])
+
+    def test_call_bytes_zero_or_null_means_max_bytes_everywhere(self):
+        for cb in (0, None):
+            d = slack._merge(slack.DEFAULT_DEFAULTS, {'uploads': {'max_bytes': 1000, 'call_bytes': cb}})
+            self.assertEqual(slack.upload_limits(d), (1000, 1000, 10))
+            self.assertEqual(slack.request_limit(d), slack.MAX_REQUEST + 1000 * 4 // 3 + 4096)
+        d = slack._merge(slack.DEFAULT_DEFAULTS, {'uploads': {'max_bytes': 0}})
+        self.assertEqual(slack.request_limit(d), slack.MAX_REQUEST)
+
+    def test_socket_client_uses_a_ceiling_not_its_own_config(self):
+        # The caller's channels.json is not the daemon's (the agent user usually
+        # has none), so in socket mode the daemon's limits decide.
+        d = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        f = os.path.join(d, 'proof.png')
+        data = self.PNG + b'z' * 500
+        with open(f, 'wb') as h:
+            h.write(data)
+        client = {'uploads': {'max_bytes': 10}}                     # would refuse a 528-byte file
+        with self.assertRaises(slack.Refused):
+            slack.parse_upload(['C1', TS, f], client)
+        self.assertEqual(slack.parse_upload(['C1', TS, f], client, ceiling=1000)[2], [('proof.png', data)])
+        with self.assertRaisesRegex(slack.Refused, 'larger'):       # over the ceiling: one file
+            slack.parse_upload(['C1', TS, f], ceiling=len(data) - 1)
+        with self.assertRaisesRegex(slack.Refused, 'total'):        # or in all
+            slack.parse_upload(['C1', TS, f, f], ceiling=len(data) + 100)
+        self.defaults['uploads'] = {'max_bytes': 1000}              # the daemon allows it
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        path = os.path.join(d, 's.sock')
+        slack.serve_socket(path, {os.getuid()}, ctx)
+        old = os.environ.get('LOCAL_SLACK_CONFIG')
+        cfg = os.path.join(d, 'client.json')
+        with open(cfg, 'w') as h:
+            json.dump({'_defaults': client}, h)
+        os.environ['LOCAL_SLACK_CONFIG'] = cfg
+        self.addCleanup(lambda: os.environ.pop('LOCAL_SLACK_CONFIG') if old is None
+                        else os.environ.__setitem__('LOCAL_SLACK_CONFIG', old))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(slack._socket_main(path, 'upload', ['C1', TS, f]), 0)
+        self.assertEqual(self.puts[-1][1], data)
+        self.defaults['uploads'] = {'max_bytes': 100}               # and its refusal is the daemon's
+        with self.assertRaises(slack.Refused):
+            slack._socket_main(path, 'upload', ['C1', TS, f])
+
+    def test_upload_counts_against_the_session_rate(self):
+        self.defaults['limits'] = {'session_writes': 1, 'session_window_s': 600, 'top_level_per_hour': 0}
+        self.w.upload('C1', TS, [('a.png', self.PNG)])
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', TS, [('a.png', self.PNG)])
+
+    def test_dm_only_to_the_allowlist(self):
+        self.defaults['disclosure'] = 'AI-generated'
+        self.w.dm('U9', 'done, see the thread')
+        self.assertEqual(self.methods(), ['conversations.open', 'chat.postMessage'])
+        self.assertEqual(self.calls[0][1], {'users': 'U9'})
+        p = self.calls[1][1]
+        self.assertEqual((p['channel'], p['unfurl_links']), ('D1', False))
+        self.assertTrue(p['text'].endswith('AI-generated'))
+        n = len(self.calls)
+        for bad in ('U8', '', 'D1', None):
+            with self.assertRaises(slack.Refused):
+                self.w.dm(bad, 'hi')
+        for bad in ('see https://evil.example/x', 'hey @here'):
+            with self.assertRaises(slack.Refused):
+                self.w.dm('U9', bad)
+        self.assertEqual(len(self.calls), n)
+        self.assertEqual(self.store.q('SELECT kind FROM audit')[0]['kind'], 'dm')
+
+    def test_upload_host_is_checked_in_the_real_client(self):
+        web = slack.Web('xoxb-test')
+        for url in ('http://files.slack.com/x', 'https://evil.example/x', 'https://files.slack.com:8443/x', ''):
+            with self.assertRaises(slack.SlackError):
+                web.upload_bytes(url, b'x')
+
+    def test_socket_serves_both_and_the_cli_reads_the_files(self):
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        d = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, 's.sock')
+        slack.serve_socket(path, {os.getuid()}, ctx)
+        big = self.PNG + b'y' * (200 * 1024)                       # well past MAX_REQUEST
+        r = slack.socket_call(path, 'upload', ['C1', TS, 'hi'], files=[('a.png', big)])
+        self.assertEqual(len(r['files']), 1)
+        self.assertEqual(self.puts[-1][1], big)
+        self.assertEqual(slack.socket_call(path, 'dm', ['U9', 'hi'])['ts'], '1700000009.000900')
+        with self.assertRaises(slack.Refused):                      # same guards as plain mode
+            slack.socket_call(path, 'dm', ['U8', 'hi'])
+        with self.assertRaises(slack.Refused):
+            slack.socket_call(path, 'upload', ['C1', TS, ''], files=[('a.png', b'not an image')])
+        with self.assertRaises(slack.Refused):
+            slack.socket_call(path, 'upload', ['C9', TS, ''], files=[('a.png', self.PNG)])
+        self.assertFalse(slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, '']})['ok'])
+        self.assertFalse(slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                                       'files': [{'name': 'a', 'data': '!!'}]})['ok'])
+        self.defaults['uploads'] = {'max_bytes': 0}                 # off: only the small cap applies
+        with self.assertRaises(slack.Refused):
+            slack.socket_call(path, 'upload', ['C1', TS, ''], files=[('a.png', big)])
+
+    def test_top_level_uploads_share_the_hourly_cap(self):
+        self.cfg['write'].update(top_level=True)
+        self.defaults['limits'] = {'session_writes': 0, 'session_window_s': 600, 'top_level_per_hour': 2}
+        self.w.upload('C1', '', [('a.png', self.PNG)])
+        self.w.post('C1', 'hi')
+        with self.assertRaises(slack.Refused):
+            self.w.upload('C1', '', [('a.png', self.PNG)])
+        with self.assertRaises(slack.Refused):
+            self.w.post('C1', 'hi')
+        self.w.upload('C1', TS, [('a.png', self.PNG)])              # a thread upload is not top-level
+
+    def test_oversized_encoded_upload_is_refused_before_decoding(self):
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        self.defaults['uploads'] = {'max_bytes': 100}
+        r = slack.handle_request(ctx, 1, {'cmd': 'upload', 'args': ['C1', TS, ''],
+                                          'files': [{'name': 'a.png', 'data': 'A' * 1000}]})
+        self.assertIn('size limits', r['error'])
+
+    def test_upload_slot_is_released_after_a_bad_big_request(self):
+        import socket as sk
+        ctx = slack.Ctx(self.web, self.store, lambda: {'C1': self.cfg}, lambda: self.defaults, dict(BOT, team='T1'))
+        a, b = sk.socketpair()
+        b.sendall(b'{"x":"' + b'y' * (slack.MAX_REQUEST + 10) + b'"}\n')
+        slack.serve_connection(a, {os.getuid()}, ctx)
+        for _ in range(2):                                          # both slots still free
+            self.assertTrue(slack.UPLOAD_SLOTS.acquire(blocking=False))
+        slack.UPLOAD_SLOTS.release()
+        slack.UPLOAD_SLOTS.release()
+        b.close()
+
+    def test_parse_upload(self):
+        d = tempfile.mkdtemp(dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        f = os.path.join(d, 'a.png')
+        with open(f, 'wb') as h:
+            h.write(self.PNG)
+        self.assertEqual(slack.parse_upload(['C1', TS, f, '--comment', 'x'], self.defaults),
+                         ('C1', TS, [('a.png', self.PNG)], 'x'))
+        self.assertEqual(slack.parse_upload(['C1', f], self.defaults)[1], '')
+        self.defaults['uploads'] = {'max_bytes': 10}                 # a cut-off read is a refusal, not a short file
+        with self.assertRaises(slack.Refused):
+            slack.parse_upload(['C1', f], self.defaults)
+        for bad in (['C1'], ['C1', TS], ['C1', os.path.join(d, 'none')]):
+            with self.assertRaises(slack.Refused):
+                slack.parse_upload(bad, self.defaults)
 
 
 class TestFiles(unittest.TestCase):
