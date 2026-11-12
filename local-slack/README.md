@@ -265,7 +265,8 @@ and a SHA-256 prefix.
 `_defaults.dm_allowlist` (exact string match; a user not listed is refused). It
 sends only and nothing reads a DM, so the text should point back to the thread.
 Needs `im:write`. `doctor` (plain mode, with the token) shows whether the token has
-`files:write` and `im:write` and which setting each one enables. In socket mode
+`files:write` and `im:write`, whether `upload` and `dm` are on, and which setting
+switches each one. In socket mode
 `doctor` only checks that the socket is reachable, so run it as the daemon's
 user with `LOCAL_SLACK_SOCKET` unset to see the scopes.
 A socket client waits 90 s plus 90 s per file for the answer; if it still times
