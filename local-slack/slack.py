@@ -87,15 +87,17 @@ SECRET_PATTERNS = [
     re.compile(r'gh[pousr]_[A-Za-z0-9]{30}'),
     re.compile(r'github_pat_[A-Za-z0-9_]{40}'),
     re.compile(r'AKIA[0-9A-Z]{16}'),
-    # Needs a digit in the 32 characters after `sk-`: a kebab-case branch name
-    # is not a key. A letter, digit or `_` before `sk-` means a longer word
+    # Needs a digit in the first 256 characters after `sk-`: a kebab-case
+    # branch name is not a key. A real key has a digit that early with near
+    # certainty. A letter, digit or `_` before `sk-` means a longer word
     # (`task-…`), not a key; a `-` before it does not (`prod-sk-…` is a key).
-    re.compile(r'(?<![A-Za-z0-9_])sk-(?=[A-Za-z0-9_-]{0,31}\d)[A-Za-z0-9_-]{32}'),
+    re.compile(r'(?<![A-Za-z0-9_])sk-(?=[A-Za-z0-9_-]{0,255}\d)[A-Za-z0-9_-]{32}'),
     re.compile(r'-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----'),
     # The lookbehind makes each match start at the beginning of a run of token
     # characters, and a segment never reads past its run, so the total work
-    # stays linear. A JWT segment longer than 8192 characters is not matched.
-    re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,8192}\.eyJ[A-Za-z0-9_-]{10,8192}\.[A-Za-z0-9_-]{10}'),
+    # stays linear even with a large cap. A JWT segment longer than 256 KiB is
+    # not matched; no real token is that large.
+    re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,262144}\.eyJ[A-Za-z0-9_-]{10,262144}\.[A-Za-z0-9_-]{10}'),
 ]
 
 
