@@ -49,8 +49,8 @@ the socket lives and who may reach it are the deployment's choice.
   `slack.py` (`MAX_REQUEST`, `MAX_CONNECTIONS`, `SERVER_TIMEOUT_S`,
   `LOCK_WAIT_S`, `CLIENT_TIMEOUT_S`). Only an `upload`'s files may take a
   request past 64 KiB, up to the daemon's `call_bytes` as base64 and never
-  past `MAX_UPLOAD_CALL` (64 MiB); at most two such requests are held at once
-  (`UPLOAD_SLOTS`). A listed uid can hold all connection slots for up to 10 s
+  past `MAX_UPLOAD_CALL` (64 MiB); two slots (`UPLOAD_SLOTS`) bound how many
+  large requests are held in memory at once. A listed uid can hold all connection slots for up to 10 s
   each: availability only, from a uid already trusted to write.
 - Audit: the `session` column is `uid<N>/<session name>`: the uid is verified,
   the name (from `AGENT_BOX_SESSION_ID`) is the caller's own claim. The
@@ -246,7 +246,7 @@ token; in plain mode the agent holds it and can bypass every guard (see the
 top of this page). The type comes from the bytes, never the name, and only
 `_defaults.uploads.types` (PDF, PNG and JPEG by default; any type in the `file`
 table can be added) pass; at most `max_bytes` per file (5 MiB), `call_bytes`
-per call (15 MiB; 0 or unset means `max_bytes`) and `max_files` (10);
+per call (15 MiB; 0 or null means `max_bytes`) and `max_files` (10);
 `max_bytes: 0` turns uploads off. In socket mode these are the daemon's
 settings: the CLI reads up to `MAX_UPLOAD_CALL` (64 MiB) and leaves the limits
 to the daemon. The sent name is sanitised and its extension comes from the
