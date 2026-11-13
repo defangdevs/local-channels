@@ -103,6 +103,9 @@ bump usually needs a companion PR in that repo. Mention it in the PR body.
 - PR title mirrors the commit subject; PR body restates the rationale, the
   contracts deliberately left unchanged, and a `## Verification` section with
   what was actually run. Reference the issue it closes.
+- After addressing all comments on a CodeRabbit PR review, resolve the
+  addressed threads and dismiss its review verdict. A comment-only review has
+  no verdict to dismiss.
 - There is no human PR reviewer. Open the PR, wait for CI, and squash-merge it
   yourself once green (squash is why the subject on `main` ends in `(#4)`) —
   which is exactly why every behaviour change must land with test coverage in
