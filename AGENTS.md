@@ -15,6 +15,12 @@ local-webhook/
                                   IPC fan-out, filter/TTL/dispatch logic, CLI — one file
   README.md                       per-plugin reference docs
 tests/test_webhook.py             stdlib-unittest suite: unit + subprocess e2e
+local-router/
+  router.py                       NOT a plugin: library + CLI that decides which session an
+                                  inbound message belongs to; single file, stdlib only, VERSION
+                                  constant is its version (tags local-router-vX.Y.Z)
+  pyproject.toml                  only so `pip install git+...#subdirectory=local-router` works
+tests/test_router.py              router decisions, prompt bounds and CLI with fake backends
 ```
 
 There is no build system, no lockfile and no generated file. A new plugin is a

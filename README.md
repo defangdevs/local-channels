@@ -22,6 +22,7 @@ one implementation for both harnesses. See
 | [`local-webhook`](local-webhook/) | 0.38.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, a per-watch `spawnWindowS` coalescing window (#93) and note limits that refuse rather than cut (#95), an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a per-source `verification` mode (`hmac-hex` \| `token` \| `standard-webhooks`, #30) so GitLab and other Standard-Webhooks senders can deliver too, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run, and the sender's `identifier` in the spawn meta of any other source, and a durable on-disk inbox (#60) so an accepted delivery survives a session that is down, a receiver restart or a spawn command at capacity |
 | [`local-whatsapp`](local-whatsapp/) | 0.6.1 | Personal WhatsApp linked-device bridge with /clear for in-process Codex context resets and a configurable prefix (empty for plain Message Yourself text), incoming images and documents. Pairing failures include safe stage, category, status, and attempt ID diagnostics. One selected recipient at a time, automatic profile-based session creation and cold-session activation, Claude channel delivery, Codex queue delivery, and a reply tool/CLI. |
 | [`local-slack`](local-slack/) | 0.2.1 | Slack threads from channels the bot was invited to, as events on the local-webhook bus (source `slack`): `message.posted`, `thread.settled` after a quiet period, reactions as controls (`ready`/`hold`/`drop`), plus a guarded `slack.py` CLI for `reply`, `post`, `status`, `react`, `upload` (files as one message) and `dm` (allowlisted people), in plain or socket-service mode. |
+| [`local-router`](local-router/) | 0.1.0 | Not a channel: a library and CLI that sits behind the channels. For each inbound message it decides whether to continue an existing session, start a new one, or start one that links older sessions, using a small LLM through whichever harness is signed in (`claude -p`, `codex exec`) or an HTTP API. Single file, stdlib only. |
 
 ## Version tags
 
@@ -33,8 +34,9 @@ The early 0.5.x manifests were stale; those tags follow the versions explicitly
 named in their release commit subjects.
 Tags are immutable and CI publishes missing tags after both Python test jobs
 and both Node test jobs pass on `main`. Documentation-only commits do not move
-an existing tag. `local-whatsapp` uses `local-whatsapp-vX.Y.Z` tags so its
-independent version sequence cannot collide with `local-webhook` tags.
+an existing tag. `local-whatsapp` uses `local-whatsapp-vX.Y.Z` tags and `local-router` uses
+`local-router-vX.Y.Z` tags, so their independent version sequences cannot
+collide with `local-webhook` tags.
 
 Use GitHub's [compare view](https://github.com/defangdevs/local-channels/compare/v0.27.1...v0.28.0)
 to see commits and changes between versions. Consumers can continue pinning
