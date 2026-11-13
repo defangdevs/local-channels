@@ -718,6 +718,17 @@ concurrent sessions acting as different GitHub users can then subscribe to the
 same repo with different ignore lists — each mutes only its own echoes, while
 fan-out delivers the event to both.
 
+### Orphaned filter locks (0.37.3)
+
+Each filter file has a sibling `filter.<key>.json.lock` for the cross-process
+`flock`. The lock is never unlinked while in use, and routing takes it even for
+a session that never subscribed, so a consumer that mints a session key per
+event batch would leave one per key forever. When the receiver starts it reaps
+the locks whose `filter.<key>.json` does not exist: it takes each with a
+non-blocking `flock` (a held lock is in use and is skipped) and unlinks it
+while holding it. `filter.dispatch.json.lock` is only reaped if the dispatch
+file itself is missing.
+
 ## Following a PR through its merge (0.37.0)
 
 A session entry with an explicit positive `pull_request.number` include leaf

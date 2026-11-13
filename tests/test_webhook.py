@@ -4615,6 +4615,41 @@ class TestSpoolEndToEnd(EndToEndCase):
             self.assertRegex(n, r'^[0-9a-f]{40}$')
 
 
+class TestReapOrphanFilterLocks(StateDirCase):
+    def touch(self, name):
+        path = os.path.join(self.state, name)
+        open(path, 'w').close()
+        return path
+
+    def test_reaps_only_locks_without_a_filter(self):
+        orphan = self.touch('filter.hook-gone.json.lock')
+        kept_json = self.touch('filter.live.json')
+        kept_lock = self.touch('filter.live.json.lock')
+        other = self.touch('sources.json.lock')
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertTrue(os.path.exists(kept_json))
+        self.assertTrue(os.path.exists(kept_lock))
+        self.assertTrue(os.path.exists(other))
+
+    def test_skips_a_lock_somebody_holds(self):
+        import fcntl
+        held = self.touch('filter.hook-busy.json.lock')
+        fd = os.open(held, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 0)
+        self.assertTrue(os.path.exists(held))
+
+    def test_a_reaped_key_can_lock_again(self):
+        path = os.path.join(self.state, 'filter.hook-x.json')
+        with self.mod.filter_file_lock(path):
+            pass
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        with self.mod.filter_file_lock(path):
+            self.assertTrue(os.path.exists(path + '.lock'))
+
+
 class TestVersionConsistency(unittest.TestCase):
     """The release invariants AGENTS.md states, enforced."""
 
