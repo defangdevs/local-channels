@@ -340,14 +340,16 @@ class ClaudeCLI(object):
 
 
 class CodexCLI(object):
-    """`codex exec` with its shell tool turned off, in an empty read-only sandbox.
+    """`codex exec` with its tools turned off, in an empty read-only sandbox.
 
     The read-only sandbox blocks writes, not reads, so an injected message could
     otherwise ask the agent to read local files (auth.json, keys) during a
-    routing call. Two layers stop that: features.shell_tool=false removes the
-    tool, and any run whose event stream shows a tool item (a command, a file
-    change, an MCP or web call) is rejected, so its answer never reaches the
-    caller and route() falls back.
+    routing call. Two layers stop that: NO_TOOLS turns off every tool family
+    that can read host data (including the user's MCP servers), and any run whose
+    event stream shows a tool item or a blocked tool attempt is rejected, so its
+    answer never reaches the caller and route() falls back. Codex adds tool
+    families over time: re-check NO_TOOLS when the CLI is upgraded, and run the
+    process as an unprivileged user without secrets when that matters.
 
     codex_home: optional CODEX_HOME with only auth.json in it (a symlink is
     fine). The default home adds the user's global AGENTS.md to every call (31k
@@ -355,6 +357,17 @@ class CodexCLI(object):
     the caller's choice."""
     name = "codex"
     ALLOWED_ITEMS = ("agent_message", "reasoning")
+    # Every tool family codex-cli 0.165.0 exposes that can read host data.
+    # --ignore-user-config drops MCP servers and plugins from the user's
+    # config.toml; with code_mode_host off, code mode fails closed (verified
+    # with a canary file outside the working directory). Tools left over
+    # (apply_patch, view_image) are blocked by the read-only sandbox or limited to
+    # images, and any tool item still makes complete() reject the answer.
+    NO_TOOLS = ("--ignore-user-config",
+                "-c", "features.shell_tool=false", "-c", "features.unified_exec=false",
+                "-c", "features.code_mode_host=false", "-c", "features.apps=false",
+                "-c", "features.browser_use=false", "-c", "features.computer_use=false",
+                "-c", "web_search=disabled")
 
     def __init__(self, model="gpt-6-luna", effort="low", codex_home=None, timeout=180, binary="codex"):
         self.model, self.effort, self.home = model, effort, codex_home
@@ -371,19 +384,25 @@ class CodexCLI(object):
             cwd = os.path.join(d, "cwd"); os.mkdir(cwd)
             p = subprocess.run([self.binary, "exec", "-m", self.model, "-c", "model_reasoning_effort=" + self.effort,
                                 "-c", "model_instructions_file=" + sysfile,
-                                "-c", "features.shell_tool=false", "-c", "features.unified_exec=false",
-                                "--ephemeral", "-s", "read-only",
+                                *self.NO_TOOLS, "--ephemeral", "-s", "read-only",
                                 "--skip-git-repo-check", "-C", cwd, "--json", "-"],
                                input=prompt, capture_output=True, text=True, timeout=self.timeout,
                                cwd=cwd, env=env)
-        text = None
+        text, in_turn = None, False
         for line in p.stdout.splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if ev.get("type") == "turn.started":
+                in_turn = True
             item = ev.get("item") or {}
             kind = item.get("type")
+            # Before the turn starts, codex reports disabled features as "error"
+            # items (code_mode_host=false always says so). Inside the turn, an
+            # error is a blocked tool attempt and is treated like a tool call.
+            if kind == "error" and not in_turn:
+                continue
             if kind and kind not in self.ALLOWED_ITEMS:
                 raise RuntimeError("codex used a tool (%s) during a routing call; answer rejected" % kind)
             if ev.get("type") == "item.completed" and kind == "agent_message":

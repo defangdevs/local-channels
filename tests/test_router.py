@@ -203,7 +203,19 @@ class ReviewFixes(unittest.TestCase):
             b.complete("s", "p")
         finally:
             router.subprocess.run = orig
-        self.assertIn("features.shell_tool=false", seen[0])
+        for flag in ("--ignore-user-config", "features.shell_tool=false", "features.code_mode_host=false",
+                     "features.unified_exec=false", "web_search=disabled"):
+            self.assertIn(flag, seen[0])
+
+    def test_codex_blocked_tool_attempt_is_rejected(self):
+        err = {"type": "item.completed", "item": {"type": "error", "message": "Code Mode is unavailable"}}
+        answer = {"type": "item.completed", "item": {"type": "agent_message", "text": '{"action": "NEW"}'}}
+        turn = {"type": "turn.started"}
+        # a startup notice before the turn is fine
+        self.assertIn("NEW", router.CodexCLI(binary=self.fake_codex([err, turn, answer])).complete("s", "p"))
+        # an error inside the turn is a blocked tool attempt
+        with self.assertRaisesRegex(RuntimeError, "used a tool"):
+            router.CodexCLI(binary=self.fake_codex([turn, err, answer])).complete("s", "p")
 
 
 class Backends(unittest.TestCase):

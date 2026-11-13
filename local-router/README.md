@@ -127,7 +127,12 @@ one of three actions plus letters that map to known sessions. Anything else
 becomes a fallback.
 
 The routing call gets no tools. `claude -p` runs with `--tools ""`. `codex exec`
-runs with its shell tool turned off (`features.shell_tool=false`), because its
-read-only sandbox blocks writes but not reads. Any Codex run that still shows a
-tool item (a command, a file change, an MCP or web call) is rejected, so its
-answer never reaches the caller.
+runs with `--ignore-user-config` (no MCP servers or plugins from the user's
+config) and with its shell, unified-exec, code-mode, apps, browser, computer-use
+and web-search tools turned off, because its read-only sandbox blocks writes but
+not reads. With these flags, a prompt-injected request to read a file outside the
+working directory failed closed on codex-cli 0.165.0. Any Codex run that still
+shows a tool item, or a blocked tool attempt, is rejected, so its answer never
+reaches the caller. Codex adds tool families over time: re-check the flags when
+the CLI is upgraded. Where inbound text is hostile, run the router as a user that
+holds no secrets beyond the harness login.
