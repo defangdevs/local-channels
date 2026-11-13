@@ -2024,6 +2024,12 @@ SPOOL_DIR = os.path.join(STATE_DIR, 'spool')
 # ambush the codex peer's idle exit exists to avoid.
 SPOOL_PEER_MAX_S = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_PEER_MAX_S', default=8 * 3600))
 SPOOL_PEER_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_PEER_MAX', default=500))
+# Total bytes the inbox, the dispatch queue and every session box may hold
+# (hard links counted once). Past it the reaper drops the OLDEST waiting
+# dispatch records, out loud, and `status` counts them (issue #105). 0 turns
+# the bound off.
+SPOOL_MAX_BYTES = max(0, _int_env('LOCAL_WEBHOOK_SPOOL_MAX_BYTES', default=256 * 1024 * 1024))
+SPOOL_OVERFLOW_DROPPED = 0
 # How long a delivery id is remembered once it is fully handed off: GitHub
 # keeps its delivery log about three days, which is as far back as a
 # `backfill` sweep can re-request anything.
@@ -2553,6 +2559,11 @@ def retry_merge_ci(env, enqueue, live=False):
 # must therefore name retained content, not one consumer's temporary filename.
 CONTENT = SpoolQueue(os.path.join(SPOOL_DIR, 'content'))
 CONTENT_TTL_S = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_TTL_S', default=86400))
+# The largest request body the ingress reads. Checked against Content-Length
+# (or the running chunked total) BEFORE the signature, so an unauthenticated
+# client cannot make the receiver buffer more. 25 MiB is GitHub's own payload
+# ceiling; 0 turns the bound off.
+MAX_BODY_BYTES = max(0, _int_env('LOCAL_WEBHOOK_MAX_BODY_BYTES', default=25 * 1024 * 1024))
 CONTENT_MAX_BYTES = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX_BYTES', default=134217728))
 CONTENT_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX', default=2000))
 CONTENT_LOCK = threading.RLock()
@@ -2945,6 +2956,55 @@ def _drop_logged(q, rows, why, label):
     return n
 
 
+def spool_bytes():
+    """Bytes held by the inbox, the dispatch queue and the session boxes. A
+    session box links the inbox record, so each inode counts once."""
+    seen, total = set(), 0
+    for top in (SPOOL_INBOX.root, SPOOL_DISPATCH.root, SPOOL_PEERS):
+        for dirpath, _dirs, files in os.walk(top):
+            for f in files:
+                try:
+                    st = os.lstat(os.path.join(dirpath, f))
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) not in seen:
+                    seen.add((st.st_dev, st.st_ino))
+                    total += st.st_size
+    return total
+
+
+def spool_enforce_cap():
+    """Drop the oldest WAITING dispatch records until the spool fits
+    SPOOL_MAX_BYTES. Leased (running) records are never touched."""
+    global SPOOL_OVERFLOW_DROPPED
+    if not SPOOL_MAX_BYTES:
+        return 0
+    total = spool_bytes()
+    if total <= SPOOL_MAX_BYTES:
+        return 0
+    dropped = 0
+    for name, _mtime, where, _pid in SPOOL_DISPATCH.aged():
+        if total <= SPOOL_MAX_BYTES:
+            break
+        if where != 'new':
+            continue
+        try:
+            size = os.lstat(spool_path(SPOOL_DISPATCH.new, name)).st_size
+        except OSError:
+            continue
+        if SPOOL_DISPATCH.drop(name):
+            dropped += 1
+            total -= size
+    SPOOL_OVERFLOW_DROPPED += dropped
+    if dropped:
+        print('local-webhook: discarded %d waiting dispatch record(s) — the spool passed '
+              'LOCAL_WEBHOOK_SPOOL_MAX_BYTES=%d' % (dropped, SPOOL_MAX_BYTES), file=sys.stderr)
+    if total > SPOOL_MAX_BYTES:
+        print('local-webhook: spool is %d bytes, over LOCAL_WEBHOOK_SPOOL_MAX_BYTES=%d, and no '
+              'waiting dispatch record is left to drop' % (total, SPOOL_MAX_BYTES), file=sys.stderr)
+    return dropped
+
+
 def spool_reap(now_s=None):
     """One pass of expiry. Every discard is said out loud."""
     now_s = time.time() if now_s is None else now_s
@@ -2977,6 +3037,7 @@ def spool_reap(now_s=None):
         resume_inbox(phase, sid, enqueue=True, now_s=now_s)
     for q in (SPOOL_INBOX, SPOOL_DISPATCH):
         q.reap_tmp(now_s)
+    spool_enforce_cap()
     if DISPATCHER is None:
         # Records a receiver WITH a spawn command left behind, read by one
         # without: nothing here will ever run them, so they age out on the
@@ -3069,7 +3130,9 @@ def spool_status(now_s=None):
     out = {'enabled': SPOOL_ENABLED, 'dir': SPOOL_DIR,
            'content': {'count': len(rows), 'bytes': sum(st.st_size for _, st in rows if st),
                        'maxBytes': CONTENT_MAX_BYTES, 'maxCount': CONTENT_MAX_N,
-                       'retentionS': CONTENT_TTL_S}}
+                       'retentionS': CONTENT_TTL_S},
+           'bytes': spool_bytes() if os.path.isdir(SPOOL_DIR) else 0,
+           'maxBytes': SPOOL_MAX_BYTES, 'overflowDropped': SPOOL_OVERFLOW_DROPPED}
     if not os.path.isdir(SPOOL_DIR):
         out.update({'inbox': 0, 'dispatch': {'pending': 0, 'running': 0, 'items': []},
                     'sessions': {}, 'seen': 0})
@@ -5223,26 +5286,43 @@ class Handler(BaseHTTPRequestHandler):
 
     do_GET = do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse
 
+    def _too_large(self):
+        self.close_connection = True  # the unread body is still on the wire
+        data = b'payload too large'
+        self.send_response(413)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(data)
+
     def _read_body(self):
         # node:http decodes chunked transparently; do the same so a proxy that
         # re-chunks the sender's body doesn't break signature verification.
         if (self.headers.get('Transfer-Encoding') or '').lower() == 'chunked':
-            chunks = []
+            chunks, got = [], 0
             while True:
                 size_line = self.rfile.readline(65536).strip()
                 size = int(size_line.split(b';')[0], 16)
                 if size == 0:
                     self.rfile.readline(65536)  # trailing CRLF (no trailers expected)
                     break
+                got += size
+                if MAX_BODY_BYTES and got > MAX_BODY_BYTES:
+                    return None
                 chunks.append(self.rfile.read(size))
                 self.rfile.readline(65536)  # CRLF after each chunk
             return b''.join(chunks)
         length = int(self.headers.get('Content-Length') or 0)
+        if MAX_BODY_BYTES and length > MAX_BODY_BYTES:
+            return None
         return self.rfile.read(length) if length > 0 else b''
 
     def do_POST(self):
         try:
             body = self._read_body()
+            if body is None:
+                return self._too_large()
             deliver(self, body)
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the ingress
             print('local-webhook: delivery error: %s' % e, file=sys.stderr)

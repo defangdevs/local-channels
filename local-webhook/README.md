@@ -1047,6 +1047,8 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SPAWN_MAX` | `2` | max concurrent spawn commands across all keys |
 | `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | default (a watch's `spawn_window_s` overrides it); seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
 | `LOCAL_WEBHOOK_SPAWN_TIMEOUT` | `600` | seconds before a running spawn command is killed (and its batch dropped) |
+| `LOCAL_WEBHOOK_MAX_BODY_BYTES` | `26214400` (25 MiB, GitHub's ceiling) | largest request body the ingress reads; a bigger `Content-Length` (or chunked total) is refused with `413` before the signature check; `0` disables |
+| `LOCAL_WEBHOOK_SPOOL_MAX_BYTES` | `268435456` (256 MiB) | total bytes the inbox, dispatch queue and session boxes may hold; past it the reaper drops the OLDEST waiting dispatch records with a log line, counted as `overflowDropped` in `status` (next to `bytes`/`maxBytes`); `0` disables |
 | `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S` | `300` | how long a batch the spawn command keeps declining (exit `75`) is kept before it is dropped; `0` disables deferral |
 | `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` | `200` | max event lines waiting per key; past it the oldest are dropped |
 | `LOCAL_WEBHOOK_CODEX_THREAD` | — | codex thread (UUID or exact session name) this process delivers to; wins over `CODEX_THREAD_ID` / `CODEX_SESSION_ID`, which codex itself exports |
