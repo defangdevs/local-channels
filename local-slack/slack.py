@@ -174,8 +174,25 @@ def check_link(url, allowed_hosts):
         scan_secrets(dec)
 
 
+def link_label(url, limit=60):
+    """Host always, then as much of the path as fits: the reader sees which page."""
+    p = urllib.parse.urlsplit(url)
+    label = (p.hostname or '') + (p.path.rstrip('/') if p.path != '/' else '')
+    if len(label) > limit:
+        label = label[:limit - 1] + '\u2026'
+    return label.replace('|', '').replace('<', '').replace('>', '')
+
+
+_MARKUP_RE = re.compile(r'<(?:https?:[^>\s]*|[^<>\s]*\|[^<>]*)>', re.I)
 _EMAIL_RE = re.compile(r'(?<![\w.+-])[\w.+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b')
 _URL_TAIL = '.,;:!?\'"'
+
+
+def with_disclosure(body, disclosure):
+    """Append the disclosure line unless the body already ends with it."""
+    if not disclosure or body.rstrip().endswith(disclosure.strip()):
+        return body
+    return body + '\n\n' + disclosure
 
 
 def compose(text, resolver, cfg, defaults, unresolved=None):
@@ -189,6 +206,8 @@ def compose(text, resolver, cfg, defaults, unresolved=None):
     if _IMAGE_MD_RE.search(text):
         raise Refused('image Markdown is refused; use upload')
     scan_secrets(text, defaults.get('secret_patterns', ()))
+    if _MARKUP_RE.search(_CODE_RE.sub('', text)):
+        raise Refused('write links as bare URLs; slack.py makes the link (no <url|label> markup)')
 
     allowed_hosts = list(defaults.get('links', {}).get('allowed_hosts', []))
     inserted = []
@@ -234,8 +253,7 @@ def compose(text, resolver, cfg, defaults, unresolved=None):
                 check_link(m.group(1), allowed_hosts)
         for kind, chunk in pieces:
             if kind == 'u':
-                host = urllib.parse.urlsplit(chunk).hostname
-                tok = '<%s|%s>' % (chunk, host)
+                tok = '<%s|%s>' % (chunk, link_label(chunk))
                 inserted.append(tok)
                 out.append(tok)
                 continue
@@ -333,7 +351,9 @@ DEFAULT_CHANNEL = {
     'track': 'all',
     'quiet_minutes': 30, 'max_wait_hours': 24, 'merge_window_minutes': 0,
     'resettle': True, 'track_bots': False,
-    'reactions': {'ready': 'white_check_mark', 'hold': 'raised_hand', 'drop': 'x', 'ack': None},
+    # Which emoji means what is the deployment's call: none of these is on until
+    # configured (channels.example.json has a recommended set).
+    'reactions': {'ready': None, 'hold': None, 'drop': None, 'ack': None},
     'controllers': [], 'ignore_users': [],
     'write': {'allowed': False, 'mode': 'on_request', 'top_level': False,
               'broadcast': False, 'groups': False},
@@ -446,6 +466,7 @@ def load_config(path=None):
     except (OSError, ValueError):
         return {}, json.loads(json.dumps(DEFAULT_DEFAULTS))
     defaults = _merge(DEFAULT_DEFAULTS, raw.get('_defaults'))
+    _warn_aliases(defaults, raw)
     channels = {}
     for k, v in raw.items():
         if k.startswith('_') or not isinstance(v, dict):
@@ -460,6 +481,19 @@ def load_config(path=None):
             continue
         channels[k] = c
     return channels, defaults
+
+
+def _warn_aliases(defaults, raw):
+    """Say once per load which configured names are aliases (they still match)."""
+    names = [('feedback_reactions', e) for e in defaults.get('feedback_reactions') or []]
+    names += [('status_marks.' + k, v) for k, v in (defaults.get('status_marks') or {}).items()]
+    for k, v in raw.items():
+        if isinstance(v, dict) and (k == '_channel_defaults' or not k.startswith('_')):
+            names += [(k + ' reactions.' + r, n) for r, n in (v.get('reactions') or {}).items()]
+    for where, n in names:
+        if isinstance(n, str) and canon_emoji(n) != n.strip(':'):
+            print('local-slack: %s: "%s" is an alias; Slack reports "%s" (matched either way)'
+                  % (where, n, canon_emoji(n)), file=sys.stderr)
 
 
 def _bad_controllers(ctl):
@@ -615,6 +649,19 @@ class Store:
 # --------------------------------------------------------------------------
 
 CONTROL = ('ready', 'hold', 'drop')
+
+# Slack reports a reaction under its canonical name, whatever alias the bot used
+# to add it (`raised_hand` is added, `hand` comes back). A configured alias must
+# still match, so both sides compare through this table.
+EMOJI_ALIASES = {
+    'raised_hand': 'hand', 'thumbsup': '+1', 'thumbsdown': '-1',
+    'thumbs_up': '+1', 'thumbs_down': '-1', 'cross_mark': 'x',
+}
+
+
+def canon_emoji(name):
+    name = (name or '').strip(':')
+    return EMOJI_ALIASES.get(name, name)
 
 
 class Tracker:
@@ -911,7 +958,8 @@ class Tracker:
             return
         key = self._key(team, channel, thread_ts)
         row = self._row(key)
-        ctrl = {v: k for k, v in cfg['reactions'].items() if k in CONTROL}
+        ctrl = {canon_emoji(v): k for k, v in cfg['reactions'].items() if k in CONTROL and v}
+        emoji = canon_emoji(emoji)
         if user in cfg['ignore_users']:
             return
         # reaction:<emoji> tracking starts a record from a reaction.
@@ -948,7 +996,7 @@ class Tracker:
             # MEANS is the deployment's call: a configured feedback reaction goes
             # out as `feedback`, anything else as a plain reaction flagged
             # on_bot_message, for the consumer to interpret.
-            if etype == 'reaction_added' and emoji in (self.defaults.get('feedback_reactions') or []):
+            if etype == 'reaction_added' and emoji in [canon_emoji(e) for e in (self.defaults.get('feedback_reactions') or [])]:
                 self.emit('feedback', self._payload(row, 'feedback', ts=ts, user=user,
                                                     extra={'rating': emoji, 'reason': 'feedback'}))
             else:
@@ -1643,8 +1691,7 @@ class Writer:
         self._rate(channel, top_level)
         unresolved = []
         body = compose(text, self.resolver, cfg, self.defaults, unresolved)
-        if self.defaults.get('disclosure'):
-            body += '\n\n' + self.defaults['disclosure']
+        body = with_disclosure(body, self.defaults.get('disclosure'))
         if len(body) > 4000:
             raise Refused('message over 4,000 characters; upload a file instead')
         params = {'channel': channel, 'text': body, 'unfurl_links': False, 'unfurl_media': False}
@@ -1732,8 +1779,7 @@ class Writer:
         self._rate('dm:' + user, False)
         unresolved = []
         body = compose(text, self.resolver, DEFAULT_CHANNEL, self.defaults, unresolved)
-        if self.defaults.get('disclosure'):
-            body += '\n\n' + self.defaults['disclosure']
+        body = with_disclosure(body, self.defaults.get('disclosure'))
         if len(body) > 4000:
             raise Refused('message over 4,000 characters')
         chan = self.web.call('conversations.open', {'users': uid}, write=True)['channel']['id']
@@ -1796,8 +1842,7 @@ class Writer:
         unresolved, body = [], ''
         if comment:
             body = compose(comment, self.resolver, cfg, self.defaults, unresolved)
-            if self.defaults.get('disclosure'):
-                body += '\n\n' + self.defaults['disclosure']
+            body = with_disclosure(body, self.defaults.get('disclosure'))
             if len(body) > 4000:
                 raise Refused('comment over 4,000 characters')
         done = []
