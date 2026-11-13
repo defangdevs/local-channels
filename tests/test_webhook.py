@@ -118,6 +118,26 @@ class TestVerify(StateDirCase):
         self.assertFalse(self.mod.verify('sekrit', '', self.BODY))
 
 
+class TestPreviousSecret(StateDirCase):
+    """Issue #49: a bounded overlap accepting the retired secret."""
+    FUTURE = '2999-01-01T00:00:00Z'
+    PAST = '2000-01-01T00:00:00Z'
+
+    def test_needs_future_expiry(self):
+        pv = self.mod.previous_secret
+        self.assertEqual(pv({'previousSecret': 'old', 'previousSecretUntil': self.FUTURE}), 'old')
+        self.assertEqual(pv({'previousSecret': 'old', 'previousSecretUntil': self.PAST}), '')
+        self.assertEqual(pv({'previousSecret': 'old'}), '')  # no expiry: never permanent
+        self.assertEqual(pv({'previousSecret': 'old', 'previousSecretUntil': 'garbage'}), '')
+        self.assertEqual(pv({'previousSecretUntil': self.FUTURE}), '')
+
+    def test_file_and_naive_timestamp(self):
+        with open(os.path.join(self.state, 'g.prev'), 'w', encoding='utf-8') as f:
+            f.write('oldfile\n')
+        src = {'previousSecretFile': 'g.prev', 'previousSecretUntil': '2999-01-01T00:00:00'}
+        self.assertEqual(self.mod.previous_secret(src), 'oldfile')
+
+
 class TestVerifyToken(StateDirCase):
     """'token' mode (GitLab's legacy X-Gitlab-Token): the header IS the secret."""
 
@@ -3660,6 +3680,30 @@ class EndToEndCase(unittest.TestCase):
 
 
 class TestEndToEnd(EndToEndCase):
+    def test_previous_secret_overlap(self):
+        import hashlib
+        import hmac as hmac_mod
+        old = 'old-secret'
+        with open(os.path.join(self.state, 'github.secret.prev'), 'w', encoding='utf-8') as f:
+            f.write(old)
+        path = os.path.join(self.state, 'sources.json')
+        with open(path, encoding='utf-8') as f:
+            cfg = json.load(f)
+        cfg['sources']['github'].update(previousSecretFile='github.secret.prev',
+                                        previousSecretUntil='2999-01-01T00:00:00Z')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        self.start_daemon()
+        raw = json.dumps(self.ISSUE).encode()
+        old_sig = 'sha256=' + hmac_mod.new(old.encode(), raw, hashlib.sha256).hexdigest()
+        self.assertEqual(self.post(raw, sig=old_sig)[0], 200)
+        self.assertEqual(self.post(raw, sig='sha256=' + hmac_mod.new(b'nope', raw, hashlib.sha256).hexdigest())[0], 401)
+        cfg['sources']['github']['previousSecretUntil'] = '2000-01-01T00:00:00Z'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        self.assertEqual(self.post(raw, sig=old_sig)[0], 401)
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+
     def test_http_status_codes(self):
         self.start_daemon()
         self.assertEqual(self.post(self.ISSUE)[0], 200)
