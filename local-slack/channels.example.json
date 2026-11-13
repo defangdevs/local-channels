@@ -7,7 +7,7 @@
     "controllers": [],
     "reactions": {
       "ready": "white_check_mark",
-      "hold": "raised_hand",
+      "hold": "hand",
       "drop": "x",
       "ack": "eyes"
     },

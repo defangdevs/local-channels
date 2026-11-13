@@ -156,7 +156,9 @@ scanned decoded, never unfurled; a scheme-less `evil.com` or `www.` link and
 (zero-width characters ignored) are refused; a disclosure line is appended to
 `reply` and `post` when `_defaults.disclosure` is set; write caps from
 `_defaults.limits` (fresh defaults 20 per session per 10 minutes, `status` edits
-excepted, and 5 top-level posts per channel per hour); `reply`, `post`, `status` and `react` are audited in SQLite. Slack
+excepted, and 5 top-level posts per channel per hour); `reply`, `post`, `status` and `react` are audited in SQLite.
+
+Config changes apply within about 30 seconds (the daemon re-reads `channels.json` every tick); no restart is needed. Reaction names may be Slack aliases (`raised_hand`, `thumbsup`): they are matched against the canonical name Slack reports (`hand`, `+1`), and loading the config prints a note naming the alias. No emoji control (`ready`/`hold`/`drop`/`ack`) is on until configured. Link labels show the host plus a shortened path; text containing `<url|label>` markup is refused (write bare URLs), and a disclosure line the text already ends with is not appended twice. Slack
 calls go through per-tier token buckets with 40% reserved for reads; read
 methods are form-encoded, writes JSON.
 
