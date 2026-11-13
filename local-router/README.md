@@ -125,3 +125,9 @@ replaces those two markers in the text, so the text cannot close them. The
 worst result of a prompt injection is one misrouted message: the answer must be
 one of three actions plus letters that map to known sessions. Anything else
 becomes a fallback.
+
+The routing call gets no tools. `claude -p` runs with `--tools ""`. `codex exec`
+runs with its shell tool turned off (`features.shell_tool=false`), because its
+read-only sandbox blocks writes but not reads. Any Codex run that still shows a
+tool item (a command, a file change, an MCP or web call) is rejected, so its
+answer never reaches the caller.

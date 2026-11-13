@@ -126,6 +126,86 @@ class Prompt(unittest.TestCase):
         self.assertLess(len(prompt), 16000)   # about 4k tokens
 
 
+class ReviewFixes(unittest.TestCase):
+    def test_current_session_keeps_a_slot_without_timestamps(self):
+        sessions = [{"id": "s%d" % i, "messages": [{"role": "user", "text": "t%d" % i}]} for i in range(7)]
+        prompt, letters = router.build_prompt({"text": "q"}, sessions, "s0")
+        self.assertIn("s0", letters.values())
+        self.assertEqual(len(letters), router.MAX_RECENT)
+        self.assertIn("CURRENT", prompt)
+
+    def test_long_topic_labels_are_clipped(self):
+        url = "https://example.com/" + "x" * 5000
+        s = {"id": "s", "messages": [{"role": "user", "text": "a", "ts": i, "topic": url} for i in range(3)]}
+        prompt, _ = router.build_prompt({"text": "q", "ts": 9}, [s], "s")
+        self.assertLess(len(prompt), 3000)
+        d = router.parse_answer(json.dumps({"action": "NEW", "topic": url}), {})
+        self.assertLessEqual(len(d["topic"]), router.TOPIC_CHARS + 1)
+
+    def test_assistant_runs_do_not_grow_the_tail(self):
+        msgs = [{"role": "user", "text": "start", "ts": 0}] + \
+               [{"role": "assistant", "text": "note %d" % i, "ts": i} for i in range(1, 200)]
+        prompt, _ = router.build_prompt({"text": "q", "ts": 999}, [{"id": "s", "messages": msgs}], "s")
+        self.assertEqual(prompt.count("  assistant: "), router.TAIL_MESSAGES)
+
+    def test_lazy_backend_is_not_resolved_for_deterministic_routes(self):
+        calls = []
+        def factory():
+            calls.append(1)
+            return Fake({"action": "NEW"})
+        ss = [session("a", 1000)]
+        router.route({"text": "x", "reply_to": "a"}, ss, None, backend=factory)
+        router.route({"text": "x"}, [], None, backend=factory)
+        router.route({"text": "ok", "ts": 1001}, ss, "a", backend=factory, short_rule=(25, 3600))
+        self.assertEqual(calls, [])
+        d = router.route({"text": "a longer new question", "ts": 1001}, ss, "a", backend=factory)
+        self.assertEqual((calls, d["reason"]), ([1], "llm"))
+
+    def test_lazy_backend_none_or_error_falls_back(self):
+        ss = [session("a", 1000)]
+        self.assertEqual(router.route({"text": "x"}, ss, "a", backend=lambda: None)["reason"], "fallback")
+        def boom():
+            raise RuntimeError("probe failed")
+        d = router.route({"text": "x"}, ss, "a", backend=boom)
+        self.assertEqual((d["reason"], d["session"]), ("fallback", "a"))
+
+    def fake_codex(self, events):
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        path = os.path.join(d, "codex")
+        with open(path, "w") as f:
+            f.write("#!%s\nimport sys, json\nsys.stdin.read()\nfor e in %r:\n    print(json.dumps(e))\n" % (sys.executable, events))
+        os.chmod(path, 0o755)
+        return path
+
+    def test_codex_answer_is_rejected_when_a_tool_ran(self):
+        answer = {"type": "item.completed", "item": {"type": "agent_message", "text": '{"action": "NEW"}'}}
+        tool = {"type": "item.completed", "item": {"type": "command_execution", "command": "cat ~/.codex/auth.json"}}
+        ok = router.CodexCLI(binary=self.fake_codex([answer]))
+        self.assertIn("NEW", ok.complete("s", "p"))
+        bad = router.CodexCLI(binary=self.fake_codex([tool, answer]))
+        with self.assertRaisesRegex(RuntimeError, "used a tool"):
+            bad.complete("s", "p")
+        d = router.route({"text": "x"}, [session("a", 1)], "a", backend=bad)
+        self.assertEqual((d["reason"], d["session"]), ("fallback", "a"))
+
+    def test_codex_runs_without_its_shell_tool(self):
+        seen = []
+        orig = subprocess.run
+        def spy(argv, **kw):
+            seen.append(argv)
+            return orig(argv, **kw)
+        b = router.CodexCLI(binary=self.fake_codex([{"type": "item.completed",
+                                                     "item": {"type": "agent_message", "text": "{}"}}]))
+        router.subprocess.run = spy
+        try:
+            b.complete("s", "p")
+        finally:
+            router.subprocess.run = orig
+        self.assertIn("features.shell_tool=false", seen[0])
+
+
 class Backends(unittest.TestCase):
     def test_command_backend_end_to_end(self):
         script = 'import sys; sys.stdin.read(); print(\'{"action": "CONTINUE", "thread": "B", "topic": "t"}\')'
@@ -160,6 +240,18 @@ class CLI(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("hello router", p.stdout)
         self.assertIn("(none yet)", p.stdout)
+
+    def test_model_without_backend_is_a_usage_error(self):
+        p = self.run_cli(["route", "--model", "opus"], {"message": {"text": "hi"}, "sessions": []})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--model needs an explicit --backend", p.stderr)
+
+    def test_reply_hint_needs_no_backend_resolution(self):
+        # auto would probe real CLIs; a reply hint must return before that
+        p = self.run_cli(["route"], {"message": {"text": "yes", "reply_to": "a"},
+                                     "sessions": [session("a", 1)], "current": None})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["reason"], "reply-hint")
 
     def test_version(self):
         p = subprocess.run([sys.executable, str(ROUTER), "version"], capture_output=True, text=True)

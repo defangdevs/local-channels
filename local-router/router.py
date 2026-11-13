@@ -54,7 +54,10 @@ SNIPPET_USER = 250
 SNIPPET_ASSISTANT = 300
 SNIPPET_MESSAGE = 1500
 TOPICS_SHOWN = 3
+TOPIC_CHARS = 60        # one stored label; a single "word" can be a long URL
+LABEL_CHARS = 160       # all labels shown for one session
 EXCHANGES_SHOWN = 2
+TAIL_MESSAGES = 6       # hard cap per session, whatever the role mix
 
 SYSTEM = "You route chat messages. Answer with one JSON object only."
 
@@ -130,18 +133,23 @@ def _sanitize(text):
     return (text or "").replace("<<<", "‹‹‹").replace(">>>", "›››")
 
 
-def candidates(sessions, message, similar=None):
-    """Sessions shown to the model: the MAX_RECENT most recently active, plus up
-    to MAX_SIMILAR older ones from the caller's `similar(message, sessions)` hook
-    (for example an embedding search). Returned oldest activity first.
+def candidates(sessions, message, similar=None, current=None):
+    """Sessions shown to the model: the current session, the most recently active
+    ones up to MAX_RECENT in all, plus up to MAX_SIMILAR older ones from the
+    caller's `similar(message, sessions)` hook (for example an embedding search).
+    Returned oldest activity first.
 
+    The current session always has a slot: timestamps are optional, so recency
+    alone could push it out, and then no answer could route a follow-up to it.
     The hook is optional. In the benchmark its only gain was finding returns to
     sessions that had dropped out of the recent window."""
     def key(s):
         ts = _last_ts(s)
         return ts if ts is not None else float("-inf")
     ordered = sorted(sessions, key=key)
-    pick = ordered[-MAX_RECENT:]
+    cur = [s for s in ordered if s["id"] == current][:1]
+    rest = [s for s in ordered if s["id"] != current]
+    pick = rest[-(MAX_RECENT - len(cur)):] + cur
     if similar is not None and len(ordered) > MAX_RECENT:
         seen = set(s["id"] for s in pick)
         by_id = dict((s["id"], s) for s in sessions)
@@ -159,27 +167,31 @@ def build_prompt(message, sessions, current=None, now=None, similar=None):
     letters keep descriptive ids (which can name the topic) from leaking an answer
     and keep the reply short."""
     now = now if now is not None else (message.get("ts") or time.time())
-    pick = candidates(sessions, message, similar)
+    pick = candidates(sessions, message, similar, current)
     letters = dict(zip(string.ascii_uppercase, (s["id"] for s in pick)))
     blocks = []
     for letter, s in zip(string.ascii_uppercase, pick):
         msgs = s.get("messages") or []
         topics = []
         for m in reversed(msgs):
-            t = (m.get("topic") or "").strip()
+            t = _clip(m.get("topic"), TOPIC_CHARS)
             if t and t not in topics:
                 topics.append(t)
             if len(topics) == TOPICS_SHOWN:
                 break
         first_user = next((m.get("text") for m in msgs if m.get("role") == "user"), "")
-        label = "; ".join(reversed(topics)) or _clip(first_user, 120)
+        label = _clip("; ".join(reversed(topics)), LABEL_CHARS) or _clip(first_user, 120)
         last = _last_ts(s)
         lines = ["[%s]%s last activity %s ago, %d messages. Recent topics: <<<%s>>>" % (
             letter, " CURRENT" if s["id"] == current else "",
             _age(None if last is None else max(0, now - last)), len(msgs), _sanitize(label))]
-        # The last EXCHANGES_SHOWN user turns and the assistant text after each.
+        # The last EXCHANGES_SHOWN user turns and the assistant text after each,
+        # never more than TAIL_MESSAGES (a run of assistant messages has no user turn
+        # to stop at).
         tail, users = [], 0
         for m in reversed(msgs):
+            if len(tail) == TAIL_MESSAGES:
+                break
             tail.append(m)
             if m.get("role") == "user":
                 users += 1
@@ -208,7 +220,7 @@ def parse_answer(text, letters):
         return None
     if not isinstance(a, dict) or a.get("action") not in ACTIONS:
         return None
-    topic = " ".join(str(a.get("topic") or "").split()[:6])
+    topic = _clip(" ".join(str(a.get("topic") or "").split()[:6]), TOPIC_CHARS)
     links = [letters[x] for x in (a.get("links") or []) if isinstance(x, str) and x in letters]
     if a["action"] == "CONTINUE":
         sid = letters.get(a.get("thread")) if isinstance(a.get("thread"), str) else None
@@ -227,7 +239,10 @@ def route(message, sessions, current=None, backend=None, similar=None, now=None,
     "fallback" decision instead, so the caller can always deliver the message.
 
     current     id of the session the previous message went to (or None)
-    backend     object with complete(system, prompt) -> str (see the backends below)
+    backend     object with complete(system, prompt) -> str (see the backends below),
+                or a zero-argument callable that returns one (or None). A callable
+                is only called when a model decision is needed, so a reply hint,
+                an empty session list or the short rule never pay for a probe.
     similar     optional hook(message, sessions) -> [session ids], best first
     short_rule  optional (max_chars, max_gap_seconds): a message at most max_chars
                 long, within max_gap_seconds of the current session's last
@@ -260,6 +275,12 @@ def route(message, sessions, current=None, backend=None, similar=None, now=None,
     fallback = ({"action": "CONTINUE", "session": current, "links": [], "topic": "", "reason": "fallback"}
                 if current is not None else
                 {"action": "NEW", "session": None, "links": [], "topic": "", "reason": "fallback"})
+    if backend is not None and not hasattr(backend, "complete") and callable(backend):
+        try:
+            backend = backend()
+        except Exception as e:
+            fallback["error"] = str(e)[:300]
+            return fallback
     if backend is None:
         return fallback
     prompt, letters = build_prompt(message, sessions, current, now, similar)
@@ -319,11 +340,21 @@ class ClaudeCLI(object):
 
 
 class CodexCLI(object):
-    """`codex exec` in a throwaway read-only sandbox. codex_home: optional
-    CODEX_HOME with only auth.json in it (a symlink is fine). The default home
-    adds the user's global AGENTS.md to every call (31k instead of 10k input
-    tokens in the benchmark); preparing that directory is the caller's choice."""
+    """`codex exec` with its shell tool turned off, in an empty read-only sandbox.
+
+    The read-only sandbox blocks writes, not reads, so an injected message could
+    otherwise ask the agent to read local files (auth.json, keys) during a
+    routing call. Two layers stop that: features.shell_tool=false removes the
+    tool, and any run whose event stream shows a tool item (a command, a file
+    change, an MCP or web call) is rejected, so its answer never reaches the
+    caller and route() falls back.
+
+    codex_home: optional CODEX_HOME with only auth.json in it (a symlink is
+    fine). The default home adds the user's global AGENTS.md to every call (31k
+    instead of 10k input tokens in the benchmark); preparing that directory is
+    the caller's choice."""
     name = "codex"
+    ALLOWED_ITEMS = ("agent_message", "reasoning")
 
     def __init__(self, model="gpt-6-luna", effort="low", codex_home=None, timeout=180, binary="codex"):
         self.model, self.effort, self.home = model, effort, codex_home
@@ -339,7 +370,9 @@ class CodexCLI(object):
                 f.write(system)
             cwd = os.path.join(d, "cwd"); os.mkdir(cwd)
             p = subprocess.run([self.binary, "exec", "-m", self.model, "-c", "model_reasoning_effort=" + self.effort,
-                                "-c", "model_instructions_file=" + sysfile, "--ephemeral", "-s", "read-only",
+                                "-c", "model_instructions_file=" + sysfile,
+                                "-c", "features.shell_tool=false", "-c", "features.unified_exec=false",
+                                "--ephemeral", "-s", "read-only",
                                 "--skip-git-repo-check", "-C", cwd, "--json", "-"],
                                input=prompt, capture_output=True, text=True, timeout=self.timeout,
                                cwd=cwd, env=env)
@@ -350,7 +383,10 @@ class CodexCLI(object):
             except ValueError:
                 continue
             item = ev.get("item") or {}
-            if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+            kind = item.get("type")
+            if kind and kind not in self.ALLOWED_ITEMS:
+                raise RuntimeError("codex used a tool (%s) during a routing call; answer rejected" % kind)
+            if ev.get("type") == "item.completed" and kind == "agent_message":
                 text = item.get("text")
         if text is None:
             raise RuntimeError("codex gave no answer (exit %d): %s" % (p.returncode, p.stderr[-300:]))
@@ -454,6 +490,9 @@ CLI_USAGE = """local-router %s
 
 def _backend_from_args(args):
     if args.backend in (None, "auto"):
+        if args.model:
+            # auto_backend() tries several harnesses; one model name cannot fit them all.
+            raise SystemExit("--model needs an explicit --backend")
         return auto_backend()
     if args.backend == "none":
         return None
@@ -485,7 +524,10 @@ def main(argv=None):
     if args.short_rule:
         c, s = args.short_rule.split(",")
         short = (int(c), float(s))
-    d = route(msg, sessions, current, backend=_backend_from_args(args), short_rule=short)
+    if args.model and args.backend in (None, "auto"):
+        raise SystemExit("--model needs an explicit --backend")
+    # Lazy: a reply hint, no sessions or the short rule need no backend and no probe.
+    d = route(msg, sessions, current, backend=lambda: _backend_from_args(args), short_rule=short)
     print(json.dumps(d, ensure_ascii=False))
     return 0
 
