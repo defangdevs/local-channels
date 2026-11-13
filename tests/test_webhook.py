@@ -2373,6 +2373,22 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
         self.assertIn('count=1', self.runs(path)[0])
 
+    def test_muted_dispatch_holds_pending_batches_until_unmuted(self):  # #23
+        path, cmd = self.recorder('muted', sleep=1)
+        self.mod.MUTE_POLL_S = 0.2
+        d = self.mod.Dispatcher(cmd, 2, 0, 30)
+        d.add('k', 'e1', {'key': 'k'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        d.add('k', 'e2', {'key': 'k'})            # queued behind the running spawn
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent',
+                  include={'path': 'action', 'in': ['opened']})
+        self.call('webhook_mute', deliver_to='subagent')
+        time.sleep(2)                              # spawn 1 ends; e2 would start now
+        self.assertEqual(len(self.runs(path)), 1)
+        self.assertEqual(self.pending(d, 'k'), ['e2'])  # held, not dropped
+        self.call('webhook_unmute', deliver_to='subagent')
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 2))
+
     def test_burst_coalesces_into_one_followup(self):
         path, cmd = self.recorder('burst', sleep=1)
         d = self.mod.Dispatcher(cmd, 2, 0, 30)  # window 0: follow-up gated only by the running spawn

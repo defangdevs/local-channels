@@ -3476,6 +3476,10 @@ SPAWN_DEFER_MAX_S = max(0, _int_env('LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S', default=3
 SPAWN_PENDING_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_PENDING_MAX', default=200))
 
 
+# How often a muted dispatch list is re-read for an unmute while batches wait.
+MUTE_POLL_S = 2
+
+
 class Dispatcher:
     # Until 0.33.0 this state was in-memory only, on the reasoning that "the
     # same deliveries reached session peers". They did not: a standing watch
@@ -3682,6 +3686,20 @@ class Dispatcher:
     def _pump(self, key):
         st = self.keys[key]
         if st['running'] or not st['pending'] or self.active >= self.max:
+            return
+        # A muted dispatch list (#23, webhook_mute deliver_to:"subagent") must
+        # also stop batches that were queued BEFORE the mute — capacity waits,
+        # coalescing timers, deferred retries and spool recoveries all reach
+        # this point, and route_event's enabled check only ever saw their
+        # arrival. Mute RETAINS: the batch stays pending (and its spool records
+        # stay leased to nobody, so they survive a restart) and a slow timer
+        # re-asks, so unmute resumes it without any other trigger. Discarding
+        # would lose events the owner never chose to drop.
+        if not read_filter(DISPATCH_FILE)['enabled']:
+            if st['timer'] is None:
+                st['timer'] = threading.Timer(MUTE_POLL_S, self._on_timer, args=(key,))
+                st['timer'].daemon = True
+                st['timer'].start()
             return
         # A batch the spawn command declined (exit 75) is paced by the larger of
         # the watch's window and the global one, with a floor of one second:
@@ -4639,7 +4657,7 @@ TOOLS = [
             'Writes enabled:false and keeps every topic, so webhook_unmute restores exactly what was listening. '
             'Use it to silence a flood in one call instead of N unsubscribes. Works on a session whose filter '
             'file does not exist yet (it writes one with no topics). Pass deliver_to:"subagent" to mute the '
-            'shared dispatch (standing-watch) list instead. Idempotent. Note: a later webhook_subscribe '
+            'shared dispatch (standing-watch) list instead: batches already waiting to spawn are held, not dropped, and resume on unmute. Idempotent. Note: a later webhook_subscribe '
             'writes enabled:true again, since subscribing is an explicit ask to listen. '
             'webhook_subscriptions reports the state as `enabled`.',
         'inputSchema': {
