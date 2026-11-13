@@ -358,11 +358,15 @@ class CodexCLI(object):
     name = "codex"
     ALLOWED_ITEMS = ("agent_message", "reasoning")
     # Every tool family codex-cli 0.165.0 exposes that can read host data.
-    # --ignore-user-config drops MCP servers and plugins from the user's
-    # config.toml; with code_mode_host off, code mode fails closed (verified
-    # with a canary file outside the working directory). Tools left over
-    # (apply_patch, view_image) are blocked by the read-only sandbox or limited to
-    # images, and any tool item still makes complete() reject the answer.
+    # The load-bearing flag is code_mode_host=false: in 0.165.0 every tool call
+    # (exec, view_image, MCP tools) is dispatched through the code-mode host, and
+    # with it off each call fails closed BEFORE it runs. Verified with canaries
+    # outside the working directory: a text file via exec, an image via
+    # view_image, and a real stdio MCP server whose tool never executed even with
+    # the user config loaded. --ignore-user-config is the second layer (the
+    # user's MCP servers and plugins are not even loaded); the other flags drop
+    # tool families outright. Any tool item still makes complete() reject the
+    # answer. Re-verify on every codex upgrade: tool dispatch may change.
     NO_TOOLS = ("--ignore-user-config",
                 "-c", "features.shell_tool=false", "-c", "features.unified_exec=false",
                 "-c", "features.code_mode_host=false", "-c", "features.apps=false",
