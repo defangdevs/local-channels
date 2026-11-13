@@ -95,7 +95,7 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 |---|---|---|
 | `secret` / `secretFile` | — | verification secret (file paths resolve in the state dir) |
 | `format` | `github` iff source is named github, else `generic` | payload summarizer |
-| `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` — see [Verification modes](#verification-modes-0300) |
+| `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` \| `query-token` (0.38.0) — see [Verification modes](#verification-modes-0300) |
 | `signatureHeader` | depends on `verification` (`x-hub-signature-256` / `x-gitlab-token` / `webhook-signature`) | the signature, in that mode's own shape |
 | `idHeader` (0.30.0) | `webhook-id` | `standard-webhooks` only |
 | `timestampHeader` (0.30.0) | `webhook-timestamp` | `standard-webhooks` only; more than 5 minutes from now is refused as a possible replay |
@@ -128,6 +128,27 @@ default keeps every existing source verifying exactly as before.
   minutes) from now is refused as a possible replay — Standard Webhooks' own
   docs call this out explicitly. The secret may be a plain string or a
   `whsec_`-prefixed base64 string, exactly as Standard Webhooks specifies.
+
+- **`query-token`** (0.38.0, #31) — the secret is a URL query parameter
+  (`tokenParam`, default `token`), for a sender that signs nothing and cannot
+  set a header: Rollbar's documented method is
+  `https://host/webhook/rollbar?token=...`. It is the **weakest** mode, weaker
+  than `hmac-hex`: the secret sits in the request line, so every proxy and
+  access log on the path records it, and one leaked log line leaks the secret.
+  Use it only for a sender that offers nothing better, and keep the access log
+  of whatever fronts this receiver off the query string. A missing or wrong
+  token answers 401 like every other mode.
+- **`eventPath`** (0.38.0, any mode) — dot-path into the body for the event
+  name, tried after the event header and before the `event` / `type`
+  fallbacks. Rollbar names it `event_name`.
+
+```json
+{ "sources": { "rollbar": {
+    "secretFile": "rollbar.secret", "format": "generic",
+    "verification": "query-token", "eventPath": "event_name",
+    "keyPath": "data.item.project_id"
+} } }
+```
 
 ```json
 { "sources": { "gitlab": {
