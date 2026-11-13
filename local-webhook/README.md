@@ -1152,3 +1152,17 @@ may be missing until that event is delivered again. This hook carries source
 identity and payload separately, so a deployment can implement GitHub and
 Slack reactions without parsing the rendered prompt. It adds no transport
 reply tool or default external writes to local-webhook itself.
+
+## Last accepted delivery (0.38.0)
+
+`receiver.json` (and `webhook.py status`, under `receiver`) carries
+`lastDelivery`: `{"at": ISO time, "source": "github", "topic": "github:owner/repo"}`,
+the last delivery the receiver **accepted** (signature verified and, with the
+durable spool, written to the inbox). Rejected requests (401/404/400) never
+count. It lets a waiting session ask "has this box heard anything lately?"
+without a token or a network round trip, and works for every source, not only
+those with a delivery log. It is a datum, not a judgement: whether an old
+timestamp is an outage or a quiet weekend is for the caller to decide. Writes
+are coalesced to at most one per 5 seconds, so the value can trail the real
+last delivery by that much. The field is absent until the first delivery after
+a receiver start.

@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.2'
+VERSION = '0.38.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -4078,7 +4078,8 @@ def dispatch_event(env, sid=None, at=None, enqueue=True):
 # dispatch is actually wired (webhook_subscribe warns when it is not), and so
 # `emit` can find the ingress — under socket activation the bound path exists
 # nowhere in a session's environment, only in the daemon's adopted fd.
-# Advisory only: absent on legacy setups, stale after a crash.
+# Advisory only: absent on legacy setups, stale after a crash. Since 0.38.0 it
+# also carries lastDelivery (see note_accepted_delivery).
 RECEIVER_FILE = os.path.join(STATE_DIR, 'receiver.json')
 
 
@@ -5108,6 +5109,41 @@ def handle_rpc(msg):
 
 
 # ------------------------------------------------------------ HTTP (recv) ---
+# Last-accepted-delivery high-water mark (#55). A session that waits on a
+# topic cannot tell "the repo is quiet" from "this box is deaf": the receiver
+# is the one process that knows when it last ACCEPTED a verified delivery, so
+# it records that in receiver.json and `status` reports it. Mechanism only —
+# what a stale timestamp means is the caller's judgement. Written at most once
+# per LAST_DELIVERY_MIN_S so a burst is one small write, which makes the
+# stored value up to that many seconds behind; "heard anything this hour?"
+# does not need more. Only the receiver that wrote the file (matching pid)
+# updates it, so a session peer never rewrites a daemon's advertisement.
+LAST_DELIVERY_MIN_S = 5
+_LAST_DELIVERY_LOCK = threading.Lock()
+_last_delivery_write_ms = [0]
+
+
+def note_accepted_delivery(source, key):
+    now = now_ms()
+    with _LAST_DELIVERY_LOCK:
+        if now - _last_delivery_write_ms[0] < LAST_DELIVERY_MIN_S * 1000:
+            return
+        info = receiver_info()
+        if not info or info.get('pid') != os.getpid():
+            return
+        info['lastDelivery'] = {'at': iso_at(now), 'source': source,
+                                'topic': '%s:%s' % (source, key) if key else source}
+        tmp = '%s.%d.tmp' % (RECEIVER_FILE, os.getpid())
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                fh.write(pretty(info) + '\n')
+            os.replace(tmp, RECEIVER_FILE)
+            _last_delivery_write_ms[0] = now
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
 def deliver(handler, body):
     def done(code, txt):
         data = txt.encode('utf-8')
@@ -5166,6 +5202,7 @@ def deliver(handler, body):
     if src.get('retainPayload') is True and not SPOOL_ENABLED:
         return done(503, 'payload retention requires the durable spool')
     if not SPOOL_ENABLED:
+        note_accepted_delivery(name, key)
         try:
             learn_merge(env, now_ms())
         except OSError:
@@ -5194,6 +5231,7 @@ def deliver(handler, body):
               % (name, delivery), file=sys.stderr)
         return done(200, 'ok (duplicate)')
     sid, at = accepted
+    note_accepted_delivery(name, key)
     with SPOOL_INFLIGHT_LOCK:
         SPOOL_INFLIGHT.add(sid)
     try:
