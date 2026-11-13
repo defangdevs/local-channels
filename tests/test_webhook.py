@@ -655,6 +655,32 @@ class TestPeerScope(StateDirCase):
         # mute the watch); a legacy name carries no scope, so it claims nothing.
         self.assertEqual(self.mod.peer_scopes_live(), ['alive'])
 
+    def test_peer_roster_lists_live_peers_with_topics_only(self):
+        # #27: who is live and what each claims; a dead peer's leftover
+        # filter file must read as absent, not as a second claimant.
+        inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
+        live = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        dead = subprocess.Popen([PYTHON, '-c', ''])
+        dead.wait()
+        for name in ('alive.%d.sock' % live.pid, 'gone.%d.sock' % dead.pid):
+            open(os.path.join(inst, name), 'w').close()
+        for key in ('alive', 'gone'):
+            with open(os.path.join(self.state, 'filter.%s.json' % key), 'w') as f:
+                json.dump({'topics': [{'topic': 'github:o/r', 'note': 'n-' + key}]}, f)
+        roster = self.mod.peer_roster()
+        self.assertEqual([r['session'] for r in roster], ['alive'])
+        self.assertEqual(roster[0]['pid'], live.pid)
+        self.assertEqual(roster[0]['topics'][0]['topic'], 'github:o/r')
+        self.assertEqual(roster[0]['topics'][0]['note'], 'n-alive')
+        res = self.mod.call_tool({'name': 'webhook_subscriptions',
+                                  'arguments': {'scope': 'all'}})
+        body = json.loads(res['content'][0]['text'].split('\n(expired')[0])
+        self.assertEqual([r['session'] for r in body['peers']], ['alive'])
+        res = self.mod.call_tool({'name': 'webhook_subscriptions', 'arguments': {}})
+        self.assertNotIn('peers', json.loads(res['content'][0]['text']))
+
 
 class TestFilterClaims(StateDirCase):
     """The read-only probe: does some other session already own this event?"""
