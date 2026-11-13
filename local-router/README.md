@@ -128,8 +128,8 @@ becomes a fallback.
 
 The routing call gets no tools. `claude -p` runs with `--tools ""`. `codex exec`
 runs with `--ignore-user-config` (no MCP servers or plugins from the user's
-config) and with its shell, unified-exec, code-mode, apps, browser, computer-use
-and web-search tools turned off, because its read-only sandbox blocks writes but
+config) and with its shell, unified-exec, code-mode, image-viewing, apps, browser,
+computer-use and web-search tools turned off, because its read-only sandbox blocks writes but
 not reads. On codex-cli 0.165.0 every tool call goes through the code-mode host, so with
 `features.code_mode_host=false` each call fails closed before it runs. Canaries
 outside the working directory confirmed it for a text file (exec), an image

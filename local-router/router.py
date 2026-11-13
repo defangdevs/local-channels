@@ -363,13 +363,16 @@ class CodexCLI(object):
     # with it off each call fails closed BEFORE it runs. Verified with canaries
     # outside the working directory: a text file via exec, an image via
     # view_image, and a real stdio MCP server whose tool never executed even with
-    # the user config loaded. --ignore-user-config is the second layer (the
+    # the user config loaded. Models can also use direct tool mode, which does
+    # not go through that host, so view_image (on by default) is turned off on
+    # its own. --ignore-user-config is the second layer (the
     # user's MCP servers and plugins are not even loaded); the other flags drop
     # tool families outright. Any tool item still makes complete() reject the
     # answer. Re-verify on every codex upgrade: tool dispatch may change.
     NO_TOOLS = ("--ignore-user-config",
                 "-c", "features.shell_tool=false", "-c", "features.unified_exec=false",
-                "-c", "features.code_mode_host=false", "-c", "features.apps=false",
+                "-c", "features.code_mode_host=false", "-c", "features.view_image=false",
+                "-c", "features.apps=false",
                 "-c", "features.browser_use=false", "-c", "features.computer_use=false",
                 "-c", "web_search=disabled")
 

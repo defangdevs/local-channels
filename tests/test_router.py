@@ -204,7 +204,7 @@ class ReviewFixes(unittest.TestCase):
         finally:
             router.subprocess.run = orig
         for flag in ("--ignore-user-config", "features.shell_tool=false", "features.code_mode_host=false",
-                     "features.unified_exec=false", "web_search=disabled"):
+                     "features.unified_exec=false", "features.view_image=false", "web_search=disabled"):
             self.assertIn(flag, seen[0])
 
     def test_codex_blocked_tool_attempt_is_rejected(self):
