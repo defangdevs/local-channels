@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.2'
+VERSION = '0.37.3'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -667,6 +667,44 @@ def filter_file_lock(path):
     finally:
         os.close(fd)
 
+
+
+# filter_file_lock() never unlinks its ".lock" (unlinking a lock someone holds
+# is the classic two-inodes race), and route_event() takes it on the read path
+# too, so every session key ever routed to leaves one behind — one per hook
+# session, forever (#61). Reap only the locks that guard NO filter: the sibling
+# ".json" is absent. A non-blocking flock is the probe — if anyone holds it, it
+# is in use, so skip — and the unlink happens while holding it. A lost mutual
+# exclusion on a never-written key protects nothing, so the residual race is
+# the one that already exists before a lock file is first created.
+def reap_orphan_filter_locks():
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return 0
+    reaped = 0
+    for n in names:
+        if not (n.startswith('filter.') and n.endswith('.json.lock')):
+            continue
+        lock = os.path.join(STATE_DIR, n)
+        if os.path.exists(lock[:-len('.lock')]):
+            continue
+        try:
+            fd = os.open(lock, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Re-check under the lock: a writer may have created the filter
+            # between the first look and the lock.
+            if not os.path.exists(lock[:-len('.lock')]):
+                os.unlink(lock)
+                reaped += 1
+        except OSError:
+            pass  # held (EWOULDBLOCK), or already gone
+        finally:
+            os.close(fd)
+    return reaped
 
 # Per-watch spawn config: an opaque, consumer-defined map carried on a
 # dispatch entry and handed to LOCAL_WEBHOOK_SPAWN_CMD as
@@ -3051,6 +3089,10 @@ def _spool_reaper_loop():
 
 def spool_start_owner():
     """Run by whichever process owns the ingress, once it does."""
+    try:
+        reap_orphan_filter_locks()
+    except Exception as e:  # noqa: BLE001 — hygiene must not keep the ingress down
+        print('local-webhook: lock reap failed: %s' % e, file=sys.stderr)
     if not SPOOL_ENABLED:
         return
     try:
