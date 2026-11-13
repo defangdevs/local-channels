@@ -1152,3 +1152,15 @@ may be missing until that event is delivered again. This hook carries source
 identity and payload separately, so a deployment can implement GitHub and
 Slack reactions without parsing the rendered prompt. It adds no transport
 reply tool or default external writes to local-webhook itself.
+
+
+## Who else is subscribed? (`peers`, #27)
+
+Delivery fans out: every live peer applies its own filter to each event.
+`webhook.py status` now carries `peers: {live, sessions: [...]}`, and
+`webhook_subscriptions` takes `scope: "all"` (CLI: `ls --scope all`) to add the
+same `peers` list. Each row is `{session, pid, self, enabled, topics}`, with
+topics rendered exactly like your own. A session counts only while its socket's
+pid is alive, so a crashed peer's leftover filter file reads as absent.
+The roster is read-only and says nothing about whether a shared topic is a
+problem; that judgement belongs to the consumer.
