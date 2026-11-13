@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.2'
+VERSION = '0.38.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -190,6 +190,8 @@ def pretty(obj):
 # Per-source keys (all optional except one of secret/secretFile):
 #   secret          inline secret string
 #   secretFile      path to secret file (relative paths resolve in STATE_DIR)
+#   previousSecret[File] + previousSecretUntil (ISO-8601): rotation overlap —
+#                   the retired secret also verifies until that time (issue #49)
 #   format          "github" | "generic"; default "github" iff the source is
 #                   named github, else "generic"
 #   verification    "hmac-hex" (default) | "token" | "standard-webhooks" — see
@@ -250,6 +252,40 @@ def source_secret(src):
         except OSError:
             pass
     return ''
+
+
+def _read_secret_value(inline, path):
+    if isinstance(inline, str) and inline.strip():
+        return inline.strip()
+    if isinstance(path, str) and path:
+        try:
+            p = path if os.path.isabs(path) else os.path.join(STATE_DIR, path)
+            with open(p, encoding='utf-8') as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return ''
+
+
+def previous_secret(src, now=None):
+    """The retired secret still accepted during a rotation overlap (issue #49).
+
+    Needs previousSecret/previousSecretFile AND a previousSecretUntil ISO-8601
+    timestamp in the future; a missing, unparseable or past expiry means no
+    overlap, so an overlap can never become permanent by accident."""
+    until = src.get('previousSecretUntil')
+    if not isinstance(until, str):
+        return ''
+    try:
+        dt = datetime.fromisoformat(until.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return ''
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    cur = now if now is not None else time.time()
+    if dt.timestamp() <= cur:
+        return ''
+    return _read_secret_value(src.get('previousSecret'), src.get('previousSecretFile'))
 
 
 # The sender signs the raw request body with HMAC-SHA256; the header carries
@@ -5130,8 +5166,17 @@ def deliver(handler, body):
         return done(404, 'unknown source')
 
     secret = source_secret(src)
-    if not secret or not verify_delivery(src, secret, handler.headers, body):
+    if not secret:
         return done(401, 'invalid signature')
+    if not verify_delivery(src, secret, handler.headers, body):
+        # Rotation overlap (#49): accept the retired secret until its expiry,
+        # and say so, so a sender nobody updated is visible.
+        prev = previous_secret(src)
+        if not prev or prev == secret or not verify_delivery(src, prev, handler.headers, body):
+            return done(401, 'invalid signature')
+        print('local-webhook: %s delivery verified with the PREVIOUS secret (valid until %s) — '
+              'update the sender to the new secret' % (name, src.get('previousSecretUntil')),
+              file=sys.stderr)
 
     try:
         payload = json.loads(body.decode('utf-8'))
