@@ -114,6 +114,7 @@ rc, out = cli('channel', 'add', 'C3')
 check('CLI: channel add C3 refused (bot not a member)', rc != 0, out[:120])
 cfg = json.load(open(CFG))
 cfg['C1'].update({'quiet_minutes': 0.1, 'resettle': True})
+cfg['C1'].setdefault('reactions', {})['ready'] = 'white_check_mark'
 cfg['C1'].setdefault('write', {})['allowed'] = True
 cfg.setdefault('_defaults', {}).setdefault('links', {})['allowed_hosts'] = ['github.com']
 json.dump(cfg, open(CFG, 'w'), indent=2)
@@ -203,7 +204,7 @@ p = posts[-1][3] if posts else {}
 check('W1 reply after a mention is sent (on_request allows it)', rc == 0 and posts, out[:160])
 check('W1 reply is threaded, unfurls off, mention resolved, link tokenised, disclosure appended',
       p.get('thread_ts') == A and p.get('unfurl_links') is False and p.get('unfurl_media') is False
-      and '<@U1>' in p.get('text', '') and '<https://github.com/defangdevs/agent-box/issues/863|github.com>' in p.get('text', '')
+      and '<@U1>' in p.get('text', '') and '<https://github.com/defangdevs/agent-box/issues/863|github.com/defangdevs/agent-box/issues/863>' in p.get('text', '')
       and 'AI agent' in p.get('text', ''), json.dumps(p)[:300])
 bot_ts = sorted([k[1] for k, m in mock.messages.items() if m.get('user') == 'UBOT' and k[0] == 'C1'])[-1] if posts else None
 for name, args in [('W2 ``@channel refused', ('reply', 'C1', A, '``@channel urgent')),
