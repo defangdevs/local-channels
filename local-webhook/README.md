@@ -5,7 +5,7 @@ HTTP (GitHub or any other sender that signs the raw body with HMAC-SHA256) and
 pushes a concise, untrusted-marked summary of each event into the Claude Code
 session that spawned it — or, since 0.26.0, into a
 [codex session](#delivering-into-a-codex-session-0260) via `codex queue`. Ships MCP tools (`webhook_subscribe`,
-`webhook_unsubscribe`, `webhook_subscriptions`) so the agent can route which
+`webhook_unsubscribe`, `webhook_subscriptions`, plus `webhook_mute` / `webhook_unmute` as a kill switch that keeps the list) so the agent can route which
 topics reach it — hot-reloaded per delivery, no session restart needed — plus an
 equivalent [CLI](#cli) for callers with no MCP client.
 
@@ -885,6 +885,8 @@ the two paths can't drift on TTL/renew semantics:
         --note "standing watch: new issues/PRs and failing CI spawn a fresh session"
     python3 webhook.py ls
     python3 webhook.py unsubscribe owner/repo
+    python3 webhook.py mute          # kill switch: enabled:false, topics kept
+    python3 webhook.py unmute        # enabled:true again
     python3 webhook.py status        # state dir, session, sources (no secrets),
                                      # and what is waiting in the spool
     python3 webhook.py emit budget '{"used_pct":92,"window":"5h"}' \

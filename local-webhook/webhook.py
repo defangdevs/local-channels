@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.2'
+VERSION = '0.38.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -516,7 +516,7 @@ def learned_numbers(e, source, key, event, payload, at):
 
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
-    "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
+    "webhook_unsubscribe. enabled=false mutes everything (webhook_mute / webhook_unmute write it); topics supports exact 'source:key' and prefix "
     "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; an entry's identity is "
     "(topic, name) — name defaults to '' (unnamed) so a plain topic still finds and renews the one entry "
     "it always did; give two subscribe calls on the same topic different names (#63) to keep them as two "
@@ -4285,6 +4285,7 @@ INSTRUCTIONS = (
     'Some sources retain full untrusted payloads: use webhook.py read-content ID from the reference in a delivery; '
     'the reference expires independently of delivery. '
     'Routing is controlled by the tools webhook_subscribe / webhook_unsubscribe / webhook_subscriptions, '
+    'with webhook_mute / webhook_unmute as a kill switch that keeps the list, '
     'which manage topic patterns of the form "source:key" — e.g. github:owner/repo or github:owner/*; a '
     'bare "owner/repo" is shorthand for github:owner/repo. There is no pattern for a whole source or the '
     'whole bus, so name what you actually want. Subscribe '
@@ -4632,6 +4633,44 @@ TOOLS = [
         },
     },
     {
+        'name': 'webhook_mute',
+        'description':
+            'Kill switch (#23): stop ALL delivery to this session at once WITHOUT losing its subscription list. '
+            'Writes enabled:false and keeps every topic, so webhook_unmute restores exactly what was listening. '
+            'Use it to silence a flood in one call instead of N unsubscribes. Works on a session whose filter '
+            'file does not exist yet (it writes one with no topics). Pass deliver_to:"subagent" to mute the '
+            'shared dispatch (standing-watch) list instead. Idempotent. Note: a later webhook_subscribe '
+            'writes enabled:true again, since subscribing is an explicit ask to listen. '
+            'webhook_subscriptions reports the state as `enabled`.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'deliver_to': {
+                    'type': 'string',
+                    'enum': ['session', 'subagent'],
+                    'description': 'Which list to mute: "session" (default) or the shared "subagent" dispatch list.',
+                },
+            },
+        },
+    },
+    {
+        'name': 'webhook_unmute',
+        'description':
+            'Undo webhook_mute: write enabled:true, so this session\'s kept subscriptions deliver again. '
+            'Does not add or renew anything — expired topics stay expired. Pass deliver_to:"subagent" for the '
+            'shared dispatch list. Idempotent.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'deliver_to': {
+                    'type': 'string',
+                    'enum': ['session', 'subagent'],
+                    'description': 'Which list to unmute: "session" (default) or the shared "subagent" dispatch list.',
+                },
+            },
+        },
+    },
+    {
         'name': 'webhook_subscriptions',
         'description': 'Return this session\'s topic subscriptions, the shared dispatch (standing-watch) '
                        'list if any, and the channel-enabled flag.',
@@ -4768,6 +4807,20 @@ def call_tool(params):
 
         f, expired = pruned(path)
         expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
+
+        # The two verbs that write `enabled` and nothing else (#23). Until
+        # 0.38.0 nothing wrote enabled:false, so the flag read_filter and the
+        # fan-out already honoured was reachable only by hand-editing the
+        # state file — which forks the write path (TTL stamps, atomic replace,
+        # the locks held here) into whoever supervises the session.
+        if name in ('webhook_mute', 'webhook_unmute'):
+            on = name == 'webhook_unmute'
+            was = f['enabled']
+            write_filter({**f, 'enabled': on}, path)
+            return text('%s%s (was %s; %d topic%s kept)%s' % (
+                'unmuted' if on else 'muted', ' [dispatch]' if dispatch else '',
+                'listening' if was else 'muted', len(f['topics']),
+                '' if len(f['topics']) == 1 else 's', expired_note))
 
         topic = str(arguments.get('topic') if arguments.get('topic') is not None else '').strip()
         if GH_SHORTHAND.match(topic):
@@ -5349,10 +5402,17 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
                                   [--spawn-config KEY=VALUE]... [--read-only]
                                   [--spawn-window SECONDS]
        webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
+       webhook.py mute [--deliver-to MODE]
+       webhook.py unmute [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
        webhook.py read-content ID
        webhook.py ls
        webhook.py status
+
+mute writes enabled:false (nothing is delivered, every topic is kept); unmute
+writes enabled:true. Both are idempotent, act on the session named by
+LOCAL_WEBHOOK_SESSION, and `ls`/`status` report the result as `enabled`. A
+later `subscribe` writes enabled:true again.
 
 TOPIC is "source:key" — "github:owner/repo" (exact) or "github:owner/*"
 (prefix). A bare "owner/repo" means github. There is no wildcard for a whole
@@ -5678,6 +5738,7 @@ def run_cli(argv):
         return run_emit(argv[1:], die)
 
     tool_for = {'subscribe': 'webhook_subscribe', 'unsubscribe': 'webhook_unsubscribe',
+                'mute': 'webhook_mute', 'unmute': 'webhook_unmute',
                 'ls': 'webhook_subscriptions', 'subscriptions': 'webhook_subscriptions'}
     tool = tool_for.get(cmd)
     if not tool:
@@ -5782,7 +5843,9 @@ def run_cli(argv):
         args['ignore_senders'] = ignore_senders
     if saw_spawn_config:
         args['spawn_config'] = spawn_config
-    if tool != 'webhook_subscriptions' and 'topic' not in args:
+    if tool in ('webhook_mute', 'webhook_unmute') and 'topic' in args:
+        die('%s takes no TOPIC; it acts on the whole list (--deliver-to picks which)' % cmd)
+    if tool not in ('webhook_subscriptions', 'webhook_mute', 'webhook_unmute') and 'topic' not in args:
         die('%s needs a TOPIC\n\n%s' % (cmd, CLI_USAGE))
 
     res = call_tool({'name': tool, 'arguments': args})

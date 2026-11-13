@@ -815,6 +815,46 @@ class TestCallTool(StateDirCase):
         self.assertEqual(body['filterState'], 'invalid')
         self.assertIn('unparseable', body['warning'])
 
+    def test_mute_and_unmute_write_only_enabled(self):
+        """#23: the kill switch keeps the list, is idempotent, and routes nothing."""
+        self.call('webhook_subscribe', topic='o/r', note='keep me')
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
+        out = self.call('webhook_mute')
+        self.assertIn('muted', out)
+        self.assertIn('was listening', out)
+        self.assertFalse(self.read_json(os.path.basename(self.mod.FILTER_FILE))['enabled'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertIs(body['enabled'], False)
+        self.assertEqual([t['topic'] for t in body['topics']], ['github:o/r'])
+        self.assertEqual(body['topics'][0]['note'], 'keep me')
+        self.assertIn('was muted', self.call('webhook_mute'))  # idempotent
+        self.assertIn('unmuted', self.call('webhook_unmute'))
+        self.assertIn('was listening', self.call('webhook_unmute'))
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
+        self.assertIs(json.loads(self.call('webhook_subscriptions'))['enabled'], True)
+
+    def test_mute_works_with_no_filter_file(self):
+        self.assertFalse(os.path.exists(self.mod.FILTER_FILE))
+        self.call('webhook_mute')
+        f = self.read_json(os.path.basename(self.mod.FILTER_FILE))
+        self.assertIs(f['enabled'], False)
+        self.assertEqual(f['topics'], [])
+
+    def test_subscribe_after_mute_listens_again(self):
+        self.call('webhook_mute')
+        self.call('webhook_subscribe', topic='o/r')
+        self.assertIs(json.loads(self.call('webhook_subscriptions'))['enabled'], True)
+
+    def test_mute_dispatch_list_leaves_session_list_alone(self):
+        self.call('webhook_subscribe', topic='o/r')
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent',
+                  include={'path': 'action', 'in': ['opened']})
+        self.assertIn('[dispatch]', self.call('webhook_mute', deliver_to='subagent'))
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertIs(body['enabled'], True)
+        self.assertIs(body['dispatch']['enabled'], False)
+
     def test_subscriptions_marks_a_surviving_wildcard_entry(self):
         """A 0.12.x filter carried across the upgrade shows its dead rows as
         dead, so a consumer never re-derives the grammar to find them."""
