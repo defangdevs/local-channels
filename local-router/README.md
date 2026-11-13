@@ -130,11 +130,14 @@ The routing call gets no tools. `claude -p` runs with `--tools ""`. `codex exec`
 runs with `--ignore-user-config` (no MCP servers or plugins from the user's
 config) and with its shell, unified-exec, code-mode, image-viewing, apps, browser,
 computer-use and web-search tools turned off, because its read-only sandbox blocks writes but
-not reads. On codex-cli 0.165.0 every tool call goes through the code-mode host, so with
-`features.code_mode_host=false` each call fails closed before it runs. Canaries
-outside the working directory confirmed it for a text file (exec), an image
-(`view_image`) and a real MCP server, whose tool never ran even with the user
-config loaded. Any Codex run that still
+not reads. On codex-cli 0.165.0, a model calls tools either through the code-mode host or
+directly. With `features.code_mode_host=false`, code-mode calls fail closed
+before they run: canaries outside the working directory confirmed it for a text
+file (exec), an image (`view_image`) and a real MCP server, whose tool never ran
+even with the user config loaded. For direct mode, each read-capable tool family
+has its own flag turned off as well (`view_image` is only registered when its
+feature is on); no installed model was found that uses direct mode, so that path
+is covered by the flags, not by a canary run. Any Codex run that still
 shows a tool item, or a blocked tool attempt, is rejected, so its answer never
 reaches the caller. Codex adds tool families over time: re-check the flags when
 the CLI is upgraded. Where inbound text is hostile, run the router as a user that

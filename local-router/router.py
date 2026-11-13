@@ -358,17 +358,18 @@ class CodexCLI(object):
     name = "codex"
     ALLOWED_ITEMS = ("agent_message", "reasoning")
     # Every tool family codex-cli 0.165.0 exposes that can read host data.
-    # The load-bearing flag is code_mode_host=false: in 0.165.0 every tool call
-    # (exec, view_image, MCP tools) is dispatched through the code-mode host, and
-    # with it off each call fails closed BEFORE it runs. Verified with canaries
-    # outside the working directory: a text file via exec, an image via
-    # view_image, and a real stdio MCP server whose tool never executed even with
-    # the user config loaded. Models can also use direct tool mode, which does
-    # not go through that host, so view_image (on by default) is turned off on
-    # its own. --ignore-user-config is the second layer (the
-    # user's MCP servers and plugins are not even loaded); the other flags drop
-    # tool families outright. Any tool item still makes complete() reject the
-    # answer. Re-verify on every codex upgrade: tool dispatch may change.
+    # Codex calls tools in one of two modes, chosen per model. In code mode,
+    # every call (exec, view_image, MCP tools) goes through the code-mode host,
+    # and code_mode_host=false makes each one fail closed BEFORE it runs:
+    # verified with canaries outside the working directory (a text file via
+    # exec, an image via view_image, a real stdio MCP server whose tool never
+    # executed even with the user config loaded). In direct mode the host is not
+    # involved, so each read-capable family is also turned off by its own flag:
+    # view_image is only registered when features.view_image is on, and
+    # --ignore-user-config keeps the user's MCP servers and plugins from loading.
+    # Direct mode itself was not exercised here (no installed model was found to
+    # use it). Any tool item still makes complete() reject the answer.
+    # Re-verify on every codex upgrade: tool dispatch may change.
     NO_TOOLS = ("--ignore-user-config",
                 "-c", "features.shell_tool=false", "-c", "features.unified_exec=false",
                 "-c", "features.code_mode_host=false", "-c", "features.view_image=false",
