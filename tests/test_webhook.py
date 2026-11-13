@@ -4120,6 +4120,47 @@ class TestEndToEnd(EndToEndCase):
         msg = self.read_peer_line(peer)
         self.assertEqual(msg['params']['meta']['event'], 'issues')
 
+    def _rollbar_post(self, query):
+        raw = b'{"event_name":"new_item","data":{"item":{"project_id":77}}}'
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/rollbar' + query, raw, {'content-type': 'application/json'})
+        resp = conn.getresponse()
+        out = (resp.status, resp.read().decode())
+        conn.close()
+        return out
+
+    def test_query_token_source_reaches_a_peer_with_event_from_body(self):
+        """#31: Rollbar signs nothing; the secret is a URL query parameter and
+        the event name is in the body at event_name."""
+        self.add_source('rollbar', format='generic', verification='query-token',
+                        eventPath='event_name', keyPath='data.item.project_id')
+        r = self.cli('subscribe', 'rollbar:77', '--note', 'rollbar', session='peersess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer = self.start_peer('peersess')
+        self.assertEqual(self._rollbar_post('?token=' + self.SECRET), (200, 'ok'))
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['params']['meta']['event'], 'new_item')
+        self.assertEqual(msg['params']['meta']['key'], '77')
+
+    def test_query_token_source_rejects_missing_wrong_and_header_tokens(self):
+        self.add_source('rollbar', format='generic', verification='query-token')
+        self.start_daemon()
+        for q in ('', '?token=nope', '?other=' + self.SECRET, '?token=', '?token=%ff'):
+            self.assertEqual(self._rollbar_post(q), (401, 'invalid signature'), q)
+        # A header carrying the secret is not accepted in this mode.
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/rollbar', b'{}', {'x-gitlab-token': self.SECRET})
+        self.assertEqual(conn.getresponse().status, 401)
+        conn.close()
+
+    def test_query_token_param_name_is_configurable(self):
+        self.add_source('rollbar', format='generic', verification='query-token',
+                        tokenParam='auth')
+        self.start_daemon()
+        self.assertEqual(self._rollbar_post('?auth=' + self.SECRET), (200, 'ok'))
+        self.assertEqual(self._rollbar_post('?token=' + self.SECRET)[0], 401)
+
     def test_gitlab_style_token_source_rejects_wrong_token(self):
         self.add_source('gitlab', format='generic', verification='token',
                         keyPath='project.path_with_namespace')

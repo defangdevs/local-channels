@@ -45,9 +45,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
-VERSION = '0.37.2'
+VERSION = '0.38.0'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -192,18 +192,24 @@ def pretty(obj):
 #   secretFile      path to secret file (relative paths resolve in STATE_DIR)
 #   format          "github" | "generic"; default "github" iff the source is
 #                   named github, else "generic"
-#   verification    "hmac-hex" (default) | "token" | "standard-webhooks" — see
-#                   verify()/verify_token()/verify_standard_webhooks() below.
+#   verification    "hmac-hex" (default) | "token" | "standard-webhooks" |
+#                   "query-token" — see verify()/verify_token()/
+#                   verify_standard_webhooks()/verify_query_token() below.
 #                   Picks signatureHeader's default too (see _DEFAULT_
 #                   SIGNATURE_HEADER), so an unmigrated source keeps verifying
 #                   the way it always did.
 #   signatureHeader default depends on verification (see above); value is the
 #                   signature in that mode's own shape
+#   tokenParam      query-token only; default "token" — the URL query
+#                   parameter that carries the secret
 #   idHeader        standard-webhooks only; default "webhook-id"
 #   timestampHeader standard-webhooks only; default "webhook-timestamp" — a
 #                   value further than STANDARD_WEBHOOKS_TOLERANCE_SECONDS
 #                   from now is refused as a possible replay
 #   eventHeader     default "x-github-event" (github) / "x-webhook-event"
+#   eventPath       dot-path into the JSON payload yielding the event name,
+#                   tried after the event header and before the "event" and
+#                   "type" fallbacks (Rollbar: "event_name")
 #   deliveryHeader  default "x-github-delivery" / "x-webhook-delivery"
 #   retainPayload   true retains the full payload after delivery (bounded, 24h);
 #                   summaries include a read-content reference; requires spool
@@ -276,6 +282,29 @@ def verify_token(secret, header_value):
     return hmac.compare_digest(provided, secret.encode('utf-8'))
 
 
+# "query-token" verification mode: the secret rides in the request URL's query
+# string (Rollbar: https://host/webhook/rollbar?token=...), because that sender
+# signs nothing and has no field for a custom header. This is the WEAKEST mode,
+# weaker than "hmac-hex" and no better than "token": the secret is in the
+# request line, so every proxy and access log on the path records it, and a
+# leaked log line leaks the secret outright. It exists only because that
+# sender offers nothing else; opt in per source, and keep the front door's
+# access log off the query string where you can.
+def verify_query_token(secret, query, param):
+    expected = secret.encode('utf-8')
+    ok = False
+    try:
+        values = parse_qs(query, keep_blank_values=True).get(param, [])
+    except ValueError:
+        return False
+    for v in values:
+        # Check every value, so a repeated parameter cannot hide a match behind
+        # an early return; surrogateescape for the same reason as verify_token.
+        if hmac.compare_digest(v.encode('utf-8', 'surrogateescape'), expected):
+            ok = True
+    return ok
+
+
 # "standard-webhooks" verification mode: https://www.standardwebhooks.com/ —
 # GitLab's own "signing token" (19.0+, on by default) uses this shape, and so
 # does any other Standard-Webhooks sender. Two differences from "hmac-hex":
@@ -326,12 +355,13 @@ def verify_standard_webhooks(secret, sig_header, id_header, timestamp_header, bo
     return False
 
 
-VERIFICATION_MODES = ('hmac-hex', 'token', 'standard-webhooks')
+VERIFICATION_MODES = ('hmac-hex', 'token', 'standard-webhooks', 'query-token')
 # Per-mode default signatureHeader, used when a source doesn't set its own.
 _DEFAULT_SIGNATURE_HEADER = {
     'hmac-hex': 'x-hub-signature-256',
     'token': 'x-gitlab-token',
     'standard-webhooks': 'webhook-signature',
+    'query-token': '',  # unused: the secret is in the URL, not a header
 }
 
 
@@ -339,9 +369,12 @@ def source_verification(src):
     return src.get('verification') if src.get('verification') in VERIFICATION_MODES else 'hmac-hex'
 
 
-def verify_delivery(src, secret, headers, body):
+def verify_delivery(src, secret, headers, body, query=''):
     """Dispatches to the source's verification mode (default "hmac-hex")."""
     mode = source_verification(src)
+    if mode == 'query-token':
+        param = src.get('tokenParam') if isinstance(src.get('tokenParam'), str) and src.get('tokenParam') else 'token'
+        return verify_query_token(secret, query, param)
     sig_header = src.get('signatureHeader') if isinstance(src.get('signatureHeader'), str) \
         else _DEFAULT_SIGNATURE_HEADER[mode]
     if mode == 'hmac-hex':
@@ -5130,7 +5163,11 @@ def deliver(handler, body):
         return done(404, 'unknown source')
 
     secret = source_secret(src)
-    if not secret or not verify_delivery(src, secret, handler.headers, body):
+    try:
+        query = urlsplit(handler.path).query
+    except ValueError:
+        query = ''
+    if not secret or not verify_delivery(src, secret, handler.headers, body, query):
         return done(401, 'invalid signature')
 
     try:
@@ -5143,6 +5180,12 @@ def deliver(handler, body):
     event_header = src.get('eventHeader') if isinstance(src.get('eventHeader'), str) else \
         ('x-github-event' if fmt == 'github' else 'x-webhook-event')
     ev = handler.headers.get(event_header)
+    if ev is None and isinstance(src.get('eventPath'), str) and src.get('eventPath'):
+        v = get_path(payload, src['eventPath'])
+        # Only a scalar names an event; a dict or list here is a misconfigured
+        # path, and falls through to the fallbacks rather than printing JSON.
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+            ev = v
     if ev is None:
         ev = g(payload, 'event')
     if ev is None:
@@ -5578,7 +5621,11 @@ def run_emit(rest, die):
         'Content-Type': 'application/json',
         delivery_header: delivery_id or 'emit-' + os.urandom(8).hex(),
     }
-    if verification == 'hmac-hex':
+    path = '/' + source
+    if verification == 'query-token':
+        param = src.get('tokenParam') if isinstance(src.get('tokenParam'), str) and src.get('tokenParam') else 'token'
+        path += '?' + urlencode({param: secret})
+    elif verification == 'hmac-hex':
         headers[sig_header] = 'sha256=' + hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest()
     elif verification == 'token':
         headers[sig_header] = secret
@@ -5611,7 +5658,7 @@ def run_emit(rest, die):
             conn.sock = s  # pre-connected: HTTPConnection only knows how to dial TCP
         else:
             conn = http.client.HTTPConnection('127.0.0.1', where, timeout=10)
-        conn.request('POST', '/' + source, body, headers)
+        conn.request('POST', path, body, headers)
         resp = conn.getresponse()
         status, text = resp.status, resp.read().decode('utf-8', 'replace')
         conn.close()
