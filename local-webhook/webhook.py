@@ -4753,6 +4753,8 @@ def call_tool(params):
             return render_entry(e, default_ttl, now)
 
         if name == 'webhook_subscriptions':
+            if arguments.get('scope', _MISSING) not in (_MISSING, 'all'):
+                return text('error: scope must be "all"')
             f, expired = pruned(FILTER_FILE)
             body = {'enabled': f['enabled'], 'ttlHours': f['ttlHours']}
             if SELF:
@@ -5392,7 +5394,7 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
        webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
        webhook.py read-content ID
-       webhook.py ls
+       webhook.py ls [--scope all]   (all: also list other live peers' claims)
        webhook.py status
 
 TOPIC is "source:key" — "github:owner/repo" (exact) or "github:owner/*"

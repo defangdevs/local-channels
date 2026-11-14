@@ -809,6 +809,11 @@ class TestCallTool(StateDirCase):
         self.call('webhook_unsubscribe', topic='o/r')
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'][0]['topic'], 'github:o/r')
 
+    def test_subscriptions_rejects_invalid_scope(self):
+        out = self.call('webhook_subscriptions', scope='al')
+        self.assertIn('scope must be "all"', out)
+        self.assertIn('peers', json.loads(self.call('webhook_subscriptions', scope='all')))
+
     def test_subscriptions_lists_both_scopes(self):
         self.call('webhook_subscribe', topic='o/r', note='mine')
         self.call('webhook_subscribe', topic='p/q', deliver_to='subagent', note='watch', include=ANY_EVENT)
