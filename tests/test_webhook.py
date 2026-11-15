@@ -3693,10 +3693,17 @@ class TestEndToEnd(EndToEndCase):
                                         previousSecretUntil='2999-01-01T00:00:00Z')
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(cfg, f)
+        r = self.cli('subscribe', 'o/r', '--note', 'overlap',
+                     '--include', self.ANY_EVENT_JSON, session='overlapsess')
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.start_daemon()
+        peer = self.start_peer('overlapsess')
         raw = json.dumps(self.ISSUE).encode()
         old_sig = 'sha256=' + hmac_mod.new(old.encode(), raw, hashlib.sha256).hexdigest()
         self.assertEqual(self.post(raw, sig=old_sig)[0], 200)
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['method'], 'notifications/claude/channel')
+        self.assertIn('issue #5 opened on o/r', json.dumps(msg))
         self.assertEqual(self.post(raw, sig='sha256=' + hmac_mod.new(b'nope', raw, hashlib.sha256).hexdigest())[0], 401)
         cfg['sources']['github']['previousSecretUntil'] = '2000-01-01T00:00:00Z'
         with open(path, 'w', encoding='utf-8') as f:
