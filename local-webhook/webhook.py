@@ -3004,6 +3004,19 @@ def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
 # ---- the session side: one peer drains its own box ----
 MY_INBOX = peer_queue(FILTER_KEY)
 INBOX_READY = threading.Event()
+# Set once notifications/initialized arrives. From then on the settle timer,
+# not the grace fallback, opens the inbox.
+INBOX_INITIALIZED = threading.Event()
+_INBOX_READY_LOCK = threading.Lock()
+
+
+def open_inbox_after_grace():
+    """The SPOOL_READY_GRACE_S fallback, for a client that never sends
+    notifications/initialized. A handshake that came first owns the opening,
+    so a late one (29.9 s) still gets its full settle time."""
+    with _INBOX_READY_LOCK:
+        if not INBOX_INITIALIZED.is_set():
+            INBOX_READY.set()
 INBOX_WAKE = threading.Event()
 
 
@@ -3680,7 +3693,7 @@ if not RECEIVER_ONLY and not CLI:
             # Socket before drain: an event spooled before the socket existed
             # is found by the drain, one spooled after it gets a doorbell.
             threading.Thread(target=_inbox_loop, daemon=True).start()
-            _grace = threading.Timer(SPOOL_READY_GRACE_S, INBOX_READY.set)
+            _grace = threading.Timer(SPOOL_READY_GRACE_S, open_inbox_after_grace)
             _grace.daemon = True
             _grace.start()
     except OSError as e:
@@ -5509,8 +5522,10 @@ def stdin_loop():
 
 def inbox_ready_after_settle():
     """Open the inbox SPOOL_READY_SETTLE_MS after the client's handshake."""
-    if INBOX_READY.is_set():
-        return
+    with _INBOX_READY_LOCK:
+        if INBOX_INITIALIZED.is_set() or INBOX_READY.is_set():
+            return
+        INBOX_INITIALIZED.set()
     if not SPOOL_READY_SETTLE_MS:
         INBOX_READY.set()
         return

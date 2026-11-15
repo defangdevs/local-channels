@@ -98,6 +98,35 @@ class StateDirCase(unittest.TestCase):
             json.dump(obj, f)
 
 
+class TestInboxReady(StateDirCase):
+    """0.39.1: the inbox opens SPOOL_READY_SETTLE_MS after the handshake, and
+    the grace fallback only serves a client that never sends one."""
+
+    def test_grace_fallback_does_not_cut_a_late_handshake_short(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.SPOOL_READY_SETTLE_MS = 60_000       # the settle timer will not fire here
+        m.inbox_ready_after_settle()           # the handshake, at 29.9 s
+        m.open_inbox_after_grace()             # the grace timer, at 30 s
+        self.assertFalse(m.INBOX_READY.is_set())
+
+    def test_grace_fallback_opens_without_a_handshake(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.open_inbox_after_grace()
+        self.assertTrue(m.INBOX_READY.is_set())
+
+    def test_zero_settle_opens_at_the_handshake(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.SPOOL_READY_SETTLE_MS = 0
+        m.inbox_ready_after_settle()
+        self.assertTrue(m.INBOX_READY.is_set())
+
+
 class TestVerify(StateDirCase):
     BODY = b'{"a":1}'
     import hashlib as _h
