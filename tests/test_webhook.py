@@ -4837,6 +4837,75 @@ class TestSpoolEndToEnd(EndToEndCase):
             self.assertRegex(n, r'^[0-9a-f]{40}$')
 
 
+class TestReapOrphanFilterLocks(StateDirCase):
+    def touch(self, name):
+        path = os.path.join(self.state, name)
+        open(path, 'w').close()
+        return path
+
+    def test_reaps_only_locks_without_a_filter(self):
+        orphan = self.touch('filter.hook-gone.json.lock')
+        kept_json = self.touch('filter.live.json')
+        kept_lock = self.touch('filter.live.json.lock')
+        other = self.touch('sources.json.lock')
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertTrue(os.path.exists(kept_json))
+        self.assertTrue(os.path.exists(kept_lock))
+        self.assertTrue(os.path.exists(other))
+
+    def test_skips_a_lock_somebody_holds(self):
+        import fcntl
+        held = self.touch('filter.hook-busy.json.lock')
+        fd = os.open(held, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 0)
+        self.assertTrue(os.path.exists(held))
+
+    def test_a_reaped_key_can_lock_again(self):
+        path = os.path.join(self.state, 'filter.hook-x.json')
+        with self.mod.filter_file_lock(path):
+            pass
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        with self.mod.filter_file_lock(path):
+            self.assertTrue(os.path.exists(path + '.lock'))
+
+    def test_waiter_retries_when_its_lock_is_unlinked(self):
+        import fcntl
+        import threading
+        from unittest import mock
+        path = os.path.join(self.state, 'filter.hook-race.json')
+        lock = path + '.lock'
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        seen = []
+
+        def waiter():
+            with self.mod.filter_file_lock(path):
+                seen.append(os.stat(lock).st_ino)
+
+        opened = threading.Event()
+        real_open = os.open
+
+        def open_and_signal(p, *a, **k):
+            fd = real_open(p, *a, **k)
+            if p == lock and threading.current_thread() is t:
+                opened.set()  # waiter now holds the OLD inode
+            return fd
+
+        t = threading.Thread(target=waiter)
+        with mock.patch.object(self.mod.os, 'open', open_and_signal):
+            t.start()
+            self.assertTrue(opened.wait(5))
+            os.unlink(lock)
+            os.close(holder)  # releases; waiter locks the orphaned inode
+            t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(os.path.exists(lock))
+
+
 class TestVersionConsistency(unittest.TestCase):
     """The release invariants AGENTS.md states, enforced."""
 
