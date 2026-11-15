@@ -727,6 +727,23 @@ class TestReviewRegressions(Rig):
         long = slack.link_label('https://github.com/' + 'a' * 100)
         self.assertTrue(long.startswith('github.com/aaa') and len(long) == 60 and long.endswith('\u2026'))
 
+    def test_link_label_never_cuts_host(self):
+        host = 'a' * 55 + '.example.com'
+        self.assertEqual(slack.link_label('https://%s/x/y' % host), host)
+
+    def test_markup_check_not_quadratic(self):
+        import time
+        t = time.time()
+        self.assertIsNone(slack._MARKUP_RE.search('<' + '|' * 50000))
+        self.assertLess(time.time() - t, 1)
+
+    def test_disclosure_with_ampersand_not_doubled(self):
+        d = '_AI & automation_'
+        cfg = slack._merge(slack.DEFAULT_CHANNEL, {})
+        dfl = slack._merge(slack.DEFAULT_DEFAULTS, {})
+        body = slack.compose('hi\n\n' + d, lambda k, n: None, cfg, dfl)
+        self.assertEqual(slack.with_disclosure(body, d), body)
+
     def test_agent_link_markup_refused(self):
         cfg = slack._merge(slack.DEFAULT_CHANNEL, {})
         dfl = slack._merge(slack.DEFAULT_DEFAULTS, {'links': {'allowed_hosts': ['github.com']}})

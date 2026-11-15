@@ -178,19 +178,24 @@ def link_label(url, limit=60):
     """Host always, then as much of the path as fits: the reader sees which page."""
     p = urllib.parse.urlsplit(url)
     label = (p.hostname or '') + (p.path.rstrip('/') if p.path != '/' else '')
+    host = p.hostname or ''
     if len(label) > limit:
-        label = label[:limit - 1] + '\u2026'
+        # Cut the path, never the host: the host may exceed the limit alone.
+        room = limit - len(host) - 1
+        label = host + (p.path.rstrip('/')[:room] + '\u2026' if room > 0 else '')
     return label.replace('|', '').replace('<', '').replace('>', '')
 
 
-_MARKUP_RE = re.compile(r'<(?:https?:[^>\s]*|[^<>\s]*\|[^<>]*)>', re.I)
+_MARKUP_RE = re.compile(r'<(?:https?:[^>\s]*|[^<>\s|]*\|[^<>]*)>', re.I)
 _EMAIL_RE = re.compile(r'(?<![\w.+-])[\w.+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b')
 _URL_TAIL = '.,;:!?\'"'
 
 
 def with_disclosure(body, disclosure):
     """Append the disclosure line unless the body already ends with it."""
-    if not disclosure or body.rstrip().endswith(disclosure.strip()):
+    # compose() already escaped the body, so compare in that representation.
+    esc = disclosure and disclosure.strip().replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    if not disclosure or body.rstrip().endswith(disclosure.strip()) or body.rstrip().endswith(esc):
         return body
     return body + '\n\n' + disclosure
 
