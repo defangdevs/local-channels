@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.39.0'
+VERSION = '0.39.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -2225,6 +2225,13 @@ SPOOL_TMP_MAX_S = 3600
 # MCP initialization is done, so its backlog waits for that — or for this long,
 # for a client that never sends it.
 SPOOL_READY_GRACE_S = 30
+# ...and then this much longer. Claude Code sends notifications/initialized
+# BEFORE it registers its channel handler (2.1.322: about 90 ms later, in its
+# MCP log as "Channel notifications registered"), and it drops a channel
+# notification that arrives in between. A backlog drained at once was lost
+# that way: the message the router sent to a session it had just woken never
+# reached it. The client sends no later signal, so wait a fixed settle time.
+SPOOL_READY_SETTLE_MS = max(0, _int_env('LOCAL_WEBHOOK_SPOOL_SETTLE_MS', default=2000))
 
 # Names. A delivery id is sender-supplied and, unlike the body, NOT covered by
 # the signature, so it never reaches a path as written unless it is plainly
@@ -2997,6 +3004,19 @@ def spool_process(sid, env, at, live, enqueue, digest='', phase='new'):
 # ---- the session side: one peer drains its own box ----
 MY_INBOX = peer_queue(FILTER_KEY)
 INBOX_READY = threading.Event()
+# Set once notifications/initialized arrives. From then on the settle timer,
+# not the grace fallback, opens the inbox.
+INBOX_INITIALIZED = threading.Event()
+_INBOX_READY_LOCK = threading.Lock()
+
+
+def open_inbox_after_grace():
+    """The SPOOL_READY_GRACE_S fallback, for a client that never sends
+    notifications/initialized. A handshake that came first owns the opening,
+    so a late one (29.9 s) still gets its full settle time."""
+    with _INBOX_READY_LOCK:
+        if not INBOX_INITIALIZED.is_set():
+            INBOX_READY.set()
 INBOX_WAKE = threading.Event()
 
 
@@ -3579,7 +3599,11 @@ def handle_ipc_envelope(env):
     if (SPOOL_ENABLED and isinstance(sp, dict) and isinstance(sp.get('id'), str)
             and SPOOL_NAME.match(sp['id']) and isinstance(sp.get('keys'), list)
             and FILTER_KEY in sp['keys'] and os.path.exists(IPC_INBOX_MARKER)):
-        inbox_take(sp['id'])
+        # Before the inbox is open the client may not take a notification
+        # yet (see SPOOL_READY_SETTLE_MS): leave the copy spooled; the drain
+        # loop delivers it once the inbox opens.
+        if INBOX_READY.is_set():
+            inbox_take(sp['id'])
         return
     handle_event(env)
 
@@ -3669,7 +3693,7 @@ if not RECEIVER_ONLY and not CLI:
             # Socket before drain: an event spooled before the socket existed
             # is found by the drain, one spooled after it gets a doorbell.
             threading.Thread(target=_inbox_loop, daemon=True).start()
-            _grace = threading.Timer(SPOOL_READY_GRACE_S, INBOX_READY.set)
+            _grace = threading.Timer(SPOOL_READY_GRACE_S, open_inbox_after_grace)
             _grace.daemon = True
             _grace.start()
     except OSError as e:
@@ -5496,13 +5520,27 @@ def stdin_loop():
     sys.exit(0)
 
 
+def inbox_ready_after_settle():
+    """Open the inbox SPOOL_READY_SETTLE_MS after the client's handshake."""
+    with _INBOX_READY_LOCK:
+        if INBOX_INITIALIZED.is_set() or INBOX_READY.is_set():
+            return
+        INBOX_INITIALIZED.set()
+    if not SPOOL_READY_SETTLE_MS:
+        INBOX_READY.set()
+        return
+    timer = threading.Timer(SPOOL_READY_SETTLE_MS / 1000.0, INBOX_READY.set)
+    timer.daemon = True
+    timer.start()
+
+
 def handle_rpc(msg):
     if not isinstance(msg, dict) or msg.get('id') is None:
         # The one notification that matters: the client has finished MCP
         # initialization, so a backlog drained from the spool now has
         # somewhere to land.
         if isinstance(msg, dict) and msg.get('method') == 'notifications/initialized':
-            INBOX_READY.set()
+            inbox_ready_after_settle()
         return
 
     def reply(result):

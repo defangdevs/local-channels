@@ -175,10 +175,14 @@ check('E4/E5/E6 unfurl edit, bot echo and unconfigured channel produce nothing',
 mock.event('Ev7', {'type': 'reaction_added', 'user': 'UGUEST', 'reaction': 'white_check_mark',
                    'item': {'type': 'message', 'channel': 'C1', 'ts': B}, 'event_ts': '1760500007.000100'})
 pump(3)
-check('E7 a guest cannot settle a thread with ✅', not [n for n in notes if act(n) == 'thread.settled'])
+# Only a ✅ settle counts. Thread A may also settle as quiet in this window:
+# its 6 s quiet period from reply B ends near here, and whether the 2 s ticker
+# fires first depends on the run's timing, not on what E7 tests.
+ready = [n for n in notes if act(n) == 'thread.settled' and 'reason: ready' in n['content']]
+check('E7 a guest cannot settle a thread with ✅', not ready, ready[0]['content'][:220] if ready else '')
 # E8: a member mentions the bot
 mock.event('Ev8', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': '<@UBOT> can you look?', 'ts': C, 'thread_ts': A})
-got = wait_notes(lambda n: act(n) == 'thread.settled')
+got = wait_notes(lambda n: act(n) == 'thread.settled' and 'reason: mention' in n['content'])
 check('E8 a mention settles the thread immediately', got, got[0]['content'][:220] if got else 'no thread.settled')
 time.sleep(1.5)
 wrote = [c for c in mock.calls if c[1] in ('reactions.add', 'chat.postMessage', 'chat.update')]
