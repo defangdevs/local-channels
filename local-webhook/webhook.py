@@ -76,6 +76,24 @@ def _int_env(*names, default=0):
     return default
 
 
+def _limit_env(name, default):
+    """A size limit: unset, empty or malformed keeps the default (never
+    silently unlimited); only an explicit non-negative integer, 0 included,
+    overrides it."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    try:
+        n = int(v.strip())
+        if n >= 0:
+            return n
+    except ValueError:
+        pass
+    print('local-webhook: ignoring invalid %s=%r (want a non-negative integer, 0 disables); '
+          'using %d' % (name, v, default), file=sys.stderr)
+    return default
+
+
 # Loopback TCP ingress port for the legacy single-file setup where each session
 # serves its own HTTP receiver and races for the port. Set to 0 to run NO TCP
 # ingress — agent-box session peers do this: a separate receiver daemon (see
@@ -2028,7 +2046,7 @@ SPOOL_PEER_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_SPOOL_PEER_MAX', default=500))
 # (hard links counted once). Past it the reaper drops the OLDEST waiting
 # dispatch records, out loud, and `status` counts them (issue #105). 0 turns
 # the bound off.
-SPOOL_MAX_BYTES = max(0, _int_env('LOCAL_WEBHOOK_SPOOL_MAX_BYTES', default=256 * 1024 * 1024))
+SPOOL_MAX_BYTES = _limit_env('LOCAL_WEBHOOK_SPOOL_MAX_BYTES', 256 * 1024 * 1024)
 SPOOL_OVERFLOW_DROPPED = 0
 # How long a delivery id is remembered once it is fully handed off: GitHub
 # keeps its delivery log about three days, which is as far back as a
@@ -2279,6 +2297,16 @@ class SpoolQueue:
             os.unlink(self.lease_path(name, owner))
         except OSError:
             pass
+
+    def drop_waiting(self, name):
+        """Remove <name> only while it still waits in new/. One unlink, so a
+        record a dispatcher has already claimed (renamed into cur/) is never
+        touched and its leases survive."""
+        try:
+            os.unlink(spool_path(self.new, name))
+            return 1
+        except OSError:
+            return 0
 
     def drop(self, name):
         """Remove <name> wherever it is in this queue."""
@@ -2563,7 +2591,7 @@ CONTENT_TTL_S = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_TTL_S', default=86400))
 # (or the running chunked total) BEFORE the signature, so an unauthenticated
 # client cannot make the receiver buffer more. 25 MiB is GitHub's own payload
 # ceiling; 0 turns the bound off.
-MAX_BODY_BYTES = max(0, _int_env('LOCAL_WEBHOOK_MAX_BODY_BYTES', default=25 * 1024 * 1024))
+MAX_BODY_BYTES = _limit_env('LOCAL_WEBHOOK_MAX_BODY_BYTES', 25 * 1024 * 1024)
 CONTENT_MAX_BYTES = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX_BYTES', default=134217728))
 CONTENT_MAX_N = max(1, _int_env('LOCAL_WEBHOOK_CONTENT_MAX', default=2000))
 CONTENT_LOCK = threading.RLock()
@@ -2973,6 +3001,31 @@ def spool_bytes():
     return total
 
 
+def _overflow_file():
+    return SPOOL_DIR.rstrip('/') + '-overflow-dropped'
+
+
+def spool_overflow_total():
+    """Records dropped for overflow, kept on disk so the CLI's `status`
+    (a different process from the receiver) reports the same number."""
+    try:
+        with open(_overflow_file()) as f:
+            return max(0, int(f.read().strip() or 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def _spool_overflow_add(n):
+    dest = _overflow_file()
+    tmp = '%s.%d.tmp' % (dest, os.getpid())
+    try:
+        with open(tmp, 'w') as f:
+            f.write(str(spool_overflow_total() + n))
+        os.replace(tmp, dest)
+    except OSError as e:
+        print('local-webhook: cannot persist overflow counter: %s' % e, file=sys.stderr)
+
+
 def spool_enforce_cap():
     """Drop the oldest WAITING dispatch records until the spool fits
     SPOOL_MAX_BYTES. Leased (running) records are never touched."""
@@ -2992,11 +3045,12 @@ def spool_enforce_cap():
             size = os.lstat(spool_path(SPOOL_DISPATCH.new, name)).st_size
         except OSError:
             continue
-        if SPOOL_DISPATCH.drop(name):
+        if SPOOL_DISPATCH.drop_waiting(name):
             dropped += 1
             total -= size
     SPOOL_OVERFLOW_DROPPED += dropped
     if dropped:
+        _spool_overflow_add(dropped)
         print('local-webhook: discarded %d waiting dispatch record(s) — the spool passed '
               'LOCAL_WEBHOOK_SPOOL_MAX_BYTES=%d' % (dropped, SPOOL_MAX_BYTES), file=sys.stderr)
     if total > SPOOL_MAX_BYTES:
@@ -3132,7 +3186,7 @@ def spool_status(now_s=None):
                        'maxBytes': CONTENT_MAX_BYTES, 'maxCount': CONTENT_MAX_N,
                        'retentionS': CONTENT_TTL_S},
            'bytes': spool_bytes() if os.path.isdir(SPOOL_DIR) else 0,
-           'maxBytes': SPOOL_MAX_BYTES, 'overflowDropped': SPOOL_OVERFLOW_DROPPED}
+           'maxBytes': SPOOL_MAX_BYTES, 'overflowDropped': max(SPOOL_OVERFLOW_DROPPED, spool_overflow_total())}
     if not os.path.isdir(SPOOL_DIR):
         out.update({'inbox': 0, 'dispatch': {'pending': 0, 'running': 0, 'items': []},
                     'sessions': {}, 'seen': 0})
@@ -5303,7 +5357,10 @@ class Handler(BaseHTTPRequestHandler):
             chunks, got = [], 0
             while True:
                 size_line = self.rfile.readline(65536).strip()
-                size = int(size_line.split(b';')[0], 16)
+                size_hex = size_line.split(b';')[0].strip()
+                if not re.fullmatch(rb'[0-9a-fA-F]{1,16}', size_hex):
+                    raise ValueError('bad chunk size')  # int() would accept "-1"
+                size = int(size_hex, 16)
                 if size == 0:
                     self.rfile.readline(65536)  # trailing CRLF (no trailers expected)
                     break
