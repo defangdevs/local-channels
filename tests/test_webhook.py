@@ -3181,6 +3181,32 @@ class TestDispatchSpool(SpoolCase):
             time.sleep(0.05)
         return False
 
+    def test_spool_over_its_byte_cap_loses_the_oldest_waiting_record(self):
+        self.mod.SPOOL_MAX_BYTES = 3000
+        sids = [self.put('github~cap-%d' % i, 'x' * 1500, at=1000 + i)[3] for i in range(4)]
+        self.assertGreater(self.mod.spool_bytes(), 3000)
+        self.mod.spool_enforce_cap()
+        self.assertLessEqual(self.mod.spool_bytes(), 3000)
+        self.assertEqual(self.q.names(), sids[-1:])
+        self.assertEqual(self.mod.spool_status()['overflowDropped'], 3)
+        self.assertIn('LOCAL_WEBHOOK_SPOOL_MAX_BYTES=3000', self.err.getvalue())
+
+    def test_cap_drop_never_removes_a_claimed_record(self):
+        self.put('github~cap-claim', 'x' * 100, at=1000)
+        name = self.q.names()[0]
+        lease = self.q.claim(name, 1234)
+        self.assertTrue(lease)
+        self.assertEqual(self.q.drop_waiting(name), 0)
+        self.assertTrue(os.path.exists(lease))
+
+    def test_overflow_counter_is_visible_across_processes(self):
+        self.mod.SPOOL_MAX_BYTES = 1000
+        for i in range(3):
+            self.put('github~ovf-%d' % i, 'x' * 1500, at=1000 + i)
+        self.mod.spool_enforce_cap()
+        self.mod.SPOOL_OVERFLOW_DROPPED = 0  # a fresh CLI process starts at zero
+        self.assertGreaterEqual(self.mod.spool_status()['overflowDropped'], 2)
+
     def test_a_declined_batch_survives_a_restart_with_its_streak(self):
         d = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q)
         text, meta, env, sid = self.put('github~cap-1', 'held at capacity')
@@ -4502,6 +4528,53 @@ class TestEndToEnd(EndToEndCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn(b'codex', r.stdout.lower())
         self.assertFalse(os.path.exists(os.path.join(self.state, 'codex')))
+
+
+class TestBodyCap(EndToEndCase):
+    """Issue #105: the ingress refuses an oversized body before reading it."""
+
+    def test_oversized_body_is_413_and_small_one_is_not(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        status, _ = self.post(b'x' * 5000)
+        self.assertEqual(status, 413)
+        status, _ = self.post(b'x' * 100)
+        self.assertNotEqual(status, 413)  # reaches the signature/parse path
+
+    def test_negative_chunk_size_is_not_read_to_eof(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.putrequest('POST', '/github')
+        conn.putheader('Transfer-Encoding', 'chunked')
+        conn.putheader('x-github-event', 'issues')
+        conn.endheaders()
+        conn.send(b'-1\r\n' + b'z' * 5000)
+        self.assertNotEqual(conn.getresponse().status, 200)
+        conn.close()
+
+    def test_oversized_chunked_body_is_413(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/github', iter([b'y' * 600, b'y' * 600]),
+                     {'x-github-event': 'issues', 'Transfer-Encoding': 'chunked'},
+                     encode_chunked=True)
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
+
+
+class TestLimitEnv(SpoolCase):
+    def test_bad_limit_keeps_default_and_only_zero_disables(self):
+        for bad in ('', '256MiB', '-5'):
+            os.environ['X_LIM'] = bad
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.mod._limit_env('X_LIM', 77), 77)
+            finally:
+                del os.environ['X_LIM']
+        os.environ['X_LIM'] = '0'
+        try:
+            self.assertEqual(self.mod._limit_env('X_LIM', 77), 0)
+        finally:
+            del os.environ['X_LIM']
 
 
 class TestSpoolEndToEnd(EndToEndCase):
