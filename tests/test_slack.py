@@ -138,6 +138,13 @@ class TestTracker(Rig):
         self.assertEqual(self.actions()[0], 'message.posted')
         self.assertEqual(self.events[0][1]['identifier'], 'T1/C1/1.1')
 
+    def test_reaction_track_accepts_alias(self):
+        self.cfg['track'] = 'reaction:raised_hand'
+        self.tr.handle(msg('1.1', 'hello'))
+        self.assertEqual(self.events, [])
+        self.tr.handle(reaction('1.1', 'hand'))
+        self.assertEqual(self.actions()[0], 'message.posted')
+
     def test_edit_without_mention_change_stays_ignored(self):
         self.cfg['track'] = 'mention'
         self.tr.handle(msg('1.1', 'please look'))

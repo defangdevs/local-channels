@@ -969,7 +969,9 @@ class Tracker:
             return
         # reaction:<emoji> tracking starts a record from a reaction.
         if row is None:
-            if cfg['track'] == 'reaction:' + emoji and etype == 'reaction_added':
+            track = cfg['track']
+            tracked = track.startswith('reaction:') and canon_emoji(track[len('reaction:'):]) == emoji
+            if tracked and etype == 'reaction_added':
                 fake = {'text': '', 'ts': thread_ts}
                 row, _ = self._start(team, channel, thread_ts, fake, cfg, now, user)
                 if row:
