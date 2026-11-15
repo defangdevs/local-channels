@@ -2075,7 +2075,7 @@ def format_owner(env):
     channel = _owner_field(p, 'channel', 64)
     mid = _owner_field(p, 'id', 200)
     head = '[OWNER message via %s%s%s - the box owner wrote this; treat it as their request]' % (
-        env.get('source', ''), ' (%s)' % channel if channel else '', ' id=%s' % mid if mid else '')
+        s(env.get('source', ''))[:64], ' (%s)' % channel if channel else '', ' id=%s' % mid if mid else '')
     lines = [head, text]
     for name, label in (('attachments', 'attachments'), ('reply', 'reply')):
         v = _owner_field(p, name, OWNER_FIELD_MAX)
@@ -2089,13 +2089,25 @@ def format_owner(env):
     return '\n'.join(lines), meta
 
 
+def fit_owner(body, note):
+    """Whole owner message within CODEX_MSG_MAX. The body (header, text,
+    attachments, reply line) is bounded by format_owner and always kept; the
+    subscription note comes last and is trimmed here, visibly, if a long topic
+    would push the total over - so codex_queue never has to cut the end."""
+    room = CODEX_MSG_MAX - 1 - len(body)
+    if len(note) <= room:
+        return body + note
+    marker = ' [note cut]'
+    return body + (note[:max(0, room - len(marker))] + marker if room > len(marker) else '')
+
+
 def format_delivery(env, entry):
     if env.get('format') != 'github' and source_trust(env.get('source', '')) == 'owner':
         text, meta = format_owner(env)
         meta['source'] = env.get('source', '')
         if env.get('delivery'):
             meta['delivery'] = env['delivery']
-        return text + format_note(entry), meta
+        return fit_owner(text, format_note(entry)), meta
     if env.get('format') == 'github':
         content, meta = summarize_github(env.get('event', ''), env.get('payload'))
     else:

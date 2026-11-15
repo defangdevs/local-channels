@@ -1499,6 +1499,29 @@ class TestOwnerTrust(StateDirCase):
         self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
         self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
 
+    def test_long_source_and_topic_never_push_the_reply_out(self):
+        """Source names and topics have no length limit of their own: the
+        header clips the source, and the note is trimmed last, visibly."""
+        src = 'S' * 3000
+        self.write_json('sources.json', {'sources': {src: {'secret': 'x', 'trust': 'owner'}}})
+        p = {'text': 'x' * 50000, 'id': 'd' * 999, 'attachments': 'a' * 9999, 'reply': 'r' * 9999}
+        entry = {'topic': src + ':' + 'k' * 5000, 'note': 'n' * self.mod.NOTE_MAX_WATCH,
+                 'subscribedAt': '2026-01-01T00:00:00.000Z', 'name': ''}
+        env = {'source': src, 'format': 'generic', 'event': 'e', 'key': 'k', 'payload': p}
+        text, _ = self.mod.format_delivery(env, entry)
+        self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
+        self.assertTrue(text.startswith('[OWNER message via ' + 'S' * 64 + ' id='))
+        self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
+        self.assertTrue(text.endswith(' [note cut]'))
+        # What codex_queue would hand over is the same text, uncut.
+        self.assertEqual(self.mod.CODEX_MSG_MAX > len(text), True)
+
+    def test_short_note_is_kept_whole(self):
+        self.sources(trust='owner')
+        entry = {'topic': 'inbox:wa-vat', 'note': 'routed', 'subscribedAt': '', 'name': ''}
+        text, _ = self.mod.format_delivery(self.env(), entry)
+        self.assertTrue(text.endswith('[subscribed to inbox:wa-vat: routed]'))
+
     def test_trust_and_format_come_from_one_read(self):
         calls = []
         real = self.mod.read_sources
@@ -4624,6 +4647,35 @@ class TestEndToEnd(EndToEndCase):
         self.assertEqual(self.post(self.ISSUE)[0], 200)
         self.assertTrue(self.wait_file(self.spawn_log, contains='title here'),
                         'no spawn once the claiming codex session was gone')
+
+    def test_owner_message_reaches_a_codex_peer_whole(self):
+        """The supervisor path agent-box's router uses: subscribe a codex
+        session from OUTSIDE it (LOCAL_WEBHOOK_CODEX_THREAD), then emit an
+        owner message with the longest text. codex queue gets the owner
+        framing with the reply line and the note intact."""
+        fake = CodexFake(self.state)
+        env = {'LOCAL_WEBHOOK_CODEX_BIN': fake.path, 'LOCAL_WEBHOOK_CODEX_THREAD': 'thr-owner'}
+        self.addCleanup(self.reap_codex_peer, 'agent-wa-c')
+        self.add_source('inbox', keyPath='session', trust='owner')
+        r = self.cli('subscribe', 'inbox:wa-c', '--note', 'routed owner messages',
+                     session='agent-wa-c', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.codex_peer_record('agent-wa-c'), r.stdout + r.stderr)
+        self.start_daemon()
+        r = self.cli('emit', 'inbox', json.dumps({'session': 'wa-c', 'text': 'y' * 9000, 'id': 'M9',
+                                                  'channel': 'whatsapp', 'reply': 'bridge.mjs reply M9 TEXT'}),
+                     '--event', 'message')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.wait_file(fake.log, contains='OWNER'), 'the codex peer never queued it')
+        sent = fake.messages()
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith('[OWNER message via inbox (whatsapp) id=M9'), sent[0][:200])
+        self.assertIn('[text cut at 5000 characters]', sent[0])
+        self.assertIn('[reply: bridge.mjs reply M9 TEXT]', sent[0])
+        self.assertIn('routed owner messages', sent[0])
+        self.assertNotIn('UNTRUSTED', sent[0])
+        self.assertFalse(sent[0].endswith('...'), 'codex_queue had to cut the message')
+        self.assertEqual(fake.calls()[0][:3], ['queue', '--thread', 'thr-owner'])
 
     def test_codex_delivery_can_be_declined_and_fails_loudly(self):
         env = {'CODEX_THREAD_ID': 'thr-x'}
