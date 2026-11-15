@@ -94,6 +94,7 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 | key | default | meaning |
 |---|---|---|
 | `secret` / `secretFile` | — | verification secret (file paths resolve in the state dir) |
+| `previousSecret` / `previousSecretFile` + `previousSecretUntil` | — | rotation overlap: while the ISO-8601 `previousSecretUntil` is in the future, a delivery that fails the current secret is also verified against the previous one, and logged as such. Without a future expiry it is ignored, so an overlap cannot become permanent |
 | `format` | `github` iff source is named github, else `generic` | payload summarizer |
 | `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` — see [Verification modes](#verification-modes-0300) |
 | `signatureHeader` | depends on `verification` (`x-hub-signature-256` / `x-gitlab-token` / `webhook-signature`) | the signature, in that mode's own shape |
