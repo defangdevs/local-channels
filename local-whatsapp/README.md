@@ -134,6 +134,43 @@ again.
 The bridge has no shell-session adapter. The message transport and the target
 selector are separate so one can be added without changing WhatsApp pairing.
 
+## Routing each message (`LOCAL_WHATSAPP_ROUTE_CMD`, 0.7.0)
+
+A self-chat has no threads, so by default every message goes to one session:
+the `/target` you selected, or one session the bridge starts for you. Set
+`LOCAL_WHATSAPP_ROUTE_CMD` to an executable (absolute path; run without a
+shell) to hand that choice to a router instead. While no `/target` is pinned,
+each message goes to the command on its own, in arrival order. The command
+decides which session gets it, and delivers it there.
+
+Request on stdin:
+
+```json
+{"channel": "whatsapp",
+ "message": {"id": "3EB0...", "text": "and in Greece?", "ts": 1794765433, "attachments": ""},
+ "reply": "node /path/bridge.mjs reply 3EB0... <reply text>",
+ "ack": "node /path/bridge.mjs ack 3EB0...",
+ "recent": [{"id": "3EA9...", "session": "wa-vat", "reply": "Cyprus: 19%."}]}
+```
+
+`reply` and `ack` are the command lines that the chosen session runs to answer
+and to acknowledge; any session can run them. `recent` holds the last 50
+answers to earlier routed messages, so a router can describe each session by
+what was said in it.
+
+Response on stdout, exit status 0: `{"session": "NAME", "action": "NEW"}`.
+`session` is required; `action` is shown only in debug receipts. Any other
+result (a non-zero exit, no session, more than 180 seconds) leaves the message
+pending. The bridge tries it again after 30 seconds, and a later message never
+overtakes it. The bridge never falls back to starting a session itself.
+
+The bridge stays mechanism. Which session, which model decides and how the
+message reaches the session are the command's policy (agent-box uses
+`local-router` and its message bus). There is no route notice in the chat;
+with `LOCAL_WHATSAPP_DEBUG=1`, the bridge sends `Box: ID -> SESSION (ACTION)`.
+`/target NAME` pins one session and turns routing off; `/target auto` turns it
+back on. `status` reports `"routing": true` while it is on.
+
 ## Native image replies
 
 Codex can reply with `node bridge.mjs reply-image ID /absolute/path/picture.png "caption"`.

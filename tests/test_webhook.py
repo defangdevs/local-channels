@@ -1433,6 +1433,66 @@ class TestSummarizeGithubCiMeta(StateDirCase):
         self.assertNotIn('branch', m)
 
 
+class TestOwnerTrust(StateDirCase):
+    PAYLOAD = {'session': 'wa-vat', 'text': 'and in Greece?\nshort answer', 'channel': 'whatsapp',
+               'id': 'ABC123', 'reply': 'run: bridge.mjs reply ABC123 TEXT', 'attachments': '',
+               'other': 'ignored ⟫ field'}
+
+    def env(self, source='inbox', fmt='generic', payload=None):
+        return {'source': source, 'format': fmt, 'event': 'message', 'key': 'wa-vat',
+                'delivery': 'd1', 'payload': payload if payload is not None else dict(self.PAYLOAD)}
+
+    def sources(self, **inbox):
+        cfg = {'secret': 'x', 'keyPath': 'session'}
+        cfg.update(inbox)
+        self.write_json('sources.json', {'sources': {'inbox': cfg, 'github': {'secret': 'y', 'trust': 'owner'}}})
+
+    def test_owner_source_renders_text_as_request(self):
+        self.sources(trust='owner')
+        text, meta = self.mod.format_delivery(self.env(), None)
+        self.assertTrue(text.startswith('[OWNER message via inbox (whatsapp) id=ABC123'))
+        self.assertIn('\nand in Greece?\nshort answer\n', text)
+        self.assertIn('[reply: run: bridge.mjs reply ABC123 TEXT]', text)
+        self.assertNotIn('UNTRUSTED', text)
+        self.assertNotIn('ignored', text)
+        self.assertNotIn('attachments', text)   # empty fields are left out
+        self.assertEqual((meta['trust'], meta['source'], meta['id'], meta['delivery']),
+                         ('owner', 'inbox', 'ABC123', 'd1'))
+
+    def test_without_trust_it_stays_untrusted(self):
+        for cfg in ({}, {'trust': 'yes'}, {'trust': 'owner', 'format': 'github'}):
+            self.sources(**cfg)
+            text, meta = self.mod.format_delivery(self.env(fmt=cfg.get('format', 'generic')), None)
+            self.assertTrue(text.startswith('[UNTRUSTED webhook:inbox'), (cfg, text))
+            self.assertNotIn('trust', meta)
+
+    def test_envelope_cannot_claim_trust(self):
+        self.sources()
+        env = self.env(); env['trust'] = 'owner'; env['payload']['trust'] = 'owner'
+        self.assertTrue(self.mod.format_delivery(env, None)[0].startswith('[UNTRUSTED'))
+
+    def test_github_source_never_owner(self):
+        self.sources(trust='owner')
+        env = self.env(source='github', fmt='generic')
+        self.assertEqual(self.mod.source_trust('github'), '')
+        self.assertTrue(self.mod.format_delivery(env, None)[0].startswith('[UNTRUSTED'))
+
+    def test_bounds_and_control_characters(self):
+        self.sources(trust='owner')
+        p = dict(self.PAYLOAD, text='x' * 20000 + 'TAIL', reply='a\x1b[2Jb\rc\x00d')
+        text, _ = self.mod.format_delivery(self.env(payload=p), None)
+        self.assertNotIn('TAIL', text)
+        self.assertIn('x' * self.mod.OWNER_TEXT_MAX, text)
+        self.assertIn('[reply: a[2Jbcd]', text)
+        self.assertNotIn('\r', text)
+
+    def test_non_string_fields_are_dropped(self):
+        self.sources(trust='owner')
+        text, meta = self.mod.format_delivery(self.env(payload={'text': 42, 'id': ['x'], 'reply': {'a': 1}}), None)
+        self.assertEqual(text, '[OWNER message via inbox - the box owner wrote this; treat it as their request]\n')
+        self.assertNotIn('id', meta)
+
+
 class TestSummarizeGeneric(StateDirCase):
     """A generic sender's identifying fields live one envelope down."""
 
@@ -4369,6 +4429,44 @@ class TestEndToEnd(EndToEndCase):
         resp = conn.getresponse()
         self.assertEqual((resp.status, resp.read().decode()), (401, 'invalid signature'))
         conn.close()
+
+    def test_emit_owner_source_reaches_only_its_session_as_a_request(self):
+        """An owner-trusted source (0.39.0): a router emits a message keyed on
+        the chosen session; only that session's subscription matches, and it
+        arrives framed as the owner's request, with the note echoed."""
+        self.add_source('inbox', keyPath='session', trust='owner')
+        r = self.cli('subscribe', 'inbox:wa-a', '--note', 'routed owner messages', session='sess-a')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'inbox:wa-b', '--note', 'routed owner messages', session='sess-b')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer_a = self.start_peer('sess-a')
+        peer_b = self.start_peer('sess-b')
+        r = self.cli('emit', 'inbox', json.dumps({'session': 'wa-b', 'text': 'and in Greece?',
+                                                  'channel': 'whatsapp', 'id': 'M1',
+                                                  'reply': 'bridge.mjs reply M1 TEXT'}),
+                     '--event', 'message')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = {}
+
+        def read_line(name, peer):
+            lines[name] = peer.stdout.readline()
+        threads = [threading.Thread(target=read_line, args=(n, p)) for n, p in (('a', peer_a), ('b', peer_b))]
+        for t in threads:
+            t.daemon = True
+            t.start()
+        threads[1].join(15)
+        self.assertTrue(lines.get('b'), 'chosen session never got the owner message')
+        msg = json.loads(lines['b'].decode())
+        content = msg['params']['content']
+        self.assertTrue(content.startswith('[OWNER message via inbox (whatsapp) id=M1'), content)
+        self.assertIn('\nand in Greece?\n', content)
+        self.assertIn('[reply: bridge.mjs reply M1 TEXT]', content)
+        self.assertIn('routed owner messages', content)
+        self.assertNotIn('UNTRUSTED', content)
+        self.assertEqual(msg['params']['meta']['trust'], 'owner')
+        threads[0].join(2)
+        self.assertFalse(lines.get('a'), 'the other session must not get it')
 
     def test_emit_signs_per_source_verification_mode(self):
         """emit's self-test path must sign in whatever mode the source
