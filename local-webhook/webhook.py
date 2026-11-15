@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.39.0'
+VERSION = '0.39.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -2225,6 +2225,13 @@ SPOOL_TMP_MAX_S = 3600
 # MCP initialization is done, so its backlog waits for that — or for this long,
 # for a client that never sends it.
 SPOOL_READY_GRACE_S = 30
+# ...and then this much longer. Claude Code sends notifications/initialized
+# BEFORE it registers its channel handler (2.1.322: about 90 ms later, in its
+# MCP log as "Channel notifications registered"), and it drops a channel
+# notification that arrives in between. A backlog drained at once was lost
+# that way: the message the router sent to a session it had just woken never
+# reached it. The client sends no later signal, so wait a fixed settle time.
+SPOOL_READY_SETTLE_MS = max(0, _int_env('LOCAL_WEBHOOK_SPOOL_SETTLE_MS', default=2000))
 
 # Names. A delivery id is sender-supplied and, unlike the body, NOT covered by
 # the signature, so it never reaches a path as written unless it is plainly
@@ -3579,7 +3586,11 @@ def handle_ipc_envelope(env):
     if (SPOOL_ENABLED and isinstance(sp, dict) and isinstance(sp.get('id'), str)
             and SPOOL_NAME.match(sp['id']) and isinstance(sp.get('keys'), list)
             and FILTER_KEY in sp['keys'] and os.path.exists(IPC_INBOX_MARKER)):
-        inbox_take(sp['id'])
+        # Before the inbox is open the client may not take a notification
+        # yet (see SPOOL_READY_SETTLE_MS): leave the copy spooled; the drain
+        # loop delivers it once the inbox opens.
+        if INBOX_READY.is_set():
+            inbox_take(sp['id'])
         return
     handle_event(env)
 
@@ -5496,13 +5507,25 @@ def stdin_loop():
     sys.exit(0)
 
 
+def inbox_ready_after_settle():
+    """Open the inbox SPOOL_READY_SETTLE_MS after the client's handshake."""
+    if INBOX_READY.is_set():
+        return
+    if not SPOOL_READY_SETTLE_MS:
+        INBOX_READY.set()
+        return
+    timer = threading.Timer(SPOOL_READY_SETTLE_MS / 1000.0, INBOX_READY.set)
+    timer.daemon = True
+    timer.start()
+
+
 def handle_rpc(msg):
     if not isinstance(msg, dict) or msg.get('id') is None:
         # The one notification that matters: the client has finished MCP
         # initialization, so a backlog drained from the spool now has
         # somewhere to land.
         if isinstance(msg, dict) and msg.get('method') == 'notifications/initialized':
-            INBOX_READY.set()
+            inbox_ready_after_settle()
         return
 
     def reply(result):

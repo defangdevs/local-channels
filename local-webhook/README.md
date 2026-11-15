@@ -839,9 +839,13 @@ spool/seen/<id>                     dedup memory (empty-ish files, mtime = when)
   whose filter accepts the event, whether or not that session is running. A
   live peer is rung over its socket (the envelope gains one additive field,
   `spool: {id, keys}`) and claims its copy; a peer that was down drains its box
-  when it comes back — a claude peer once the client's MCP
-  `notifications/initialized` arrives, a codex peer at once — and polls every
-  `LOCAL_WEBHOOK_SPOOL_POLL_S`. A backlog event is routed against the
+  when it comes back — a claude peer `LOCAL_WEBHOOK_SPOOL_SETTLE_MS` (2000 by
+  default) after the client's MCP `notifications/initialized` arrives, a codex
+  peer at once — and polls every
+  `LOCAL_WEBHOOK_SPOOL_POLL_S`. The settle time exists because Claude Code
+  registers its channel handler only after it sends `initialized` and drops a
+  notification that comes in between (0.39.1); a doorbell that rings in that
+  window leaves its copy spooled for the drain. A backlog event is routed against the
   session's filter **as of when it was accepted**: a TTL that lapsed during the
   outage still delivers what arrived while it was live, while an unsubscribe
   discards it. A `codex queue` that fails puts the event back in line instead

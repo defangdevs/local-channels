@@ -3793,7 +3793,11 @@ class EndToEndCase(unittest.TestCase):
         self.assertTrue(os.path.exists(self.http_sock), 'daemon never bound its socket')
         return p
 
-    def start_peer(self, session, **extra):
+    def start_peer(self, session, handshake=True, **extra):
+        # A real claude client sends notifications/initialized, and since
+        # 0.39.1 a peer claims nothing before it (plus the settle time, which
+        # is 0 here unless a test sets it). handshake=False leaves it out.
+        extra.setdefault('LOCAL_WEBHOOK_SPOOL_SETTLE_MS', '0')
         env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0', **extra)
         p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -3804,6 +3808,9 @@ class EndToEndCase(unittest.TestCase):
             socks = [f for f in (os.listdir(inst) if os.path.isdir(inst) else [])
                      if f == '%s.%d.sock' % (session, p.pid)]
             if socks:
+                if handshake:
+                    p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+                    p.stdin.flush()
                 return p
             time.sleep(0.05)
         self.fail('peer never registered its IPC socket')
@@ -4795,7 +4802,7 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(self.status('downsess')['sessions']['downsess']['pending'], 1)
         # ...and the receiver itself goes away before the session is back.
         self.stop_daemon(d)
-        peer = self.start_peer('downsess')
+        peer = self.start_peer('downsess', handshake=False)
         # The backlog waits for the client's MCP handshake.
         self.assertTrue(self.no_line(peer, 1.5), 'backlog delivered before notifications/initialized')
         self.handshake(peer)
@@ -4810,6 +4817,25 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(self.status('downsess')['sessions']['downsess'],
                          {'pending': 0, 'leased': 0, 'oldestAgeS': None})
         self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+
+    def test_backlog_waits_for_the_settle_time_after_the_handshake(self):
+        """0.39.1: Claude Code registers its channel handler only after it
+        sends notifications/initialized, and drops a notification in between.
+        The backlog, and a doorbell that rings in that window, wait for
+        LOCAL_WEBHOOK_SPOOL_SETTLE_MS after the handshake."""
+        r = self.cli('subscribe', 'o/r', '--note', 'woken session', session='settle')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-settle-1'), (200, 'ok'))
+        peer = self.start_peer('settle', LOCAL_WEBHOOK_SPOOL_SETTLE_MS='2500')   # handshakes
+        # A live event inside the settle window rings the doorbell; it must
+        # stay spooled too, not go out before the client can take it.
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-settle-2'), (200, 'ok'))
+        self.assertTrue(self.no_line(peer, 1.5), 'delivered inside the settle window')
+        got = {self.read_peer_line(peer)['params']['meta']['delivery'] for _ in range(2)}
+        self.assertEqual(got, {'gh-settle-1', 'gh-settle-2'})
+        self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+        self.stop_daemon(d)
 
     def test_a_peer_that_dies_and_comes_back_gets_the_event_it_missed(self):
         r = self.cli('subscribe', 'o/r', '--note', 'flaky', session='flaky')
