@@ -132,7 +132,8 @@ default keeps every existing source verifying exactly as before.
 - **`query-token`** (0.38.0, #31) — the secret is a URL query parameter
   (`tokenParam`, default `token`), for a sender that signs nothing and cannot
   set a header: Rollbar's documented method is
-  `https://host/webhook/rollbar?token=...`. It is the **weakest** mode, weaker
+  `https://host/rollbar?token=...` (the path is the source name; if a proxy
+  adds a prefix such as `/webhook`, it must strip it before forwarding). It is the **weakest** mode, weaker
   than `hmac-hex`: the secret sits in the request line, so every proxy and
   access log on the path records it, and one leaked log line leaks the secret.
   Use it only for a sender that offers nothing better, and keep the access log
@@ -147,6 +148,20 @@ default keeps every existing source verifying exactly as before.
     "secretFile": "rollbar.secret", "format": "generic",
     "verification": "query-token", "eventPath": "event_name",
     "keyPath": "data.item.project_id"
+} } }
+```
+
+This example routes Rollbar **item** events only. A `deploy` event carries
+`data.deploy.project_id` and no `data.item`, so with this `keyPath` its routing
+key is empty and it reaches no subscription, while the receiver still accepts
+the request. To receive deploy events, add a second source with its own
+`secretFile` and a deploy `keyPath`:
+
+```json
+{ "sources": { "rollbar-deploy": {
+    "secretFile": "rollbar-deploy.secret", "format": "generic",
+    "verification": "query-token", "eventPath": "event_name",
+    "keyPath": "data.deploy.project_id"
 } } }
 ```
 
