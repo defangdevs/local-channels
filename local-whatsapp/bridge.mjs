@@ -32,6 +32,18 @@ const addressPrefix = (() => {
 const sessionBin = process.env.LOCAL_WHATSAPP_SESSION_BIN || '/usr/local/bin/agent-box-session';
 const codexBin = process.env.LOCAL_WHATSAPP_CODEX_BIN || join(userInfo().homedir, '.nix-profile', 'bin', 'codex');
 if (!isAbsolute(sessionBin) || !isAbsolute(codexBin)) throw new Error('bridge helper paths must be absolute');
+// LOCAL_WHATSAPP_ROUTE_CMD: an executable (absolute path, no shell) that takes
+// over the automatic target. A self-chat has no threads, so with no explicit
+// /target each message is handed to it alone (JSON on stdin, see routeMessage)
+// and IT decides which session gets the message and delivers it there. The
+// bridge stays mechanism: it keeps order, retries and receipts; which session,
+// which model decides, and how the message reaches the session are the
+// command's policy. Unset keeps the old behaviour (one spawned session).
+const routeCmd = process.env.LOCAL_WHATSAPP_ROUTE_CMD || '';
+if (routeCmd && !isAbsolute(routeCmd)) throw new Error('LOCAL_WHATSAPP_ROUTE_CMD must be an absolute path');
+const ROUTE_TIMEOUT_MS = Number(process.env.LOCAL_WHATSAPP_ROUTE_TIMEOUT_MS) || 180000;   // one model call plus, for a new topic, a session start
+const ROUTE_RETRY_MS = 30000;
+const ROUTE_RECENT = 50;
 
 function target() {
   if (!existsSync(targetPath)) return null;
@@ -188,6 +200,69 @@ async function sessionCommand(args) {
       try { resolve(JSON.parse(output)); }
       catch (failure) { reject(failure); }
     });
+  });
+}
+
+// Hand one message to the route command. Request (stdin):
+//   {"channel": "whatsapp",
+//    "message": {"id", "text", "ts" (epoch seconds), "attachments" (notice or "")},
+//    "reply": command line the session runs to answer, "ack": ... to acknowledge,
+//    "recent": [{"id", "session", "reply"}]   answers already given to earlier
+//               routed messages, so the router can describe each session}
+// Response (stdout, exit 0): {"session": NAME, "action": "...", ...}.
+// Anything else is a failure: the message stays pending and is retried.
+function routeMessage(message, state) {
+  const self = fileURLToPath(import.meta.url);
+  const recent = Object.values(state.messages)
+    .filter((entry) => entry.routedTo && entry.reply?.text && !entry.clearedAt)
+    .slice(-ROUTE_RECENT)
+    .map((entry) => ({ id: entry.id, session: entry.routedTo, reply: entry.reply.text.slice(0, 2000) }));
+  const body = JSON.stringify({
+    channel: 'whatsapp',
+    message: { id: message.id, text: message.text || '', ts: Math.floor(Date.parse(message.receivedAt || '') / 1000) || Math.floor(Date.now() / 1000),
+      attachments: attachmentNotice(message).trim() },
+    reply: `node ${self} reply ${message.id} <reply text>`,
+    ack: `node ${self} ack ${message.id}`,
+    recent,
+  });
+  return new Promise((resolve, reject) => {
+    // Own process group, so the deadline can stop the router AND anything it
+    // started (a model CLI, a session start) that still holds our pipes.
+    const child = spawn(routeCmd, [], { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    let output = '';
+    let error = '';
+    let settled = false;
+    const stopTree = (signal) => {
+      try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch { /* gone */ } }
+    };
+    const finish = (failure, decision) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (failure) reject(failure); else resolve(decision);
+    };
+    // The deadline settles the promise by itself: a router that ignores
+    // SIGTERM, or a grandchild that keeps the pipes open, never emits close.
+    // A late completion after this is ignored, so it cannot record success.
+    const timeout = setTimeout(() => {
+      stopTree('SIGTERM');
+      setTimeout(() => stopTree('SIGKILL'), 5000).unref();
+      child.stdout.destroy(); child.stderr.destroy();
+      finish(new Error(`route command timed out after ${ROUTE_TIMEOUT_MS / 1000}s`));
+    }, ROUTE_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => { output += chunk.toString(); if (output.length > 20000) stopTree('SIGKILL'); });
+    child.stderr.on('data', (chunk) => { error = (error + chunk.toString()).slice(-1000); });
+    child.on('error', (failure) => finish(failure));
+    child.on('close', (code) => {
+      if (code !== 0) return finish(new Error(error.trim() || `route command exited ${code}`));
+      try {
+        const decision = JSON.parse(output);
+        if (!decision || !/^[A-Za-z0-9_-]{1,150}$/.test(decision.session || '')) throw new Error('route command gave no session');
+        finish(null, decision);
+      } catch (failure) { finish(failure); }
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(body);
   });
 }
 
@@ -359,6 +434,8 @@ async function serve() {
   const initialAuth = await useMultiFileAuthState(authPath);
   if (!initialAuth.state.creds.me) throw new Error('device not paired: run pair first');
   const state = loadState(dir);
+  // A route call cannot survive a bridge restart; its message is retried.
+  for (const message of Object.values(state.messages)) delete message.routeInFlight;
   cleanImageOutbox(dir, state);
   cleanMediaInbox(dir, state, true);
   const peers = new Map();
@@ -391,6 +468,42 @@ async function serve() {
     dispatchFinished = new Promise((resolve) => { finishDispatch = resolve; });
     try {
       if (!Object.values(state.messages).some((message) => !message.reply && !message.control && !message.clearedAt)) return;
+      if (routeCmd && !existsSync(targetPath)) {
+        // Routed mode: one decision per message, in arrival order. A failure
+        // stops the pass, so a later message never overtakes an earlier one.
+        for (const message of Object.values(state.messages)) {
+          if (resetting || state.resetPending) break;
+          if (message.reply || message.control || message.clearedAt || message.deliveredTo) continue;
+          // The retry delay counts from the end of the failed attempt
+          // (routeRetryAt); lastAttemptAt covers a bridge that died mid-call.
+          if (Date.now() < (message.routeRetryAt || 0) ||
+              Date.now() - (message.lastAttemptAt || 0) < ROUTE_RETRY_MS) break;
+          message.lastAttemptAt = Date.now();
+          // The router delivers BEFORE it answers, so the chosen session can
+          // acknowledge while the call is still running (see the ack op).
+          message.routeInFlight = true;
+          saveState(dir, state);
+          let decision;
+          try { decision = await routeMessage(message, state); }
+          catch (error) {
+            delete message.routeInFlight;
+            message.routeRetryAt = Date.now() + ROUTE_RETRY_MS;
+            saveState(dir, state);
+            process.stderr.write(`route failed for ${message.id}: ${error.message}\n`);
+            break;
+          }
+          delete message.routeInFlight;
+          delete message.routeRetryAt;
+          message.deliveredTo = `route:${decision.session}`;
+          message.routedTo = decision.session;
+          if (debugReceipts) {
+            const action = typeof decision.action === 'string' ? decision.action.slice(0, 20) : '';
+            message.debugRoute = { text: `Box: ${message.id} -> ${decision.session}${action ? ` (${action})` : ''}`, status: 'queued' };
+          }
+          saveState(dir, state);
+        }
+        return;
+      }
       const available = await sessions();
       const binding = await ensureTarget(available);
       for (const message of Object.values(state.messages)) {
@@ -443,15 +556,16 @@ async function serve() {
             }
           }
         }
-        if (entry.debugAck?.status === 'queued') {
+        for (const field of ['debugAck', 'debugRoute']) {
+          if (entry[field]?.status !== 'queued') continue;
           if (!debugReceipts) {
-            entry.debugAck.status = 'suppressed';
+            entry[field].status = 'suppressed';
             saveState(dir, state);
           } else {
             try {
-              const sent = await whatsapp.sendMessage(entry.chat, { text: entry.debugAck.text });
+              const sent = await whatsapp.sendMessage(entry.chat, { text: entry[field].text });
               if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
-              entry.debugAck.status = 'sent';
+              entry[field].status = 'sent';
               saveState(dir, state);
             } catch (error) { process.stderr.write(`debug receipt failed: ${error.message}\n`); }
           }
@@ -479,7 +593,7 @@ async function serve() {
             if (timestamp < Date.now() - 30 * 24 * 3600 * 1000) delete state.sentIds[id];
           }
           const completed = Object.values(state.messages)
-            .filter((message) => (message.reply?.status === 'sent' && message.ack?.status !== 'queued' && message.debugAck?.status !== 'queued') || message.clearedAt)
+            .filter((message) => (message.reply?.status === 'sent' && message.ack?.status !== 'queued' && message.debugAck?.status !== 'queued' && message.debugRoute?.status !== 'queued') || message.clearedAt)
             .sort((left, right) => (left.clearedAt || left.reply.sentAt).localeCompare(right.clearedAt || right.reply.sentAt));
           for (const old of completed.slice(0, Math.max(0, completed.length - 1000))) delete state.messages[old.id];
           saveState(dir, state);
@@ -532,7 +646,9 @@ async function serve() {
             const profile = inbound.text.match(/^\/profile (default|[A-Za-z0-9._-]{1,64})$/)?.[1];
             if (name === 'auto') {
               await clearTarget();
-              queueReply(state, inbound.id, 'Box target: automatic. The next message starts a session using the selected profile.');
+              queueReply(state, inbound.id, routeCmd
+                ? 'Box target: automatic. Each message goes to the session the router chooses.'
+                : 'Box target: automatic. The next message starts a session using the selected profile.');
             } else if (name) {
               const selected = available.find((item) => item.name === name);
               if (!selected) throw new Error(`unknown session; send ${addressPrefix ? `${addressPrefix} ` : ''}/sessions`);
@@ -587,7 +703,7 @@ async function serve() {
             dispatch().catch((error) => process.stderr.write(`${error.message}\n`));
           } else if (value.op === 'ack') {
             const entry = state.messages[value.id];
-            if (!entry || entry.control || entry.clearedAt || !entry.reactionKey || !entry.deliveredTo) throw new Error('message is not available for acknowledgment');
+            if (!entry || entry.control || entry.clearedAt || !entry.reactionKey || !(entry.deliveredTo || entry.routeInFlight)) throw new Error('message is not available for acknowledgment');
             if (!entry.ack) entry.ack = { status: 'queued' };
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, status: 'acknowledgment queued', id: entry.id })}\n`);
@@ -604,7 +720,7 @@ async function serve() {
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, until: new Date(state.acceptMediaUntil).toISOString() })}\n`);
           } else if (value.op === 'status') {
-            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, resetPending: Boolean(state.resetPending), acceptMediaUntil: state.acceptMediaUntil || null, target: target(), pending: Object.values(state.messages).filter((entry) => !entry.reply && !entry.clearedAt).length })}\n`);
+            peer.write(`${JSON.stringify({ ok: true, connected, debugReceipts, resetPending: Boolean(state.resetPending), acceptMediaUntil: state.acceptMediaUntil || null, target: target(), routing: Boolean(routeCmd) && !existsSync(targetPath), pending: Object.values(state.messages).filter((entry) => !entry.reply && !entry.clearedAt).length })}\n`);
           } else {
             peer.write(`${JSON.stringify({ ok: false, error: 'unknown operation' })}\n`);
           }
