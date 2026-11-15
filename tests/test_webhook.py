@@ -3181,6 +3181,32 @@ class TestDispatchSpool(SpoolCase):
             time.sleep(0.05)
         return False
 
+    def test_spool_over_its_byte_cap_loses_the_oldest_waiting_record(self):
+        self.mod.SPOOL_MAX_BYTES = 3000
+        sids = [self.put('github~cap-%d' % i, 'x' * 1500, at=1000 + i)[3] for i in range(4)]
+        self.assertGreater(self.mod.spool_bytes(), 3000)
+        self.mod.spool_enforce_cap()
+        self.assertLessEqual(self.mod.spool_bytes(), 3000)
+        self.assertEqual(self.q.names(), sids[-1:])
+        self.assertEqual(self.mod.spool_status()['overflowDropped'], 3)
+        self.assertIn('LOCAL_WEBHOOK_SPOOL_MAX_BYTES=3000', self.err.getvalue())
+
+    def test_cap_drop_never_removes_a_claimed_record(self):
+        self.put('github~cap-claim', 'x' * 100, at=1000)
+        name = self.q.names()[0]
+        lease = self.q.claim(name, 1234)
+        self.assertTrue(lease)
+        self.assertEqual(self.q.drop_waiting(name), 0)
+        self.assertTrue(os.path.exists(lease))
+
+    def test_overflow_counter_is_visible_across_processes(self):
+        self.mod.SPOOL_MAX_BYTES = 1000
+        for i in range(3):
+            self.put('github~ovf-%d' % i, 'x' * 1500, at=1000 + i)
+        self.mod.spool_enforce_cap()
+        self.mod.SPOOL_OVERFLOW_DROPPED = 0  # a fresh CLI process starts at zero
+        self.assertGreaterEqual(self.mod.spool_status()['overflowDropped'], 2)
+
     def test_a_declined_batch_survives_a_restart_with_its_streak(self):
         d = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q)
         text, meta, env, sid = self.put('github~cap-1', 'held at capacity')
@@ -4529,6 +4555,53 @@ class TestEndToEnd(EndToEndCase):
         self.assertFalse(os.path.exists(os.path.join(self.state, 'codex')))
 
 
+class TestBodyCap(EndToEndCase):
+    """Issue #105: the ingress refuses an oversized body before reading it."""
+
+    def test_oversized_body_is_413_and_small_one_is_not(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        status, _ = self.post(b'x' * 5000)
+        self.assertEqual(status, 413)
+        status, _ = self.post(b'x' * 100)
+        self.assertNotEqual(status, 413)  # reaches the signature/parse path
+
+    def test_negative_chunk_size_is_not_read_to_eof(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.putrequest('POST', '/github')
+        conn.putheader('Transfer-Encoding', 'chunked')
+        conn.putheader('x-github-event', 'issues')
+        conn.endheaders()
+        conn.send(b'-1\r\n' + b'z' * 5000)
+        self.assertNotEqual(conn.getresponse().status, 200)
+        conn.close()
+
+    def test_oversized_chunked_body_is_413(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/github', iter([b'y' * 600, b'y' * 600]),
+                     {'x-github-event': 'issues', 'Transfer-Encoding': 'chunked'},
+                     encode_chunked=True)
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
+
+
+class TestLimitEnv(SpoolCase):
+    def test_bad_limit_keeps_default_and_only_zero_disables(self):
+        for bad in ('', '256MiB', '-5'):
+            os.environ['X_LIM'] = bad
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.mod._limit_env('X_LIM', 77), 77)
+            finally:
+                del os.environ['X_LIM']
+        os.environ['X_LIM'] = '0'
+        try:
+            self.assertEqual(self.mod._limit_env('X_LIM', 77), 0)
+        finally:
+            del os.environ['X_LIM']
+
+
 class TestSpoolEndToEnd(EndToEndCase):
     """#60 end to end: real receiver, real peers, real signed deliveries — and
     the failures that used to lose an accepted event: a peer that is down, a
@@ -4787,6 +4860,75 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(len(names), 2)
         for n in names:
             self.assertRegex(n, r'^[0-9a-f]{40}$')
+
+
+class TestReapOrphanFilterLocks(StateDirCase):
+    def touch(self, name):
+        path = os.path.join(self.state, name)
+        open(path, 'w').close()
+        return path
+
+    def test_reaps_only_locks_without_a_filter(self):
+        orphan = self.touch('filter.hook-gone.json.lock')
+        kept_json = self.touch('filter.live.json')
+        kept_lock = self.touch('filter.live.json.lock')
+        other = self.touch('sources.json.lock')
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertTrue(os.path.exists(kept_json))
+        self.assertTrue(os.path.exists(kept_lock))
+        self.assertTrue(os.path.exists(other))
+
+    def test_skips_a_lock_somebody_holds(self):
+        import fcntl
+        held = self.touch('filter.hook-busy.json.lock')
+        fd = os.open(held, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 0)
+        self.assertTrue(os.path.exists(held))
+
+    def test_a_reaped_key_can_lock_again(self):
+        path = os.path.join(self.state, 'filter.hook-x.json')
+        with self.mod.filter_file_lock(path):
+            pass
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        with self.mod.filter_file_lock(path):
+            self.assertTrue(os.path.exists(path + '.lock'))
+
+    def test_waiter_retries_when_its_lock_is_unlinked(self):
+        import fcntl
+        import threading
+        from unittest import mock
+        path = os.path.join(self.state, 'filter.hook-race.json')
+        lock = path + '.lock'
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        seen = []
+
+        def waiter():
+            with self.mod.filter_file_lock(path):
+                seen.append(os.stat(lock).st_ino)
+
+        opened = threading.Event()
+        real_open = os.open
+
+        def open_and_signal(p, *a, **k):
+            fd = real_open(p, *a, **k)
+            if p == lock and threading.current_thread() is t:
+                opened.set()  # waiter now holds the OLD inode
+            return fd
+
+        t = threading.Thread(target=waiter)
+        with mock.patch.object(self.mod.os, 'open', open_and_signal):
+            t.start()
+            self.assertTrue(opened.wait(5))
+            os.unlink(lock)
+            os.close(holder)  # releases; waiter locks the orphaned inode
+            t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(os.path.exists(lock))
 
 
 class TestVersionConsistency(unittest.TestCase):

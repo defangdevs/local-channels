@@ -719,6 +719,17 @@ concurrent sessions acting as different GitHub users can then subscribe to the
 same repo with different ignore lists — each mutes only its own echoes, while
 fan-out delivers the event to both.
 
+### Orphaned filter locks (0.38.1)
+
+Each filter file has a sibling `filter.<key>.json.lock` for the cross-process
+`flock`. The lock is never unlinked while in use, and routing takes it even for
+a session that never subscribed, so a consumer that mints a session key per
+event batch would leave one per key forever. When the receiver starts it reaps
+the locks whose `filter.<key>.json` does not exist: it takes each with a
+non-blocking `flock` (a held lock is in use and is skipped) and unlinks it
+while holding it. `filter.dispatch.json.lock` is only reaped if the dispatch
+file itself is missing.
+
 ## Following a PR through its merge (0.37.0)
 
 A session entry with an explicit positive `pull_request.number` include leaf
@@ -1050,6 +1061,8 @@ timers calling `emit`) is
 | `LOCAL_WEBHOOK_SPAWN_MAX` | `2` | max concurrent spawn commands across all keys |
 | `LOCAL_WEBHOOK_SPAWN_WINDOW` | `60` | default (a watch's `spawn_window_s` overrides it); seconds after a spawn starts during which further events on the same key coalesce into one follow-up batch |
 | `LOCAL_WEBHOOK_SPAWN_TIMEOUT` | `600` | seconds before a running spawn command is killed (and its batch dropped) |
+| `LOCAL_WEBHOOK_MAX_BODY_BYTES` | `26214400` (25 MiB, GitHub's ceiling) | largest request body the ingress reads; a bigger `Content-Length` (or chunked total) is refused with `413` before the signature check; an empty, negative or non-numeric value keeps the default, only an explicit `0` disables |
+| `LOCAL_WEBHOOK_SPOOL_MAX_BYTES` | `268435456` (256 MiB) | a threshold, not a hard limit: when the inbox, dispatch queue and session boxes together pass it, the periodic reaper drops the OLDEST waiting dispatch records with a log line (running records and session boxes are never dropped, so with none waiting the spool can stay above it); drops are counted as `overflowDropped` in `status` (persisted, so the CLI sees it); an empty, negative or non-numeric value keeps the default, only an explicit `0` disables |
 | `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S` | `300` | how long a batch the spawn command keeps declining (exit `75`) is kept before it is dropped; `0` disables deferral |
 | `LOCAL_WEBHOOK_SPAWN_PENDING_MAX` | `200` | max event lines waiting per key; past it the oldest are dropped |
 | `LOCAL_WEBHOOK_CODEX_THREAD` | — | codex thread (UUID or exact session name) this process delivers to; wins over `CODEX_THREAD_ID` / `CODEX_SESSION_ID`, which codex itself exports |
