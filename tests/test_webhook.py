@@ -118,6 +118,26 @@ class TestVerify(StateDirCase):
         self.assertFalse(self.mod.verify('sekrit', '', self.BODY))
 
 
+class TestPreviousSecret(StateDirCase):
+    """Issue #49: a bounded overlap accepting the retired secret."""
+    FUTURE = '2999-01-01T00:00:00Z'
+    PAST = '2000-01-01T00:00:00Z'
+
+    def test_needs_future_expiry(self):
+        pv = self.mod.previous_secret
+        self.assertEqual(pv({'previousSecret': 'old', 'previousSecretUntil': self.FUTURE}), 'old')
+        self.assertEqual(pv({'previousSecret': 'old', 'previousSecretUntil': self.PAST}), '')
+        self.assertEqual(pv({'previousSecret': 'old'}), '')  # no expiry: never permanent
+        self.assertEqual(pv({'previousSecret': 'old', 'previousSecretUntil': 'garbage'}), '')
+        self.assertEqual(pv({'previousSecretUntil': self.FUTURE}), '')
+
+    def test_file_and_naive_timestamp(self):
+        with open(os.path.join(self.state, 'g.prev'), 'w', encoding='utf-8') as f:
+            f.write('oldfile\n')
+        src = {'previousSecretFile': 'g.prev', 'previousSecretUntil': '2999-01-01T00:00:00'}
+        self.assertEqual(self.mod.previous_secret(src), 'oldfile')
+
+
 class TestVerifyToken(StateDirCase):
     """'token' mode (GitLab's legacy X-Gitlab-Token): the header IS the secret."""
 
@@ -655,6 +675,32 @@ class TestPeerScope(StateDirCase):
         # mute the watch); a legacy name carries no scope, so it claims nothing.
         self.assertEqual(self.mod.peer_scopes_live(), ['alive'])
 
+    def test_peer_roster_lists_live_peers_with_topics_only(self):
+        # #27: who is live and what each claims; a dead peer's leftover
+        # filter file must read as absent, not as a second claimant.
+        inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
+        live = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        dead = subprocess.Popen([PYTHON, '-c', ''])
+        dead.wait()
+        for name in ('alive.%d.sock' % live.pid, 'gone.%d.sock' % dead.pid):
+            open(os.path.join(inst, name), 'w').close()
+        for key in ('alive', 'gone'):
+            with open(os.path.join(self.state, 'filter.%s.json' % key), 'w') as f:
+                json.dump({'topics': [{'topic': 'github:o/r', 'note': 'n-' + key}]}, f)
+        roster = self.mod.peer_roster()
+        self.assertEqual([r['session'] for r in roster], ['alive'])
+        self.assertEqual(roster[0]['pid'], live.pid)
+        self.assertEqual(roster[0]['topics'][0]['topic'], 'github:o/r')
+        self.assertEqual(roster[0]['topics'][0]['note'], 'n-alive')
+        res = self.mod.call_tool({'name': 'webhook_subscriptions',
+                                  'arguments': {'scope': 'all'}})
+        body = json.loads(res['content'][0]['text'].split('\n(expired')[0])
+        self.assertEqual([r['session'] for r in body['peers']], ['alive'])
+        res = self.mod.call_tool({'name': 'webhook_subscriptions', 'arguments': {}})
+        self.assertNotIn('peers', json.loads(res['content'][0]['text']))
+
 
 class TestFilterClaims(StateDirCase):
     """The read-only probe: does some other session already own this event?"""
@@ -783,6 +829,22 @@ class TestCallTool(StateDirCase):
         self.call('webhook_unsubscribe', topic='o/r')
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'][0]['topic'], 'github:o/r')
 
+    def test_subscriptions_rejects_invalid_scope(self):
+        out = self.call('webhook_subscriptions', scope='al')
+        self.assertIn('scope must be "all"', out)
+        self.assertIn('peers', json.loads(self.call('webhook_subscriptions', scope='all')))
+
+    def test_all_scope_stays_parseable_after_expiry(self):
+        self.call('webhook_subscribe', topic='o/r', note='mine', ttl_hours=1)
+        path = os.path.join(self.state, 'filter.testsess.json')
+        f = self.read_json('filter.testsess.json')
+        f['topics'][0]['subscribedAt'] = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        with open(path, 'w') as fh:
+            json.dump(f, fh)
+        body = json.loads(self.call('webhook_subscriptions', scope='all'))
+        self.assertEqual(body['expired'], ['github:o/r'])
+        self.assertIn('peers', body)
+
     def test_subscriptions_lists_both_scopes(self):
         self.call('webhook_subscribe', topic='o/r', note='mine')
         self.call('webhook_subscribe', topic='p/q', deliver_to='subagent', note='watch', include=ANY_EVENT)
@@ -814,6 +876,46 @@ class TestCallTool(StateDirCase):
         body = json.loads(self.call('webhook_subscriptions'))
         self.assertEqual(body['filterState'], 'invalid')
         self.assertIn('unparseable', body['warning'])
+
+    def test_mute_and_unmute_write_only_enabled(self):
+        """#23: the kill switch keeps the list, is idempotent, and routes nothing."""
+        self.call('webhook_subscribe', topic='o/r', note='keep me')
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
+        out = self.call('webhook_mute')
+        self.assertIn('muted', out)
+        self.assertIn('was listening', out)
+        self.assertFalse(self.read_json(os.path.basename(self.mod.FILTER_FILE))['enabled'])
+        self.assertFalse(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertIs(body['enabled'], False)
+        self.assertEqual([t['topic'] for t in body['topics']], ['github:o/r'])
+        self.assertEqual(body['topics'][0]['note'], 'keep me')
+        self.assertIn('was muted', self.call('webhook_mute'))  # idempotent
+        self.assertIn('unmuted', self.call('webhook_unmute'))
+        self.assertIn('was listening', self.call('webhook_unmute'))
+        self.assertTrue(self.mod.route_event('github', 'o/r', 'x', 'issues')['forward'])
+        self.assertIs(json.loads(self.call('webhook_subscriptions'))['enabled'], True)
+
+    def test_mute_works_with_no_filter_file(self):
+        self.assertFalse(os.path.exists(self.mod.FILTER_FILE))
+        self.call('webhook_mute')
+        f = self.read_json(os.path.basename(self.mod.FILTER_FILE))
+        self.assertIs(f['enabled'], False)
+        self.assertEqual(f['topics'], [])
+
+    def test_subscribe_after_mute_listens_again(self):
+        self.call('webhook_mute')
+        self.call('webhook_subscribe', topic='o/r')
+        self.assertIs(json.loads(self.call('webhook_subscriptions'))['enabled'], True)
+
+    def test_mute_dispatch_list_leaves_session_list_alone(self):
+        self.call('webhook_subscribe', topic='o/r')
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent',
+                  include={'path': 'action', 'in': ['opened']})
+        self.assertIn('[dispatch]', self.call('webhook_mute', deliver_to='subagent'))
+        body = json.loads(self.call('webhook_subscriptions'))
+        self.assertIs(body['enabled'], True)
+        self.assertIs(body['dispatch']['enabled'], False)
 
     def test_subscriptions_marks_a_surviving_wildcard_entry(self):
         """A 0.12.x filter carried across the upgrade shows its dead rows as
@@ -2333,6 +2435,22 @@ class TestDispatcher(StateDirCase):
         self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
         self.assertIn('count=1', self.runs(path)[0])
 
+    def test_muted_dispatch_holds_pending_batches_until_unmuted(self):  # #23
+        path, cmd = self.recorder('muted', sleep=1)
+        self.mod.MUTE_POLL_S = 0.2
+        d = self.mod.Dispatcher(cmd, 2, 0, 30)
+        d.add('k', 'e1', {'key': 'k'})
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 1))
+        d.add('k', 'e2', {'key': 'k'})            # queued behind the running spawn
+        self.call('webhook_subscribe', topic='p/q', deliver_to='subagent',
+                  include={'path': 'action', 'in': ['opened']})
+        self.call('webhook_mute', deliver_to='subagent')
+        time.sleep(2)                              # spawn 1 ends; e2 would start now
+        self.assertEqual(len(self.runs(path)), 1)
+        self.assertEqual(self.pending(d, 'k'), ['e2'])  # held, not dropped
+        self.call('webhook_unmute', deliver_to='subagent')
+        self.assertTrue(self.wait_for(lambda: len(self.runs(path)) == 2))
+
     def test_burst_coalesces_into_one_followup(self):
         path, cmd = self.recorder('burst', sleep=1)
         d = self.mod.Dispatcher(cmd, 2, 0, 30)  # window 0: follow-up gated only by the running spawn
@@ -3660,6 +3778,37 @@ class EndToEndCase(unittest.TestCase):
 
 
 class TestEndToEnd(EndToEndCase):
+    def test_previous_secret_overlap(self):
+        import hashlib
+        import hmac as hmac_mod
+        old = 'old-secret'
+        with open(os.path.join(self.state, 'github.secret.prev'), 'w', encoding='utf-8') as f:
+            f.write(old)
+        path = os.path.join(self.state, 'sources.json')
+        with open(path, encoding='utf-8') as f:
+            cfg = json.load(f)
+        cfg['sources']['github'].update(previousSecretFile='github.secret.prev',
+                                        previousSecretUntil='2999-01-01T00:00:00Z')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        r = self.cli('subscribe', 'o/r', '--note', 'overlap',
+                     '--include', self.ANY_EVENT_JSON, session='overlapsess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer = self.start_peer('overlapsess')
+        raw = json.dumps(self.ISSUE).encode()
+        old_sig = 'sha256=' + hmac_mod.new(old.encode(), raw, hashlib.sha256).hexdigest()
+        self.assertEqual(self.post(raw, sig=old_sig)[0], 200)
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['method'], 'notifications/claude/channel')
+        self.assertIn('issue #5 opened on o/r', json.dumps(msg))
+        self.assertEqual(self.post(raw, sig='sha256=' + hmac_mod.new(b'nope', raw, hashlib.sha256).hexdigest())[0], 401)
+        cfg['sources']['github']['previousSecretUntil'] = '2000-01-01T00:00:00Z'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        self.assertEqual(self.post(raw, sig=old_sig)[0], 401)
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+
     def test_http_status_codes(self):
         self.start_daemon()
         self.assertEqual(self.post(self.ISSUE)[0], 200)

@@ -58,6 +58,29 @@ class VersionTags(unittest.TestCase):
         self.assertEqual(tags.git('rev-parse', 'v1.0.0'), original)
         self.assertEqual(tags.git('rev-parse', 'v1.1.0^{commit}'), merged)
 
+    def commit_router(self, version, body=None):
+        path = Path('local-router/router.py')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body if body is not None else '"""doc"""\nVERSION = "%s"\n' % version)
+        tags.git('add', '.')
+        tags.git('commit', '-m', 'local-router ' + version)
+        return tags.git('rev-parse', 'HEAD')
+
+    def test_router_versions_get_separate_tags(self):
+        self.commit('1.0.0')
+        first = self.commit_router('0.1.0')
+        self.commit_router('0.1.0', '"""changed doc"""\nVERSION = "0.1.0"\n')
+        second = self.commit_router('0.2.0')
+        self.assertEqual(tags.router_version_commits('HEAD'), {'0.1.0': first, '0.2.0': second})
+        tags.tag_versions('HEAD')
+        self.assertEqual(tags.git('rev-parse', 'local-router-v0.1.0^{commit}'), first)
+        self.assertEqual(tags.git('rev-parse', 'v1.0.0^{commit}'), tags.git('rev-parse', 'HEAD~3'))
+
+    def test_router_version_must_be_semver(self):
+        self.commit_router('x', 'VERSION = "1.0"\n')
+        with self.assertRaisesRegex(ValueError, 'Invalid local-router version'):
+            tags.router_version_commits('HEAD')
+
     def test_whatsapp_versions_get_separate_immutable_tags(self):
         self.commit('1.0.0')
         first = self.commit_whatsapp('0.1.0')

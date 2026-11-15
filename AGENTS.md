@@ -15,6 +15,12 @@ local-webhook/
                                   IPC fan-out, filter/TTL/dispatch logic, CLI — one file
   README.md                       per-plugin reference docs
 tests/test_webhook.py             stdlib-unittest suite: unit + subprocess e2e
+local-router/
+  router.py                       NOT a plugin: library + CLI that decides which session an
+                                  inbound message belongs to; single file, stdlib only, VERSION
+                                  constant is its version (tags local-router-vX.Y.Z)
+  pyproject.toml                  only so `pip install git+...#subdirectory=local-router` works
+tests/test_router.py              router decisions, prompt bounds and CLI with fake backends
 ```
 
 There is no build system, no lockfile and no generated file. A new plugin is a
@@ -103,6 +109,9 @@ bump usually needs a companion PR in that repo. Mention it in the PR body.
 - PR title mirrors the commit subject; PR body restates the rationale, the
   contracts deliberately left unchanged, and a `## Verification` section with
   what was actually run. Reference the issue it closes.
+- After addressing all comments on a CodeRabbit PR review, resolve the
+  addressed threads and dismiss its review verdict. A comment-only review has
+  no verdict to dismiss.
 - There is no human PR reviewer. Open the PR, wait for CI, and squash-merge it
   yourself once green (squash is why the subject on `main` ends in `(#4)`) —
   which is exactly why every behaviour change must land with test coverage in
