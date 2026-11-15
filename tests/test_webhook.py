@@ -4801,7 +4801,7 @@ class TestReapOrphanFilterLocks(StateDirCase):
     def test_waiter_retries_when_its_lock_is_unlinked(self):
         import fcntl
         import threading
-        import time
+        from unittest import mock
         path = os.path.join(self.state, 'filter.hook-race.json')
         lock = path + '.lock'
         holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
@@ -4812,12 +4812,22 @@ class TestReapOrphanFilterLocks(StateDirCase):
             with self.mod.filter_file_lock(path):
                 seen.append(os.stat(lock).st_ino)
 
+        opened = threading.Event()
+        real_open = os.open
+
+        def open_and_signal(p, *a, **k):
+            fd = real_open(p, *a, **k)
+            if p == lock and threading.current_thread() is t:
+                opened.set()  # waiter now holds the OLD inode
+            return fd
+
         t = threading.Thread(target=waiter)
-        t.start()
-        time.sleep(0.3)  # waiter is parked in flock() on the old inode
-        os.unlink(lock)
-        os.close(holder)  # releases; waiter locks the orphaned inode
-        t.join(5)
+        with mock.patch.object(self.mod.os, 'open', open_and_signal):
+            t.start()
+            self.assertTrue(opened.wait(5))
+            os.unlink(lock)
+            os.close(holder)  # releases; waiter locks the orphaned inode
+            t.join(5)
         self.assertFalse(t.is_alive())
         self.assertEqual(len(seen), 1)
         self.assertTrue(os.path.exists(lock))
