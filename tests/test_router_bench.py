@@ -79,7 +79,9 @@ class Mix(unittest.TestCase):
             self.assertEqual(m[0]["orig_seq"], 0)    # topics still start in order
 
     def test_deterministic(self):
-        self.assertEqual(bench.mix(STREAM, 0.5, 3), bench.mix(STREAM, 0.5, 3))
+        first = bench.mix(STREAM, 0.5, 3)
+        second = bench.mix(list(STREAM), 0.5, 3)
+        self.assertEqual([r["orig_seq"] for r in first], [r["orig_seq"] for r in second])
 
 
 class Scoring(unittest.TestCase):

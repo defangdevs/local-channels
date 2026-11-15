@@ -17,7 +17,7 @@ python3 bench/bench.py --data ~/my_labelled_chat.jsonl --backend codex
 same parsing and the same fallback. It has the same constraints as `router.py`:
 one file, the standard library only, Python 3.9 or later. Model answers are
 cached by prompt in `bench/.cache.jsonl` (not committed), so a second run with
-the same router and data makes no model calls. Use `--json` for a machine-readable
+the same router and data makes no model calls (`--no-cache` turns it off). Use `--json` for a machine-readable
 result.
 
 ## Two modes

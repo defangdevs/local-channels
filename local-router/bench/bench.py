@@ -23,7 +23,7 @@ Same constraints as router.py: single file, stdlib only, python >= 3.9.
   python3 bench/bench.py --router gap:2            # a baseline, no model calls
   python3 bench/bench.py --data my_streams.jsonl   # your own labelled data
 
-Model answers are cached by prompt (--cache), so a re-run with the same router
+Model answers are cached by prompt in bench/.cache.jsonl, so a re-run with the same router
 and data costs nothing. Delete the cache after changing the backend's model.
 """
 import argparse
@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import router as R  # noqa: E402
 
 DATA = os.path.join(HERE, "data")
+CACHE = os.path.join(HERE, ".cache.jsonl")   # fixed path: the bench writes nowhere else
 SKIP = ("CONTROL", "EVENT")   # gold actions that are not routing decisions
 
 
@@ -307,8 +308,8 @@ def main(argv=None):
     ap.add_argument("--backend", default="auto", choices=["auto"] + sorted(R.BACKENDS))
     ap.add_argument("--model")
     ap.add_argument("--short-rule", help="CHARS,SECONDS (see router.route)")
-    ap.add_argument("--cache", default=os.path.join(HERE, ".cache.jsonl"),
-                    help="answer cache file, '' to disable (default bench/.cache.jsonl)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="do not read or write the answer cache (bench/.cache.jsonl)")
     ap.add_argument("--workers", type=int, default=2, help="streams routed in parallel")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
@@ -328,7 +329,7 @@ def main(argv=None):
             kw = {"model": args.model} if args.model else {}
             backend = R.BACKENDS[args.backend](**kw)
         tag = "%s/%s" % (getattr(backend, "name", args.backend), getattr(backend, "model", args.model or ""))
-        cached = Cached(backend, args.cache or None, tag)
+        cached = Cached(backend, None if args.no_cache else CACHE, tag)
         short = None
         if args.short_rule:
             c, s = args.short_rule.split(",")
