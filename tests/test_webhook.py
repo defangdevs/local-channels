@@ -675,6 +675,32 @@ class TestPeerScope(StateDirCase):
         # mute the watch); a legacy name carries no scope, so it claims nothing.
         self.assertEqual(self.mod.peer_scopes_live(), ['alive'])
 
+    def test_peer_roster_lists_live_peers_with_topics_only(self):
+        # #27: who is live and what each claims; a dead peer's leftover
+        # filter file must read as absent, not as a second claimant.
+        inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
+        live = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        dead = subprocess.Popen([PYTHON, '-c', ''])
+        dead.wait()
+        for name in ('alive.%d.sock' % live.pid, 'gone.%d.sock' % dead.pid):
+            open(os.path.join(inst, name), 'w').close()
+        for key in ('alive', 'gone'):
+            with open(os.path.join(self.state, 'filter.%s.json' % key), 'w') as f:
+                json.dump({'topics': [{'topic': 'github:o/r', 'note': 'n-' + key}]}, f)
+        roster = self.mod.peer_roster()
+        self.assertEqual([r['session'] for r in roster], ['alive'])
+        self.assertEqual(roster[0]['pid'], live.pid)
+        self.assertEqual(roster[0]['topics'][0]['topic'], 'github:o/r')
+        self.assertEqual(roster[0]['topics'][0]['note'], 'n-alive')
+        res = self.mod.call_tool({'name': 'webhook_subscriptions',
+                                  'arguments': {'scope': 'all'}})
+        body = json.loads(res['content'][0]['text'].split('\n(expired')[0])
+        self.assertEqual([r['session'] for r in body['peers']], ['alive'])
+        res = self.mod.call_tool({'name': 'webhook_subscriptions', 'arguments': {}})
+        self.assertNotIn('peers', json.loads(res['content'][0]['text']))
+
 
 class TestFilterClaims(StateDirCase):
     """The read-only probe: does some other session already own this event?"""
@@ -802,6 +828,22 @@ class TestCallTool(StateDirCase):
         self.call('webhook_subscribe', topic='o/r', deliver_to='subagent', include=ANY_EVENT)
         self.call('webhook_unsubscribe', topic='o/r')
         self.assertEqual(self.read_json('filter.dispatch.json')['topics'][0]['topic'], 'github:o/r')
+
+    def test_subscriptions_rejects_invalid_scope(self):
+        out = self.call('webhook_subscriptions', scope='al')
+        self.assertIn('scope must be "all"', out)
+        self.assertIn('peers', json.loads(self.call('webhook_subscriptions', scope='all')))
+
+    def test_all_scope_stays_parseable_after_expiry(self):
+        self.call('webhook_subscribe', topic='o/r', note='mine', ttl_hours=1)
+        path = os.path.join(self.state, 'filter.testsess.json')
+        f = self.read_json('filter.testsess.json')
+        f['topics'][0]['subscribedAt'] = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        with open(path, 'w') as fh:
+            json.dump(f, fh)
+        body = json.loads(self.call('webhook_subscriptions', scope='all'))
+        self.assertEqual(body['expired'], ['github:o/r'])
+        self.assertIn('peers', body)
 
     def test_subscriptions_lists_both_scopes(self):
         self.call('webhook_subscribe', topic='o/r', note='mine')

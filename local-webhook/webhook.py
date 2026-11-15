@@ -4731,10 +4731,87 @@ TOOLS = [
     {
         'name': 'webhook_subscriptions',
         'description': 'Return this session\'s topic subscriptions, the shared dispatch (standing-watch) '
-                       'list if any, and the channel-enabled flag.',
-        'inputSchema': {'type': 'object', 'properties': {}},
+                       'list if any, and the channel-enabled flag. scope:"all" also lists every other '
+                       'live session\'s subscriptions (peers).',
+        'inputSchema': {'type': 'object', 'properties': {
+            'scope': {'type': 'string', 'enum': ['all'],
+                      'description': 'all = add a peers roster of every live session and its topics'}}},
     },
 ]
+
+
+def render_entry(e, default_ttl, now):
+    o = {'topic': e['topic']}
+    # Kept, never matching, and SAID so — a consumer must not have to
+    # re-derive the grammar to spot a dead row, and could not do it
+    # safely anyway: the same string is legal on a 0.12.x daemon, so
+    # only the daemon serving the row knows whether it still parses.
+    reason = topic_invalid_reason(e['topic'])
+    if reason:
+        o['invalid'] = True
+        o['reason'] = reason
+    if e['name']:
+        o['name'] = e['name']
+    if e['note']:
+        o['note'] = e['note']
+    if note_warning(e):
+        o['warning'] = note_warning(e)
+    if e['ttlHours'] is not None:
+        o['ttlHours'] = e['ttlHours']
+    if e['renewOnEvent']:
+        o['renewOnEvent'] = True
+    if e['ignoreSenders']:
+        o['ignoreSenders'] = e['ignoreSenders']
+    if e['include'] is not None:
+        o['include'] = e['include']
+    if e['exclude'] is not None:
+        o['exclude'] = e['exclude']
+    active_merges = [dict(r, expiresAt=iso_at(parse_ms(r['mergedAt']) + MERGE_TTL_MS))
+                     for r in e.get('mergeCommits', [])
+                     if now < parse_ms(r['mergedAt']) + MERGE_TTL_MS]
+    if active_merges:
+        o['mergeCommits'] = active_merges
+    if e['spawnConfig']:
+        o['spawnConfig'] = e['spawnConfig']
+    if e.get('ownership') == 'none':
+        o['ownership'] = 'none'
+    if e.get('spawnWindowS') is not None:
+        o['spawnWindowS'] = e['spawnWindowS']
+    if e['subscribedAt']:
+        o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
+    if e['lastActivityAt']:
+        o['lastActivity'] = '%s ago' % age_str(e['lastActivityAt'], now)
+    o['expiresIn'] = expires_str(e, default_ttl, now)
+    return o
+
+
+def peer_roster(now=None):
+    """Live session peers and what each one is subscribed to — #27.
+
+    Read off the same two sources peer_scopes_live() reads: the instance
+    socket names say WHICH sessions are alive (pid-checked), and the filter
+    file named by each key says what they claim. A filter file whose peer has
+    no live socket is absent here, never a second claimant. Read-only: nothing
+    is stamped, renewed or pruned (expired rows are simply left out).
+    """
+    now = now_ms() if now is None else now
+    pids = {}
+    try:
+        names = os.listdir(INSTANCE_DIR)
+    except OSError:
+        names = []
+    for n in names:
+        parsed = peer_scope(n)
+        if parsed and pid_alive(parsed[1]):
+            pids.setdefault(parsed[0], parsed[1])
+    sessions = []
+    for key in sorted(pids):
+        f = read_filter(filter_path_of(key))
+        rows = [render_entry(e, f['ttlHours'], now) for e in f['topics']
+                if not entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
+        sessions.append({'session': key, 'pid': pids[key], 'self': key == FILTER_KEY,
+                         'enabled': f['enabled'], 'topics': rows})
+    return sessions
 
 
 def call_tool(params):
@@ -4770,56 +4847,22 @@ def call_tool(params):
             return f, expired
 
         def render(e, default_ttl):
-            o = {'topic': e['topic']}
-            # Kept, never matching, and SAID so — a consumer must not have to
-            # re-derive the grammar to spot a dead row, and could not do it
-            # safely anyway: the same string is legal on a 0.12.x daemon, so
-            # only the daemon serving the row knows whether it still parses.
-            reason = topic_invalid_reason(e['topic'])
-            if reason:
-                o['invalid'] = True
-                o['reason'] = reason
-            if e['name']:
-                o['name'] = e['name']
-            if e['note']:
-                o['note'] = e['note']
-            if note_warning(e):
-                o['warning'] = note_warning(e)
-            if e['ttlHours'] is not None:
-                o['ttlHours'] = e['ttlHours']
-            if e['renewOnEvent']:
-                o['renewOnEvent'] = True
-            if e['ignoreSenders']:
-                o['ignoreSenders'] = e['ignoreSenders']
-            if e['include'] is not None:
-                o['include'] = e['include']
-            if e['exclude'] is not None:
-                o['exclude'] = e['exclude']
-            active_merges = [dict(r, expiresAt=iso_at(parse_ms(r['mergedAt']) + MERGE_TTL_MS))
-                             for r in e.get('mergeCommits', [])
-                             if now < parse_ms(r['mergedAt']) + MERGE_TTL_MS]
-            if active_merges:
-                o['mergeCommits'] = active_merges
-            if e['spawnConfig']:
-                o['spawnConfig'] = e['spawnConfig']
-            if e.get('ownership') == 'none':
-                o['ownership'] = 'none'
-            if e.get('spawnWindowS') is not None:
-                o['spawnWindowS'] = e['spawnWindowS']
-            if e['subscribedAt']:
-                o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
-            if e['lastActivityAt']:
-                o['lastActivity'] = '%s ago' % age_str(e['lastActivityAt'], now)
-            o['expiresIn'] = expires_str(e, default_ttl, now)
-            return o
+            return render_entry(e, default_ttl, now)
 
         if name == 'webhook_subscriptions':
+            if arguments.get('scope', _MISSING) not in (_MISSING, 'all'):
+                return text('error: scope must be "all"')
             f, expired = pruned(FILTER_FILE)
             body = {'enabled': f['enabled'], 'ttlHours': f['ttlHours']}
             if SELF:
                 body['self'] = SELF
             body['filterFile'] = FILTER_FILE
             body['topics'] = [render(e, f['ttlHours']) for e in f['topics']]
+            # scope:"all" (#27): every OTHER live session's subscriptions too,
+            # so "is anyone else on this topic?" is answerable before
+            # subscribing. Opt-in: the default reply stays this session's own.
+            if arguments.get('scope') == 'all':
+                body['peers'] = peer_roster(now)
             # All three empty cases now route the same (nothing), so the list is
             # no longer misleading on its own — 0.12.1's failOpen field is gone
             # with the behaviour it warned about. What still differs is whether
@@ -4860,6 +4903,13 @@ def call_tool(params):
                           'inherit): %s. Re-subscribe with rules saying which events deserve a '
                           'session.' % ', '.join(mute))
                 expired = expired + dexpired
+            if arguments.get('scope') == 'all':
+                # Keep the roster reply parseable: a trailing note after the
+                # JSON object would break json.loads on exactly the call that
+                # pruned something.
+                if expired:
+                    body['expired'] = [e['topic'] for e in expired]
+                return text(pretty(body))
             expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
             return text(pretty(body) + expired_note)
 
@@ -5473,7 +5523,7 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
        webhook.py unmute [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
        webhook.py read-content ID
-       webhook.py ls
+       webhook.py ls [--scope all]   (all: also list other live peers' claims)
        webhook.py status
 
 mute writes enabled:false (nothing is delivered, every topic is kept); unmute
@@ -5763,6 +5813,7 @@ def run_cli(argv):
     if cmd == 'status':
         cfg = read_sources()
         f = read_filter()
+        roster = peer_roster()
         # Secrets stay out of this: only which sources are configured, and whether
         # each has a usable secret (an unconfigured source rejects every delivery).
         print(pretty({
@@ -5779,6 +5830,7 @@ def run_cli(argv):
             'codexPeer': codex_peer_status(),
             'enabled': f['enabled'],
             'topicCount': len(f['topics']),
+            'peers': {'live': len(roster), 'sessions': roster},
             'dispatchTopicCount': len(read_filter(DISPATCH_FILE)['topics']),
             'receiver': receiver_info(),
             # #60: what is waiting right now, read off the spool directories —
@@ -5847,6 +5899,10 @@ def run_cli(argv):
             if not math.isfinite(n) or n < 0:
                 die('--ttl must be a number >= 0 (0 = never expire)')
             args['ttl_hours'] = int(n) if n.is_integer() else n
+        elif a == '--scope':
+            args['scope'] = value()
+            if args['scope'] != 'all':
+                die('--scope must be "all"')
         elif a == '--deliver-to':
             v = value().strip().lower()
             if v not in ('session', 'subagent'):
