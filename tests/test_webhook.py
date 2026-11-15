@@ -4649,6 +4649,30 @@ class TestReapOrphanFilterLocks(StateDirCase):
         with self.mod.filter_file_lock(path):
             self.assertTrue(os.path.exists(path + '.lock'))
 
+    def test_waiter_retries_when_its_lock_is_unlinked(self):
+        import fcntl
+        import threading
+        import time
+        path = os.path.join(self.state, 'filter.hook-race.json')
+        lock = path + '.lock'
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        seen = []
+
+        def waiter():
+            with self.mod.filter_file_lock(path):
+                seen.append(os.stat(lock).st_ino)
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.3)  # waiter is parked in flock() on the old inode
+        os.unlink(lock)
+        os.close(holder)  # releases; waiter locks the orphaned inode
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(os.path.exists(lock))
+
 
 class TestVersionConsistency(unittest.TestCase):
     """The release invariants AGENTS.md states, enforced."""

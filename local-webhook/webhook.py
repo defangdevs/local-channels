@@ -657,26 +657,39 @@ FILTER_LOCK = threading.RLock()
 # whatever process it runs in — against every other one on the same path.
 @contextlib.contextmanager
 def filter_file_lock(path):
-    fd = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    while True:
+        fd = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # reap_orphan_filter_locks() may unlink the lock while we wait.
+            # Only an inode still at the path protects the filter; otherwise
+            # retry on a fresh one.
+            try:
+                if os.stat(path + '.lock').st_ino == os.fstat(fd).st_ino:
+                    break
+            except FileNotFoundError:
+                pass
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+    try:
+        yield
     finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
 
-# filter_file_lock() never unlinks its ".lock" (unlinking a lock someone holds
-# is the classic two-inodes race), and route_event() takes it on the read path
-# too, so every session key ever routed to leaves one behind — one per hook
-# session, forever (#61). Reap only the locks that guard NO filter: the sibling
-# ".json" is absent. A non-blocking flock is the probe — if anyone holds it, it
-# is in use, so skip — and the unlink happens while holding it. A lost mutual
-# exclusion on a never-written key protects nothing, so the residual race is
-# the one that already exists before a lock file is first created.
+# filter_file_lock() never unlinks its ".lock", and route_event() takes it on
+# the read path too, so every session key ever routed to leaves one behind —
+# one per hook session, forever (#61). Reap only the locks that guard NO
+# filter: the sibling ".json" is absent. A non-blocking flock is the probe — if
+# anyone holds it, it is in use, so skip — and the unlink happens while holding
+# it. A waiter that opened the old inode before the unlink would otherwise lock
+# an inode no longer at the path (and so race a first write to an absent
+# filter); filter_file_lock() therefore re-checks, after locking, that its
+# descriptor is still the inode at the path, and retries on a fresh one if not.
 def reap_orphan_filter_locks():
     try:
         names = os.listdir(STATE_DIR)
