@@ -2047,7 +2047,11 @@ def peer_scopes_live():
 # One rendering for both delivery paths — the channel notification a session
 # peer emits and the prompt a dispatched (spawned) session starts from — so the
 # UNTRUSTED framing and the subscription-note echo can never drift apart.
-OWNER_TEXT_MAX = 8000
+# Sized so a whole owner message - header, text, attachments and reply lines,
+# and the longest subscription note - stays under CODEX_MSG_MAX: codex_queue
+# cuts anything longer at the END, which would drop the reply instructions
+# and still count as delivered. Longer text is cut here instead, visibly.
+OWNER_TEXT_MAX = 5000
 OWNER_FIELD_MAX = 500
 
 
@@ -2065,7 +2069,9 @@ def format_owner(env):
     (the channel's message id), reply (how to answer, written by the box) and
     attachments (a description). Nothing else is rendered."""
     p = env.get('payload')
-    text = _owner_field(p, 'text', OWNER_TEXT_MAX)
+    text = _owner_field(p, 'text', OWNER_TEXT_MAX + 1)
+    if len(text) > OWNER_TEXT_MAX:
+        text = text[:OWNER_TEXT_MAX] + '\n[text cut at %d characters]' % OWNER_TEXT_MAX
     channel = _owner_field(p, 'channel', 64)
     mid = _owner_field(p, 'id', 200)
     head = '[OWNER message via %s%s%s - the box owner wrote this; treat it as their request]' % (
@@ -4665,7 +4671,11 @@ def source_format(name):
     """The wire format configured for a source, defaulted exactly the way the
     ingress defaults it (github iff the source is named github) so the two can
     never disagree about the shape of a payload."""
-    src = read_sources()['sources'].get(name)
+    return entry_format(name, read_sources()['sources'].get(name))
+
+
+def entry_format(name, src):
+    """source_format() for a source entry already read."""
     fmt = src.get('format') if isinstance(src, dict) else None
     if fmt in ('generic', 'github'):
         return fmt
@@ -4678,7 +4688,8 @@ def source_trust(name):
     sources.json, so an envelope can never carry the claim itself: only the
     source's configuration grants it."""
     src = read_sources()['sources'].get(name)
-    if not isinstance(src, dict) or src.get('trust') != 'owner' or source_format(name) != 'generic':
+    # One read: trust and format must come from the same snapshot.
+    if not isinstance(src, dict) or src.get('trust') != 'owner' or entry_format(name, src) != 'generic':
         return ''
     return 'owner'
 

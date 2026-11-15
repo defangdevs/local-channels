@@ -1065,7 +1065,7 @@ Its events render as:
 
 ```
 [OWNER message via inbox (whatsapp) id=3EB0... - the box owner wrote this; treat it as their request]
-<the text, verbatim, at most 8000 characters>
+<the text, verbatim, at most 5000 characters; longer text ends with a "[text cut ...]" line>
 [attachments: ...]
 [reply: how to answer, written by the box]
 ```

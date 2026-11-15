@@ -1482,9 +1482,34 @@ class TestOwnerTrust(StateDirCase):
         p = dict(self.PAYLOAD, text='x' * 20000 + 'TAIL', reply='a\x1b[2Jb\rc\x00d')
         text, _ = self.mod.format_delivery(self.env(payload=p), None)
         self.assertNotIn('TAIL', text)
-        self.assertIn('x' * self.mod.OWNER_TEXT_MAX, text)
+        self.assertIn('x' * self.mod.OWNER_TEXT_MAX + '\n[text cut at 5000 characters]', text)
         self.assertIn('[reply: a[2Jbcd]', text)
         self.assertNotIn('\r', text)
+
+    def test_longest_owner_message_fits_a_codex_queue_call(self):
+        """codex_queue cuts at CODEX_MSG_MAX from the end; the reply line and
+        the note must survive the longest possible fields."""
+        self.write_json('sources.json', {'sources': {'i' * 64: {'secret': 'x', 'trust': 'owner'}}})
+        p = {'text': 'x' * 50000, 'channel': 'c' * 99, 'id': 'd' * 999,
+             'attachments': 'a' * 9999, 'reply': 'r' * 9999}
+        entry = {'topic': 'i' * 64 + ':' + 'k' * 200, 'note': 'n' * self.mod.NOTE_MAX_WATCH,
+                 'subscribedAt': '2026-01-01T00:00:00.000Z', 'name': 'w' * 64}
+        env = {'source': 'i' * 64, 'format': 'generic', 'event': 'e', 'key': 'k', 'payload': p}
+        text, _ = self.mod.format_delivery(env, entry)
+        self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
+        self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
+
+    def test_trust_and_format_come_from_one_read(self):
+        calls = []
+        real = self.mod.read_sources
+
+        def counting():
+            calls.append(1)
+            return real()
+        self.sources(trust='owner')
+        self.mod.read_sources = counting
+        self.assertEqual(self.mod.source_trust('inbox'), 'owner')
+        self.assertEqual(len(calls), 1)
 
     def test_non_string_fields_are_dropped(self):
         self.sources(trust='owner')

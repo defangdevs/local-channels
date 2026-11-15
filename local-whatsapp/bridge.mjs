@@ -41,7 +41,7 @@ if (!isAbsolute(sessionBin) || !isAbsolute(codexBin)) throw new Error('bridge he
 // command's policy. Unset keeps the old behaviour (one spawned session).
 const routeCmd = process.env.LOCAL_WHATSAPP_ROUTE_CMD || '';
 if (routeCmd && !isAbsolute(routeCmd)) throw new Error('LOCAL_WHATSAPP_ROUTE_CMD must be an absolute path');
-const ROUTE_TIMEOUT_MS = 180000;   // one model call plus, for a new topic, a session start
+const ROUTE_TIMEOUT_MS = Number(process.env.LOCAL_WHATSAPP_ROUTE_TIMEOUT_MS) || 180000;   // one model call plus, for a new topic, a session start
 const ROUTE_RETRY_MS = 30000;
 const ROUTE_RECENT = 50;
 
@@ -226,21 +226,40 @@ function routeMessage(message, state) {
     recent,
   });
   return new Promise((resolve, reject) => {
-    const child = spawn(routeCmd, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Own process group, so the deadline can stop the router AND anything it
+    // started (a model CLI, a session start) that still holds our pipes.
+    const child = spawn(routeCmd, [], { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     let output = '';
     let error = '';
-    const timeout = setTimeout(() => child.kill(), ROUTE_TIMEOUT_MS);
-    child.stdout.on('data', (chunk) => { output += chunk.toString(); if (output.length > 20000) child.kill(); });
-    child.stderr.on('data', (chunk) => { error = (error + chunk.toString()).slice(-1000); });
-    child.on('error', (failure) => { clearTimeout(timeout); reject(failure); });
-    child.on('close', (code) => {
+    let settled = false;
+    const stopTree = (signal) => {
+      try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch { /* gone */ } }
+    };
+    const finish = (failure, decision) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
-      if (code !== 0) return reject(new Error(error.trim() || `route command exited ${code}`));
+      if (failure) reject(failure); else resolve(decision);
+    };
+    // The deadline settles the promise by itself: a router that ignores
+    // SIGTERM, or a grandchild that keeps the pipes open, never emits close.
+    // A late completion after this is ignored, so it cannot record success.
+    const timeout = setTimeout(() => {
+      stopTree('SIGTERM');
+      setTimeout(() => stopTree('SIGKILL'), 5000).unref();
+      child.stdout.destroy(); child.stderr.destroy();
+      finish(new Error(`route command timed out after ${ROUTE_TIMEOUT_MS / 1000}s`));
+    }, ROUTE_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => { output += chunk.toString(); if (output.length > 20000) stopTree('SIGKILL'); });
+    child.stderr.on('data', (chunk) => { error = (error + chunk.toString()).slice(-1000); });
+    child.on('error', (failure) => finish(failure));
+    child.on('close', (code) => {
+      if (code !== 0) return finish(new Error(error.trim() || `route command exited ${code}`));
       try {
         const decision = JSON.parse(output);
         if (!decision || !/^[A-Za-z0-9_-]{1,150}$/.test(decision.session || '')) throw new Error('route command gave no session');
-        resolve(decision);
-      } catch (failure) { reject(failure); }
+        finish(null, decision);
+      } catch (failure) { finish(failure); }
     });
     child.stdin.on('error', () => {});
     child.stdin.end(body);
@@ -415,6 +434,8 @@ async function serve() {
   const initialAuth = await useMultiFileAuthState(authPath);
   if (!initialAuth.state.creds.me) throw new Error('device not paired: run pair first');
   const state = loadState(dir);
+  // A route call cannot survive a bridge restart; its message is retried.
+  for (const message of Object.values(state.messages)) delete message.routeInFlight;
   cleanImageOutbox(dir, state);
   cleanMediaInbox(dir, state, true);
   const peers = new Map();
@@ -453,12 +474,26 @@ async function serve() {
         for (const message of Object.values(state.messages)) {
           if (resetting || state.resetPending) break;
           if (message.reply || message.control || message.clearedAt || message.deliveredTo) continue;
-          if (Date.now() - (message.lastAttemptAt || 0) < ROUTE_RETRY_MS) break;
+          // The retry delay counts from the end of the failed attempt
+          // (routeRetryAt); lastAttemptAt covers a bridge that died mid-call.
+          if (Date.now() < (message.routeRetryAt || 0) ||
+              Date.now() - (message.lastAttemptAt || 0) < ROUTE_RETRY_MS) break;
           message.lastAttemptAt = Date.now();
+          // The router delivers BEFORE it answers, so the chosen session can
+          // acknowledge while the call is still running (see the ack op).
+          message.routeInFlight = true;
           saveState(dir, state);
           let decision;
           try { decision = await routeMessage(message, state); }
-          catch (error) { process.stderr.write(`route failed for ${message.id}: ${error.message}\n`); break; }
+          catch (error) {
+            delete message.routeInFlight;
+            message.routeRetryAt = Date.now() + ROUTE_RETRY_MS;
+            saveState(dir, state);
+            process.stderr.write(`route failed for ${message.id}: ${error.message}\n`);
+            break;
+          }
+          delete message.routeInFlight;
+          delete message.routeRetryAt;
           message.deliveredTo = `route:${decision.session}`;
           message.routedTo = decision.session;
           if (debugReceipts) {
@@ -668,7 +703,7 @@ async function serve() {
             dispatch().catch((error) => process.stderr.write(`${error.message}\n`));
           } else if (value.op === 'ack') {
             const entry = state.messages[value.id];
-            if (!entry || entry.control || entry.clearedAt || !entry.reactionKey || !entry.deliveredTo) throw new Error('message is not available for acknowledgment');
+            if (!entry || entry.control || entry.clearedAt || !entry.reactionKey || !(entry.deliveredTo || entry.routeInFlight)) throw new Error('message is not available for acknowledgment');
             if (!entry.ack) entry.ack = { status: 'queued' };
             saveState(dir, state);
             peer.write(`${JSON.stringify({ ok: true, status: 'acknowledgment queued', id: entry.id })}\n`);

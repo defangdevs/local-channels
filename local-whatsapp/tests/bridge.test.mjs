@@ -881,3 +881,40 @@ test('a relative route command is refused', () => {
   assert.match(result.stderr, /must be an absolute path/);
   rmSync(f.dir, { recursive: true, force: true });
 });
+
+test('the chosen session can acknowledge before the route command returns', async () => {
+  // The router delivers first and answers last: run the ack it was handed
+  // while still running, the way a fast session would.
+  const r = routeFixture(`ack=$(printf '%s' "$body" | sed -n 's/.*"ack":"\\([^"]*\\)".*/\\1/p')\n$ack > "$ACKED" 2>&1 || echo FAILED >> "$ACKED"\nprintf '%s\\n' '{"session":"wa-x","action":"NEW"}'`);
+  const acked = join(r.fixture.dir, 'acked.txt');
+  const env = { ...r.env, ACKED: acked };
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(join(r.fixture.state, 'messages.json')) && Object.values(r.saved().messages)[0]?.deliveredTo, 'routed');
+    assert.match(readFileSync(acked, 'utf8'), /acknowledgment queued/);
+    assert.doesNotMatch(readFileSync(acked, 'utf8'), /FAILED/);
+    const entry = Object.values(r.saved().messages)[0];
+    assert.equal(entry.routeInFlight, undefined);
+    await waitUntil(() => existsSync(r.fixture.fakeOut) && readFileSync(r.fixture.fakeOut, 'utf8').includes('"react"'), 'reaction');
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+
+test('a hung route command is stopped at the deadline and retried later', async () => {
+  // Ignores SIGTERM and leaves a grandchild holding the pipes.
+  const r = routeFixture(`trap '' TERM\n(sleep 60) &\nsleep 60`);
+  const env = { ...r.env, LOCAL_WHATSAPP_ROUTE_TIMEOUT_MS: '400' };
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let errors = '';
+  daemon.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  try {
+    await waitUntil(() => errors.includes('route command timed out after 0.4s'), 'deadline');
+    await waitUntil(() => Object.values(r.saved().messages)[0]?.routeRetryAt, 'retry time');
+    const entry = Object.values(r.saved().messages)[0];
+    assert.equal(entry.deliveredTo, null);
+    assert.equal(entry.routeInFlight, undefined);
+    assert.ok(entry.routeRetryAt >= Date.now() + 25000, 'retry waits 30 s after the failure');
+    // The bridge still answers its control socket: nothing is wedged.
+    const status = spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' });
+    assert.equal(status.status, 0, status.stderr);
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});

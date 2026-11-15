@@ -161,8 +161,9 @@ what was said in it.
 Response on stdout, exit status 0: `{"session": "NAME", "action": "NEW"}`.
 `session` is required; `action` is shown only in debug receipts. Any other
 result (a non-zero exit, no session, more than 180 seconds) leaves the message
-pending. The bridge tries it again after 30 seconds, and a later message never
-overtakes it. The bridge never falls back to starting a session itself.
+pending. At the deadline the bridge stops the command's whole process group. It
+tries again 30 seconds after the failure, and a later message never overtakes
+it. The chosen session may run `ack` while the command is still running. The bridge never falls back to starting a session itself.
 
 The bridge stays mechanism. Which session, which model decides and how the
 message reaches the session are the command's policy (agent-box uses
