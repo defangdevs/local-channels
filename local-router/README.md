@@ -47,8 +47,8 @@ labels.
 
 ## Why this design
 
-The design comes from a benchmark (the scripts are not in this repo yet). The
-data: 4,251 messages from 120 per-user WildChat streams, labelled by an LLM judge
+The design comes from a benchmark; [`bench/`](bench/README.md) has the script
+and the public part of the data. The data: 4,251 messages from 120 per-user WildChat streams, labelled by an LLM judge
 with hindsight, plus hand-labelled personal WhatsApp and Grok chats.
 
 - **An LLM, not rules or embeddings.** One decision at a time, with the correct
