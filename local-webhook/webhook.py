@@ -4806,6 +4806,13 @@ def call_tool(params):
                           'inherit): %s. Re-subscribe with rules saying which events deserve a '
                           'session.' % ', '.join(mute))
                 expired = expired + dexpired
+            if arguments.get('scope') == 'all':
+                # Keep the roster reply parseable: a trailing note after the
+                # JSON object would break json.loads on exactly the call that
+                # pruned something.
+                if expired:
+                    body['expired'] = [e['topic'] for e in expired]
+                return text(pretty(body))
             expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
             return text(pretty(body) + expired_note)
 

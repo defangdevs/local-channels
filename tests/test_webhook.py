@@ -814,6 +814,17 @@ class TestCallTool(StateDirCase):
         self.assertIn('scope must be "all"', out)
         self.assertIn('peers', json.loads(self.call('webhook_subscriptions', scope='all')))
 
+    def test_all_scope_stays_parseable_after_expiry(self):
+        self.call('webhook_subscribe', topic='o/r', note='mine', ttl_hours=1)
+        path = os.path.join(self.state, 'filter.testsess.json')
+        f = self.read_json('filter.testsess.json')
+        f['topics'][0]['subscribedAt'] = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        with open(path, 'w') as fh:
+            json.dump(f, fh)
+        body = json.loads(self.call('webhook_subscriptions', scope='all'))
+        self.assertEqual(body['expired'], ['github:o/r'])
+        self.assertIn('peers', body)
+
     def test_subscriptions_lists_both_scopes(self):
         self.call('webhook_subscribe', topic='o/r', note='mine')
         self.call('webhook_subscribe', topic='p/q', deliver_to='subagent', note='watch', include=ANY_EVENT)
