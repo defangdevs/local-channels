@@ -5,7 +5,7 @@ HTTP (GitHub or any other sender that signs the raw body with HMAC-SHA256) and
 pushes a concise, untrusted-marked summary of each event into the Claude Code
 session that spawned it — or, since 0.26.0, into a
 [codex session](#delivering-into-a-codex-session-0260) via `codex queue`. Ships MCP tools (`webhook_subscribe`,
-`webhook_unsubscribe`, `webhook_subscriptions`) so the agent can route which
+`webhook_unsubscribe`, `webhook_subscriptions`, plus `webhook_mute` / `webhook_unmute` as a kill switch that keeps the list) so the agent can route which
 topics reach it — hot-reloaded per delivery, no session restart needed — plus an
 equivalent [CLI](#cli) for callers with no MCP client.
 
@@ -94,6 +94,7 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 | key | default | meaning |
 |---|---|---|
 | `secret` / `secretFile` | — | verification secret (file paths resolve in the state dir) |
+| `previousSecret` / `previousSecretFile` + `previousSecretUntil` | — | rotation overlap: while the ISO-8601 `previousSecretUntil` is in the future, a delivery that fails the current secret is also verified against the previous one, and logged as such. Without a future expiry it is ignored, so an overlap cannot become permanent |
 | `format` | `github` iff source is named github, else `generic` | payload summarizer |
 | `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` — see [Verification modes](#verification-modes-0300) |
 | `signatureHeader` | depends on `verification` (`x-hub-signature-256` / `x-gitlab-token` / `webhook-signature`) | the signature, in that mode's own shape |
@@ -718,7 +719,7 @@ concurrent sessions acting as different GitHub users can then subscribe to the
 same repo with different ignore lists — each mutes only its own echoes, while
 fan-out delivers the event to both.
 
-### Orphaned filter locks (0.37.3)
+### Orphaned filter locks (0.38.1)
 
 Each filter file has a sibling `filter.<key>.json.lock` for the cross-process
 `flock`. The lock is never unlinked while in use, and routing takes it even for
@@ -896,6 +897,8 @@ the two paths can't drift on TTL/renew semantics:
         --note "standing watch: new issues/PRs and failing CI spawn a fresh session"
     python3 webhook.py ls
     python3 webhook.py unsubscribe owner/repo
+    python3 webhook.py mute          # kill switch: enabled:false, topics kept
+    python3 webhook.py unmute        # enabled:true again
     python3 webhook.py status        # state dir, session, sources (no secrets),
                                      # and what is waiting in the spool
     python3 webhook.py emit budget '{"used_pct":92,"window":"5h"}' \
@@ -1163,3 +1166,15 @@ may be missing until that event is delivered again. This hook carries source
 identity and payload separately, so a deployment can implement GitHub and
 Slack reactions without parsing the rendered prompt. It adds no transport
 reply tool or default external writes to local-webhook itself.
+
+
+## Who else is subscribed? (`peers`, #27)
+
+Delivery fans out: every live peer applies its own filter to each event.
+`webhook.py status` now carries `peers: {live, sessions: [...]}`, and
+`webhook_subscriptions` takes `scope: "all"` (CLI: `ls --scope all`) to add the
+same `peers` list. Each row is `{session, pid, self, enabled, topics}`, with
+topics rendered exactly like your own. A session counts only while its socket's
+pid is alive, so a crashed peer's leftover filter file reads as absent.
+The roster is read-only and says nothing about whether a shared topic is a
+problem; that judgement belongs to the consumer.

@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.37.3'
+VERSION = '0.38.1'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -190,6 +190,8 @@ def pretty(obj):
 # Per-source keys (all optional except one of secret/secretFile):
 #   secret          inline secret string
 #   secretFile      path to secret file (relative paths resolve in STATE_DIR)
+#   previousSecret[File] + previousSecretUntil (ISO-8601): rotation overlap —
+#                   the retired secret also verifies until that time (issue #49)
 #   format          "github" | "generic"; default "github" iff the source is
 #                   named github, else "generic"
 #   verification    "hmac-hex" (default) | "token" | "standard-webhooks" — see
@@ -250,6 +252,40 @@ def source_secret(src):
         except OSError:
             pass
     return ''
+
+
+def _read_secret_value(inline, path):
+    if isinstance(inline, str) and inline.strip():
+        return inline.strip()
+    if isinstance(path, str) and path:
+        try:
+            p = path if os.path.isabs(path) else os.path.join(STATE_DIR, path)
+            with open(p, encoding='utf-8') as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return ''
+
+
+def previous_secret(src, now=None):
+    """The retired secret still accepted during a rotation overlap (issue #49).
+
+    Needs previousSecret/previousSecretFile AND a previousSecretUntil ISO-8601
+    timestamp in the future; a missing, unparseable or past expiry means no
+    overlap, so an overlap can never become permanent by accident."""
+    until = src.get('previousSecretUntil')
+    if not isinstance(until, str):
+        return ''
+    try:
+        dt = datetime.fromisoformat(until.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return ''
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    cur = now if now is not None else time.time()
+    if dt.timestamp() <= cur:
+        return ''
+    return _read_secret_value(src.get('previousSecret'), src.get('previousSecretFile'))
 
 
 # The sender signs the raw request body with HMAC-SHA256; the header carries
@@ -516,7 +552,7 @@ def learned_numbers(e, source, key, event, payload, at):
 
 FILTER_COMMENT = (
     "Hot-reloaded per delivery by local-webhook. Managed by MCP tools webhook_subscribe / "
-    "webhook_unsubscribe. enabled=false mutes everything; topics supports exact 'source:key' and prefix "
+    "webhook_unsubscribe. enabled=false mutes everything (webhook_mute / webhook_unmute write it); topics supports exact 'source:key' and prefix "
     "'source:prefix/*' — there is no wildcard for a whole source or the whole bus; an entry's identity is "
     "(topic, name) — name defaults to '' (unnamed) so a plain topic still finds and renews the one entry "
     "it always did; give two subscribe calls on the same topic different names (#63) to keep them as two "
@@ -3531,6 +3567,10 @@ SPAWN_DEFER_MAX_S = max(0, _int_env('LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S', default=3
 SPAWN_PENDING_MAX = max(1, _int_env('LOCAL_WEBHOOK_SPAWN_PENDING_MAX', default=200))
 
 
+# How often a muted dispatch list is re-read for an unmute while batches wait.
+MUTE_POLL_S = 2
+
+
 class Dispatcher:
     # Until 0.33.0 this state was in-memory only, on the reasoning that "the
     # same deliveries reached session peers". They did not: a standing watch
@@ -3737,6 +3777,20 @@ class Dispatcher:
     def _pump(self, key):
         st = self.keys[key]
         if st['running'] or not st['pending'] or self.active >= self.max:
+            return
+        # A muted dispatch list (#23, webhook_mute deliver_to:"subagent") must
+        # also stop batches that were queued BEFORE the mute — capacity waits,
+        # coalescing timers, deferred retries and spool recoveries all reach
+        # this point, and route_event's enabled check only ever saw their
+        # arrival. Mute RETAINS: the batch stays pending (and its spool records
+        # stay leased to nobody, so they survive a restart) and a slow timer
+        # re-asks, so unmute resumes it without any other trigger. Discarding
+        # would lose events the owner never chose to drop.
+        if not read_filter(DISPATCH_FILE)['enabled']:
+            if st['timer'] is None:
+                st['timer'] = threading.Timer(MUTE_POLL_S, self._on_timer, args=(key,))
+                st['timer'].daemon = True
+                st['timer'].start()
             return
         # A batch the spawn command declined (exit 75) is paced by the larger of
         # the watch's window and the global one, with a floor of one second:
@@ -4340,6 +4394,7 @@ INSTRUCTIONS = (
     'Some sources retain full untrusted payloads: use webhook.py read-content ID from the reference in a delivery; '
     'the reference expires independently of delivery. '
     'Routing is controlled by the tools webhook_subscribe / webhook_unsubscribe / webhook_subscriptions, '
+    'with webhook_mute / webhook_unmute as a kill switch that keeps the list, '
     'which manage topic patterns of the form "source:key" — e.g. github:owner/repo or github:owner/*; a '
     'bare "owner/repo" is shorthand for github:owner/repo. There is no pattern for a whole source or the '
     'whole bus, so name what you actually want. Subscribe '
@@ -4577,7 +4632,11 @@ TOOLS = [
                         'describes the WATCH, so two watches on the same repo can start different workers '
                         '(e.g. {"profile": "cheap-triage"} on the new-issues watch and {"profile": '
                         '"deep-fix"} on the failing-CI one — what those names mean is the spawner\'s '
-                        'business, not this plugin\'s). Keys are 1-64 chars of [A-Za-z0-9_-], values must '
+                        'business, not this plugin\'s). agent-box\'s own spawner additionally honors '
+                        '{"remoteControl": "true"|"false"}: whether a match should be reachable from the '
+                        'claude/codex mobile and desktop apps (named after agent-box-session add '
+                        '--remote-control, the flag it feeds), versus kept off them. Unset keeps each '
+                        'resolved harness\'s own current default. Keys are 1-64 chars of [A-Za-z0-9_-], values must '
                         'be strings (quote numbers), at most 16 pairs. Echoed by webhook_subscriptions and '
                         'readable from the spawned process\'s environment, so put a lookup key there, '
                         'never a credential. Refused on a deliver_to:"session" subscription, which spawns '
@@ -4687,12 +4746,127 @@ TOOLS = [
         },
     },
     {
+        'name': 'webhook_mute',
+        'description':
+            'Kill switch (#23): stop ALL delivery to this session at once WITHOUT losing its subscription list. '
+            'Writes enabled:false and keeps every topic, so webhook_unmute restores exactly what was listening. '
+            'Use it to silence a flood in one call instead of N unsubscribes. Works on a session whose filter '
+            'file does not exist yet (it writes one with no topics). Pass deliver_to:"subagent" to mute the '
+            'shared dispatch (standing-watch) list instead: batches already waiting to spawn are held, not dropped, and resume on unmute. Idempotent. Note: a later webhook_subscribe '
+            'writes enabled:true again, since subscribing is an explicit ask to listen. '
+            'webhook_subscriptions reports the state as `enabled`.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'deliver_to': {
+                    'type': 'string',
+                    'enum': ['session', 'subagent'],
+                    'description': 'Which list to mute: "session" (default) or the shared "subagent" dispatch list.',
+                },
+            },
+        },
+    },
+    {
+        'name': 'webhook_unmute',
+        'description':
+            'Undo webhook_mute: write enabled:true, so this session\'s kept subscriptions deliver again. '
+            'Does not add or renew anything — expired topics stay expired. Pass deliver_to:"subagent" for the '
+            'shared dispatch list. Idempotent.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'deliver_to': {
+                    'type': 'string',
+                    'enum': ['session', 'subagent'],
+                    'description': 'Which list to unmute: "session" (default) or the shared "subagent" dispatch list.',
+                },
+            },
+        },
+    },
+    {
         'name': 'webhook_subscriptions',
         'description': 'Return this session\'s topic subscriptions, the shared dispatch (standing-watch) '
-                       'list if any, and the channel-enabled flag.',
-        'inputSchema': {'type': 'object', 'properties': {}},
+                       'list if any, and the channel-enabled flag. scope:"all" also lists every other '
+                       'live session\'s subscriptions (peers).',
+        'inputSchema': {'type': 'object', 'properties': {
+            'scope': {'type': 'string', 'enum': ['all'],
+                      'description': 'all = add a peers roster of every live session and its topics'}}},
     },
 ]
+
+
+def render_entry(e, default_ttl, now):
+    o = {'topic': e['topic']}
+    # Kept, never matching, and SAID so — a consumer must not have to
+    # re-derive the grammar to spot a dead row, and could not do it
+    # safely anyway: the same string is legal on a 0.12.x daemon, so
+    # only the daemon serving the row knows whether it still parses.
+    reason = topic_invalid_reason(e['topic'])
+    if reason:
+        o['invalid'] = True
+        o['reason'] = reason
+    if e['name']:
+        o['name'] = e['name']
+    if e['note']:
+        o['note'] = e['note']
+    if note_warning(e):
+        o['warning'] = note_warning(e)
+    if e['ttlHours'] is not None:
+        o['ttlHours'] = e['ttlHours']
+    if e['renewOnEvent']:
+        o['renewOnEvent'] = True
+    if e['ignoreSenders']:
+        o['ignoreSenders'] = e['ignoreSenders']
+    if e['include'] is not None:
+        o['include'] = e['include']
+    if e['exclude'] is not None:
+        o['exclude'] = e['exclude']
+    active_merges = [dict(r, expiresAt=iso_at(parse_ms(r['mergedAt']) + MERGE_TTL_MS))
+                     for r in e.get('mergeCommits', [])
+                     if now < parse_ms(r['mergedAt']) + MERGE_TTL_MS]
+    if active_merges:
+        o['mergeCommits'] = active_merges
+    if e['spawnConfig']:
+        o['spawnConfig'] = e['spawnConfig']
+    if e.get('ownership') == 'none':
+        o['ownership'] = 'none'
+    if e.get('spawnWindowS') is not None:
+        o['spawnWindowS'] = e['spawnWindowS']
+    if e['subscribedAt']:
+        o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
+    if e['lastActivityAt']:
+        o['lastActivity'] = '%s ago' % age_str(e['lastActivityAt'], now)
+    o['expiresIn'] = expires_str(e, default_ttl, now)
+    return o
+
+
+def peer_roster(now=None):
+    """Live session peers and what each one is subscribed to — #27.
+
+    Read off the same two sources peer_scopes_live() reads: the instance
+    socket names say WHICH sessions are alive (pid-checked), and the filter
+    file named by each key says what they claim. A filter file whose peer has
+    no live socket is absent here, never a second claimant. Read-only: nothing
+    is stamped, renewed or pruned (expired rows are simply left out).
+    """
+    now = now_ms() if now is None else now
+    pids = {}
+    try:
+        names = os.listdir(INSTANCE_DIR)
+    except OSError:
+        names = []
+    for n in names:
+        parsed = peer_scope(n)
+        if parsed and pid_alive(parsed[1]):
+            pids.setdefault(parsed[0], parsed[1])
+    sessions = []
+    for key in sorted(pids):
+        f = read_filter(filter_path_of(key))
+        rows = [render_entry(e, f['ttlHours'], now) for e in f['topics']
+                if not entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
+        sessions.append({'session': key, 'pid': pids[key], 'self': key == FILTER_KEY,
+                         'enabled': f['enabled'], 'topics': rows})
+    return sessions
 
 
 def call_tool(params):
@@ -4728,56 +4902,22 @@ def call_tool(params):
             return f, expired
 
         def render(e, default_ttl):
-            o = {'topic': e['topic']}
-            # Kept, never matching, and SAID so — a consumer must not have to
-            # re-derive the grammar to spot a dead row, and could not do it
-            # safely anyway: the same string is legal on a 0.12.x daemon, so
-            # only the daemon serving the row knows whether it still parses.
-            reason = topic_invalid_reason(e['topic'])
-            if reason:
-                o['invalid'] = True
-                o['reason'] = reason
-            if e['name']:
-                o['name'] = e['name']
-            if e['note']:
-                o['note'] = e['note']
-            if note_warning(e):
-                o['warning'] = note_warning(e)
-            if e['ttlHours'] is not None:
-                o['ttlHours'] = e['ttlHours']
-            if e['renewOnEvent']:
-                o['renewOnEvent'] = True
-            if e['ignoreSenders']:
-                o['ignoreSenders'] = e['ignoreSenders']
-            if e['include'] is not None:
-                o['include'] = e['include']
-            if e['exclude'] is not None:
-                o['exclude'] = e['exclude']
-            active_merges = [dict(r, expiresAt=iso_at(parse_ms(r['mergedAt']) + MERGE_TTL_MS))
-                             for r in e.get('mergeCommits', [])
-                             if now < parse_ms(r['mergedAt']) + MERGE_TTL_MS]
-            if active_merges:
-                o['mergeCommits'] = active_merges
-            if e['spawnConfig']:
-                o['spawnConfig'] = e['spawnConfig']
-            if e.get('ownership') == 'none':
-                o['ownership'] = 'none'
-            if e.get('spawnWindowS') is not None:
-                o['spawnWindowS'] = e['spawnWindowS']
-            if e['subscribedAt']:
-                o['subscribed'] = '%s ago' % age_str(e['subscribedAt'], now)
-            if e['lastActivityAt']:
-                o['lastActivity'] = '%s ago' % age_str(e['lastActivityAt'], now)
-            o['expiresIn'] = expires_str(e, default_ttl, now)
-            return o
+            return render_entry(e, default_ttl, now)
 
         if name == 'webhook_subscriptions':
+            if arguments.get('scope', _MISSING) not in (_MISSING, 'all'):
+                return text('error: scope must be "all"')
             f, expired = pruned(FILTER_FILE)
             body = {'enabled': f['enabled'], 'ttlHours': f['ttlHours']}
             if SELF:
                 body['self'] = SELF
             body['filterFile'] = FILTER_FILE
             body['topics'] = [render(e, f['ttlHours']) for e in f['topics']]
+            # scope:"all" (#27): every OTHER live session's subscriptions too,
+            # so "is anyone else on this topic?" is answerable before
+            # subscribing. Opt-in: the default reply stays this session's own.
+            if arguments.get('scope') == 'all':
+                body['peers'] = peer_roster(now)
             # All three empty cases now route the same (nothing), so the list is
             # no longer misleading on its own — 0.12.1's failOpen field is gone
             # with the behaviour it warned about. What still differs is whether
@@ -4818,11 +4958,32 @@ def call_tool(params):
                           'inherit): %s. Re-subscribe with rules saying which events deserve a '
                           'session.' % ', '.join(mute))
                 expired = expired + dexpired
+            if arguments.get('scope') == 'all':
+                # Keep the roster reply parseable: a trailing note after the
+                # JSON object would break json.loads on exactly the call that
+                # pruned something.
+                if expired:
+                    body['expired'] = [e['topic'] for e in expired]
+                return text(pretty(body))
             expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
             return text(pretty(body) + expired_note)
 
         f, expired = pruned(path)
         expired_note = ' (expired just now: %s)' % ', '.join(e['topic'] for e in expired) if expired else ''
+
+        # The two verbs that write `enabled` and nothing else (#23). Until
+        # 0.38.0 nothing wrote enabled:false, so the flag read_filter and the
+        # fan-out already honoured was reachable only by hand-editing the
+        # state file — which forks the write path (TTL stamps, atomic replace,
+        # the locks held here) into whoever supervises the session.
+        if name in ('webhook_mute', 'webhook_unmute'):
+            on = name == 'webhook_unmute'
+            was = f['enabled']
+            write_filter({**f, 'enabled': on}, path)
+            return text('%s%s (was %s; %d topic%s kept)%s' % (
+                'unmuted' if on else 'muted', ' [dispatch]' if dispatch else '',
+                'listening' if was else 'muted', len(f['topics']),
+                '' if len(f['topics']) == 1 else 's', expired_note))
 
         topic = str(arguments.get('topic') if arguments.get('topic') is not None else '').strip()
         if GH_SHORTHAND.match(topic):
@@ -5185,8 +5346,17 @@ def deliver(handler, body):
         return done(404, 'unknown source')
 
     secret = source_secret(src)
-    if not secret or not verify_delivery(src, secret, handler.headers, body):
+    if not secret:
         return done(401, 'invalid signature')
+    if not verify_delivery(src, secret, handler.headers, body):
+        # Rotation overlap (#49): accept the retired secret until its expiry,
+        # and say so, so a sender nobody updated is visible.
+        prev = previous_secret(src)
+        if not prev or prev == secret or not verify_delivery(src, prev, handler.headers, body):
+            return done(401, 'invalid signature')
+        print('local-webhook: %s delivery verified with the PREVIOUS secret (valid until %s) — '
+              'update the sender to the new secret' % (name, src.get('previousSecretUntil')),
+              file=sys.stderr)
 
     try:
         payload = json.loads(body.decode('utf-8'))
@@ -5404,10 +5574,17 @@ usage: webhook.py subscribe TOPIC [--name NAME] [--note TEXT] [--ttl HOURS]
                                   [--spawn-config KEY=VALUE]... [--read-only]
                                   [--spawn-window SECONDS]
        webhook.py unsubscribe TOPIC [--name NAME] [--deliver-to MODE]
+       webhook.py mute [--deliver-to MODE]
+       webhook.py unmute [--deliver-to MODE]
        webhook.py emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
        webhook.py read-content ID
-       webhook.py ls
+       webhook.py ls [--scope all]   (all: also list other live peers' claims)
        webhook.py status
+
+mute writes enabled:false (nothing is delivered, every topic is kept); unmute
+writes enabled:true. Both are idempotent, act on the session named by
+LOCAL_WEBHOOK_SESSION, and `ls`/`status` report the result as `enabled`. A
+later `subscribe` writes enabled:true again.
 
 TOPIC is "source:key" — "github:owner/repo" (exact) or "github:owner/*"
 (prefix). A bare "owner/repo" means github. There is no wildcard for a whole
@@ -5691,6 +5868,7 @@ def run_cli(argv):
     if cmd == 'status':
         cfg = read_sources()
         f = read_filter()
+        roster = peer_roster()
         # Secrets stay out of this: only which sources are configured, and whether
         # each has a usable secret (an unconfigured source rejects every delivery).
         print(pretty({
@@ -5707,6 +5885,7 @@ def run_cli(argv):
             'codexPeer': codex_peer_status(),
             'enabled': f['enabled'],
             'topicCount': len(f['topics']),
+            'peers': {'live': len(roster), 'sessions': roster},
             'dispatchTopicCount': len(read_filter(DISPATCH_FILE)['topics']),
             'receiver': receiver_info(),
             # #60: what is waiting right now, read off the spool directories —
@@ -5733,6 +5912,7 @@ def run_cli(argv):
         return run_emit(argv[1:], die)
 
     tool_for = {'subscribe': 'webhook_subscribe', 'unsubscribe': 'webhook_unsubscribe',
+                'mute': 'webhook_mute', 'unmute': 'webhook_unmute',
                 'ls': 'webhook_subscriptions', 'subscriptions': 'webhook_subscriptions'}
     tool = tool_for.get(cmd)
     if not tool:
@@ -5774,6 +5954,10 @@ def run_cli(argv):
             if not math.isfinite(n) or n < 0:
                 die('--ttl must be a number >= 0 (0 = never expire)')
             args['ttl_hours'] = int(n) if n.is_integer() else n
+        elif a == '--scope':
+            args['scope'] = value()
+            if args['scope'] != 'all':
+                die('--scope must be "all"')
         elif a == '--deliver-to':
             v = value().strip().lower()
             if v not in ('session', 'subagent'):
@@ -5837,7 +6021,9 @@ def run_cli(argv):
         args['ignore_senders'] = ignore_senders
     if saw_spawn_config:
         args['spawn_config'] = spawn_config
-    if tool != 'webhook_subscriptions' and 'topic' not in args:
+    if tool in ('webhook_mute', 'webhook_unmute') and 'topic' in args:
+        die('%s takes no TOPIC; it acts on the whole list (--deliver-to picks which)' % cmd)
+    if tool not in ('webhook_subscriptions', 'webhook_mute', 'webhook_unmute') and 'topic' not in args:
         die('%s needs a TOPIC\n\n%s' % (cmd, CLI_USAGE))
 
     res = call_tool({'name': tool, 'arguments': args})
