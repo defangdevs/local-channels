@@ -185,3 +185,8 @@ class ReleaseBump(unittest.TestCase):
         Path('local-router/router.py').write_text('VERSION = "0.5.0"\n')
         self.commit('manual bump')
         self.assertEqual(rb.release(self.base, apply=False), {})
+
+    def test_refs_are_validated(self):
+        for bad in ('--output=x', 'a b', '$(id)'):
+            with self.assertRaises(ValueError):
+                rb.release(bad, apply=False)

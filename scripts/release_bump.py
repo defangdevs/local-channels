@@ -31,6 +31,16 @@ def git(*args):
     return subprocess.check_output(['git', *args], text=True)
 
 
+def commit_id(ref):
+    """Resolve one revision to a full commit ID; same guard as tag_versions.py."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/~^{}@-]*', ref):
+        raise ValueError('Invalid release ref: ' + ref)
+    oid = git('rev-parse', '--verify', '--end-of-options', ref + '^{commit}').strip()
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', oid):
+        raise ValueError('Invalid commit ID: ' + oid)
+    return oid
+
+
 def bump(version, level):
     major, minor, patch = map(int, version.split('.'))
     return '%d.%d.0' % (major, minor + 1) if level == 'minor' else \
@@ -73,9 +83,9 @@ def write(plugin, old, new):
 
 def release(base, head='HEAD', apply=True):
     """Return {plugin: (old, new)}; write the files when apply."""
-    rng = base + '..' + head
-    files = git('diff', '--name-only', rng).splitlines()
-    subjects = git('log', '--format=%s', rng).splitlines()
+    rng = commit_id(base) + '..' + commit_id(head)
+    files = git('diff', '--name-only', rng, '--').splitlines()
+    subjects = git('log', '--format=%s', rng, '--').splitlines()
     level = level_for(subjects)
     result = {}
     for plugin, targets in PLUGINS.items():
