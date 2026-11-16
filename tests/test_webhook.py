@@ -5153,6 +5153,26 @@ class TestReadOnlyStateDir(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(os.listdir(state), [])
 
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root ignores mode bits')
+    def test_ls_does_not_rewrite_expired_entries(self):
+        state = tempfile.mkdtemp(prefix='webhook-ro-')
+        self.addCleanup(shutil.rmtree, state, True)
+        path = os.path.join(state, 'filter.ro.json')  # session 'ro' below
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'ttlHours': 1, 'topics': [
+                {'topic': 'github:o/r', 'expiresAt': 1}]}, f)
+        with open(path, encoding='utf-8') as f:
+            before = f.read()
+        os.chmod(state, 0o500)
+        self.addCleanup(os.chmod, state, 0o700)
+        env = dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=state, LOCAL_WEBHOOK_SESSION='ro')
+        r = subprocess.run([PYTHON, WEBHOOK_PY, 'ls'], env=env, capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(f.read(), before)
+        self.assertIn('github:o/r', r.stdout)
+
 
 class TestVersionConsistency(unittest.TestCase):
     """The release invariants AGENTS.md states, enforced."""

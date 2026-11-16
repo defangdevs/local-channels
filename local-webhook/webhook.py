@@ -3680,6 +3680,8 @@ if not RECEIVER_ONLY and not CLI:
         except OSError:
             pass
     try:
+        # Retried here: a transient failure above must not leave the bind to fail.
+        os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
         _ipc_srv = socket.socket(socket.AF_UNIX)
         _addr, _close = _sock_open(IPC_SOCK)
         try:
@@ -5123,17 +5125,24 @@ def call_tool(params):
     # webhook_subscriptions reads and prunes BOTH files regardless of `path`
     # (see below), so both are locked here rather than only the one this call
     # is otherwise scoped to.
-    with FILTER_LOCK, filter_file_lock(FILTER_FILE), filter_file_lock(DISPATCH_FILE):
+    # Listing writes nothing (#147), so it takes no .lock file either: creating
+    # one is a write, and a read-only state dir must still answer `ls`.
+    with contextlib.ExitStack() as _locks:
+        if name != 'webhook_subscriptions':
+            _locks.enter_context(FILTER_LOCK)
+            _locks.enter_context(filter_file_lock(FILTER_FILE))
+            _locks.enter_context(filter_file_lock(DISPATCH_FILE))
         now = now_ms()
 
         # Every tool call is also a pruning opportunity: expired topics drop out
         # here even if no delivery ever arrives to trigger route_event's prune.
-        def pruned(p):
+        def pruned(p, persist=True):
             f = read_filter(p)
             expired = [e for e in f['topics'] if entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
             if expired:
                 f['topics'] = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
-                write_filter(f, p)
+                if persist:
+                    write_filter(f, p)
             return f, expired
 
         def render(e, default_ttl):
@@ -5142,7 +5151,9 @@ def call_tool(params):
         if name == 'webhook_subscriptions':
             if arguments.get('scope', _MISSING) not in (_MISSING, 'all'):
                 return text('error: scope must be "all"')
-            f, expired = pruned(FILTER_FILE)
+            # Listing is read-only (#147): expired entries are left out of the
+            # reply but not rewritten, so `ls` works on a read-only state dir.
+            f, expired = pruned(FILTER_FILE, persist=False)
             body = {'enabled': f['enabled'], 'ttlHours': f['ttlHours']}
             if SELF:
                 body['self'] = SELF
@@ -5168,7 +5179,7 @@ def call_tool(params):
                     'no filter file: this session receives nothing until it subscribes. Before '
                     '0.13.0 this state forwarded EVERY event of every wired source instead.')
             # Dispatch standing watches are shared, so every session sees them.
-            d, dexpired = pruned(DISPATCH_FILE)
+            d, dexpired = pruned(DISPATCH_FILE, persist=False)
             if d['topicsConfigured']:
                 body['dispatch'] = {'filterFile': DISPATCH_FILE, 'enabled': d['enabled'],
                                     'topics': [render(e, d['ttlHours']) for e in d['topics']]}
