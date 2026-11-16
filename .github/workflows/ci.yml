@@ -52,14 +52,16 @@ jobs:
     # collide on the version lines. The range is derived from the repo itself
     # (changes since each plugin's last version change), so a cancelled or
     # superseded run loses nothing: the next one picks it up.
+    # No concurrency group on purpose: GitHub lets a late-finishing OLDER run
+    # replace a NEWER pending job in a group, which would drop the newer bump.
+    # Without one every pushed commit keeps its own release job. A job whose
+    # push is rejected always has a newer main, and the job for main's head
+    # releases everything before it (stateless range), so none is lost.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, whatsapp]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency:
-      group: version-tags
-      cancel-in-progress: false
     outputs:
       sha: ${{ steps.bump.outputs.sha }}
     steps:
@@ -97,14 +99,13 @@ jobs:
           fi
 
   tag:
+    # No concurrency group, same reason as above. Tagging is idempotent: it
+    # tags the first commit carrying each version and never moves a tag.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency:
-      group: version-tags
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
