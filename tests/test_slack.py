@@ -43,7 +43,9 @@ class Rig(unittest.TestCase):
         self.t = [1000.0]
         self.events, self.reacts = [], []
         self.store = slack.Store(':memory:')
-        self.cfg = slack._merge(slack.DEFAULT_CHANNEL, {'quiet_minutes': 10, 'max_wait_hours': 1})
+        self.cfg = slack._merge(slack.DEFAULT_CHANNEL, {
+            'quiet_minutes': 10, 'max_wait_hours': 1,
+            'reactions': {'ready': 'white_check_mark', 'hold': 'hand', 'drop': 'x'}})
         self.extra = {}
         self.defaults = {}
         self.tr = slack.Tracker(
@@ -136,6 +138,13 @@ class TestTracker(Rig):
         self.assertEqual(self.actions()[0], 'message.posted')
         self.assertEqual(self.events[0][1]['identifier'], 'T1/C1/1.1')
 
+    def test_reaction_track_accepts_alias(self):
+        self.cfg['track'] = 'reaction:raised_hand'
+        self.tr.handle(msg('1.1', 'hello'))
+        self.assertEqual(self.events, [])
+        self.tr.handle(reaction('1.1', 'hand'))
+        self.assertEqual(self.actions()[0], 'message.posted')
+
     def test_edit_without_mention_change_stays_ignored(self):
         self.cfg['track'] = 'mention'
         self.tr.handle(msg('1.1', 'please look'))
@@ -225,6 +234,17 @@ class TestTracker(Rig):
                                            'C7': {'controllers': 0}, 'C8': {'controllers': ''}}))
             ch, _ = slack.load_config(p)
             self.assertEqual(sorted(ch), ['C3', 'C4'])
+
+    def test_configured_alias_holds_on_canonical_event(self):
+        self.cfg['reactions']['hold'] = 'raised_hand'
+        self.tr.handle(msg('1.1'))
+        self.tr.handle(reaction('1.1', 'hand'))
+        self.advance(5000)
+        self.assertEqual(self.tr.tick(), 0)
+
+    def test_no_emoji_controls_by_default(self):
+        self.assertEqual({k: v for k, v in slack.DEFAULT_CHANNEL['reactions'].items()},
+                         {'ready': None, 'hold': None, 'drop': None, 'ack': None})
 
     def test_hold_blocks_settle_until_removed(self):
         self.tr.handle(msg('1.1'))
@@ -433,7 +453,7 @@ class TestText(unittest.TestCase):
 
     def test_links(self):
         self.assertEqual(self.c('see https://github.com/o/r/pull/1'),
-                         'see <https://github.com/o/r/pull/1|github.com>')
+                         'see <https://github.com/o/r/pull/1|github.com/o/r/pull/1>')
         with self.assertRaises(slack.Refused):
             self.c('see https://evil.example/x')
         with self.assertRaises(slack.Refused):
@@ -709,11 +729,46 @@ class TestReviewRegressions(Rig):
                 self.c(text)
         self.assertEqual(self.c('see github.com/o/r and README.md'), 'see github.com/o/r and README.md')
 
+    def test_link_label_keeps_host_and_truncates(self):
+        self.assertEqual(slack.link_label('https://github.com/'), 'github.com')
+        long = slack.link_label('https://github.com/' + 'a' * 100)
+        self.assertTrue(long.startswith('github.com/aaa') and len(long) == 60 and long.endswith('\u2026'))
+
+    def test_link_label_never_cuts_host(self):
+        host = 'a' * 55 + '.example.com'
+        self.assertEqual(slack.link_label('https://%s/x/y' % host), host)
+
+    def test_markup_check_not_quadratic(self):
+        import time
+        t = time.time()
+        self.assertIsNone(slack._MARKUP_RE.search('<' + '|' * 50000))
+        self.assertLess(time.time() - t, 1)
+
+    def test_disclosure_with_ampersand_not_doubled(self):
+        d = '_AI & automation_'
+        cfg = slack._merge(slack.DEFAULT_CHANNEL, {})
+        dfl = slack._merge(slack.DEFAULT_DEFAULTS, {})
+        body = slack.compose('hi\n\n' + d, lambda k, n: None, cfg, dfl)
+        self.assertEqual(slack.with_disclosure(body, d), body)
+
+    def test_agent_link_markup_refused(self):
+        cfg = slack._merge(slack.DEFAULT_CHANNEL, {})
+        dfl = slack._merge(slack.DEFAULT_DEFAULTS, {'links': {'allowed_hosts': ['github.com']}})
+        for t in ('see <https://github.com/o/r/issues/1|o/r#1>', 'see <https://github.com/o/r>', '<x|y>'):
+            with self.assertRaises(slack.Refused):
+                slack.compose(t, lambda k, n: None, cfg, dfl)
+        slack.compose('code `<a|b>` is fine', lambda k, n: None, cfg, dfl)
+
+    def test_disclosure_not_doubled(self):
+        d = '_— AI agent_'
+        self.assertEqual(slack.with_disclosure('hi', d), 'hi\n\n' + d)
+        self.assertEqual(slack.with_disclosure('hi\n\n' + d, d), 'hi\n\n' + d)
+
     def test_trailing_punctuation_stays_out_of_links(self):
         self.assertEqual(self.c('see https://github.com/x/y/pull/1.'),
-                         'see <https://github.com/x/y/pull/1|github.com>.')
+                         'see <https://github.com/x/y/pull/1|github.com/x/y/pull/1>.')
         self.assertEqual(self.c('(https://github.com/x), then https://github.com/y!'),
-                         '(<https://github.com/x|github.com>), then <https://github.com/y|github.com>!')
+                         '(<https://github.com/x|github.com/x>), then <https://github.com/y|github.com/y>!')
 
     def test_bare_email_domain_is_checked(self):
         with self.assertRaises(slack.Refused):

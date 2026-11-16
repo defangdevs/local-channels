@@ -98,6 +98,35 @@ class StateDirCase(unittest.TestCase):
             json.dump(obj, f)
 
 
+class TestInboxReady(StateDirCase):
+    """0.39.1: the inbox opens SPOOL_READY_SETTLE_MS after the handshake, and
+    the grace fallback only serves a client that never sends one."""
+
+    def test_grace_fallback_does_not_cut_a_late_handshake_short(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.SPOOL_READY_SETTLE_MS = 60_000       # the settle timer will not fire here
+        m.inbox_ready_after_settle()           # the handshake, at 29.9 s
+        m.open_inbox_after_grace()             # the grace timer, at 30 s
+        self.assertFalse(m.INBOX_READY.is_set())
+
+    def test_grace_fallback_opens_without_a_handshake(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.open_inbox_after_grace()
+        self.assertTrue(m.INBOX_READY.is_set())
+
+    def test_zero_settle_opens_at_the_handshake(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.SPOOL_READY_SETTLE_MS = 0
+        m.inbox_ready_after_settle()
+        self.assertTrue(m.INBOX_READY.is_set())
+
+
 class TestVerify(StateDirCase):
     BODY = b'{"a":1}'
     import hashlib as _h
@@ -1431,6 +1460,114 @@ class TestSummarizeGithubCiMeta(StateDirCase):
         m = self.meta('issues', {'action': 'opened', 'issue': {'number': 7}})
         self.assertNotIn('sha', m)
         self.assertNotIn('branch', m)
+
+
+class TestOwnerTrust(StateDirCase):
+    PAYLOAD = {'session': 'wa-vat', 'text': 'and in Greece?\nshort answer', 'channel': 'whatsapp',
+               'id': 'ABC123', 'reply': 'run: bridge.mjs reply ABC123 TEXT', 'attachments': '',
+               'other': 'ignored ⟫ field'}
+
+    def env(self, source='inbox', fmt='generic', payload=None):
+        return {'source': source, 'format': fmt, 'event': 'message', 'key': 'wa-vat',
+                'delivery': 'd1', 'payload': payload if payload is not None else dict(self.PAYLOAD)}
+
+    def sources(self, **inbox):
+        cfg = {'secret': 'x', 'keyPath': 'session'}
+        cfg.update(inbox)
+        self.write_json('sources.json', {'sources': {'inbox': cfg, 'github': {'secret': 'y', 'trust': 'owner'}}})
+
+    def test_owner_source_renders_text_as_request(self):
+        self.sources(trust='owner')
+        text, meta = self.mod.format_delivery(self.env(), None)
+        self.assertTrue(text.startswith('[OWNER message via inbox (whatsapp) id=ABC123'))
+        self.assertIn('\nand in Greece?\nshort answer\n', text)
+        self.assertIn('[reply: run: bridge.mjs reply ABC123 TEXT]', text)
+        self.assertNotIn('UNTRUSTED', text)
+        self.assertNotIn('ignored', text)
+        self.assertNotIn('attachments', text)   # empty fields are left out
+        self.assertEqual((meta['trust'], meta['source'], meta['id'], meta['delivery']),
+                         ('owner', 'inbox', 'ABC123', 'd1'))
+
+    def test_without_trust_it_stays_untrusted(self):
+        for cfg in ({}, {'trust': 'yes'}, {'trust': 'owner', 'format': 'github'}):
+            self.sources(**cfg)
+            text, meta = self.mod.format_delivery(self.env(fmt=cfg.get('format', 'generic')), None)
+            self.assertTrue(text.startswith('[UNTRUSTED webhook:inbox'), (cfg, text))
+            self.assertNotIn('trust', meta)
+
+    def test_envelope_cannot_claim_trust(self):
+        self.sources()
+        env = self.env(); env['trust'] = 'owner'; env['payload']['trust'] = 'owner'
+        self.assertTrue(self.mod.format_delivery(env, None)[0].startswith('[UNTRUSTED'))
+
+    def test_github_source_never_owner(self):
+        self.sources(trust='owner')
+        env = self.env(source='github', fmt='generic')
+        self.assertEqual(self.mod.source_trust('github'), '')
+        self.assertTrue(self.mod.format_delivery(env, None)[0].startswith('[UNTRUSTED'))
+
+    def test_bounds_and_control_characters(self):
+        self.sources(trust='owner')
+        p = dict(self.PAYLOAD, text='x' * 20000 + 'TAIL', reply='a\x1b[2Jb\rc\x00d')
+        text, _ = self.mod.format_delivery(self.env(payload=p), None)
+        self.assertNotIn('TAIL', text)
+        self.assertIn('x' * self.mod.OWNER_TEXT_MAX + '\n[text cut at 5000 characters]', text)
+        self.assertIn('[reply: a[2Jbcd]', text)
+        self.assertNotIn('\r', text)
+
+    def test_longest_owner_message_fits_a_codex_queue_call(self):
+        """codex_queue cuts at CODEX_MSG_MAX from the end; the reply line and
+        the note must survive the longest possible fields."""
+        self.write_json('sources.json', {'sources': {'i' * 64: {'secret': 'x', 'trust': 'owner'}}})
+        p = {'text': 'x' * 50000, 'channel': 'c' * 99, 'id': 'd' * 999,
+             'attachments': 'a' * 9999, 'reply': 'r' * 9999}
+        entry = {'topic': 'i' * 64 + ':' + 'k' * 200, 'note': 'n' * self.mod.NOTE_MAX_WATCH,
+                 'subscribedAt': '2026-01-01T00:00:00.000Z', 'name': 'w' * 64}
+        env = {'source': 'i' * 64, 'format': 'generic', 'event': 'e', 'key': 'k', 'payload': p}
+        text, _ = self.mod.format_delivery(env, entry)
+        self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
+        self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
+
+    def test_long_source_and_topic_never_push_the_reply_out(self):
+        """Source names and topics have no length limit of their own: the
+        header clips the source, and the note is trimmed last, visibly."""
+        src = 'S' * 3000
+        self.write_json('sources.json', {'sources': {src: {'secret': 'x', 'trust': 'owner'}}})
+        p = {'text': 'x' * 50000, 'id': 'd' * 999, 'attachments': 'a' * 9999, 'reply': 'r' * 9999}
+        entry = {'topic': src + ':' + 'k' * 5000, 'note': 'n' * self.mod.NOTE_MAX_WATCH,
+                 'subscribedAt': '2026-01-01T00:00:00.000Z', 'name': ''}
+        env = {'source': src, 'format': 'generic', 'event': 'e', 'key': 'k', 'payload': p}
+        text, _ = self.mod.format_delivery(env, entry)
+        self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
+        self.assertTrue(text.startswith('[OWNER message via ' + 'S' * 64 + ' id='))
+        self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
+        self.assertTrue(text.endswith(' [note cut]'))
+        # What codex_queue would hand over is the same text, uncut.
+        self.assertEqual(self.mod.CODEX_MSG_MAX > len(text), True)
+
+    def test_short_note_is_kept_whole(self):
+        self.sources(trust='owner')
+        entry = {'topic': 'inbox:wa-vat', 'note': 'routed', 'subscribedAt': '', 'name': ''}
+        text, _ = self.mod.format_delivery(self.env(), entry)
+        self.assertTrue(text.endswith('[subscribed to inbox:wa-vat: routed]'))
+
+    def test_trust_and_format_come_from_one_read(self):
+        calls = []
+        real = self.mod.read_sources
+
+        def counting():
+            calls.append(1)
+            return real()
+        self.sources(trust='owner')
+        self.mod.read_sources = counting
+        self.assertEqual(self.mod.source_trust('inbox'), 'owner')
+        self.assertEqual(len(calls), 1)
+
+    def test_non_string_fields_are_dropped(self):
+        self.sources(trust='owner')
+        text, meta = self.mod.format_delivery(self.env(payload={'text': 42, 'id': ['x'], 'reply': {'a': 1}}), None)
+        self.assertEqual(text, '[OWNER message via inbox - the box owner wrote this; treat it as their request]\n')
+        self.assertNotIn('id', meta)
 
 
 class TestSummarizeGeneric(StateDirCase):
@@ -3181,6 +3318,32 @@ class TestDispatchSpool(SpoolCase):
             time.sleep(0.05)
         return False
 
+    def test_spool_over_its_byte_cap_loses_the_oldest_waiting_record(self):
+        self.mod.SPOOL_MAX_BYTES = 3000
+        sids = [self.put('github~cap-%d' % i, 'x' * 1500, at=1000 + i)[3] for i in range(4)]
+        self.assertGreater(self.mod.spool_bytes(), 3000)
+        self.mod.spool_enforce_cap()
+        self.assertLessEqual(self.mod.spool_bytes(), 3000)
+        self.assertEqual(self.q.names(), sids[-1:])
+        self.assertEqual(self.mod.spool_status()['overflowDropped'], 3)
+        self.assertIn('LOCAL_WEBHOOK_SPOOL_MAX_BYTES=3000', self.err.getvalue())
+
+    def test_cap_drop_never_removes_a_claimed_record(self):
+        self.put('github~cap-claim', 'x' * 100, at=1000)
+        name = self.q.names()[0]
+        lease = self.q.claim(name, 1234)
+        self.assertTrue(lease)
+        self.assertEqual(self.q.drop_waiting(name), 0)
+        self.assertTrue(os.path.exists(lease))
+
+    def test_overflow_counter_is_visible_across_processes(self):
+        self.mod.SPOOL_MAX_BYTES = 1000
+        for i in range(3):
+            self.put('github~ovf-%d' % i, 'x' * 1500, at=1000 + i)
+        self.mod.spool_enforce_cap()
+        self.mod.SPOOL_OVERFLOW_DROPPED = 0  # a fresh CLI process starts at zero
+        self.assertGreaterEqual(self.mod.spool_status()['overflowDropped'], 2)
+
     def test_a_declined_batch_survives_a_restart_with_its_streak(self):
         d = self.mod.Dispatcher('cat >/dev/null; exit 75', 2, 60, 30, spool=self.q)
         text, meta, env, sid = self.put('github~cap-1', 'held at capacity')
@@ -3659,7 +3822,11 @@ class EndToEndCase(unittest.TestCase):
         self.assertTrue(os.path.exists(self.http_sock), 'daemon never bound its socket')
         return p
 
-    def start_peer(self, session, **extra):
+    def start_peer(self, session, handshake=True, **extra):
+        # A real claude client sends notifications/initialized, and since
+        # 0.39.1 a peer claims nothing before it (plus the settle time, which
+        # is 0 here unless a test sets it). handshake=False leaves it out.
+        extra.setdefault('LOCAL_WEBHOOK_SPOOL_SETTLE_MS', '0')
         env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0', **extra)
         p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -3670,6 +3837,9 @@ class EndToEndCase(unittest.TestCase):
             socks = [f for f in (os.listdir(inst) if os.path.isdir(inst) else [])
                      if f == '%s.%d.sock' % (session, p.pid)]
             if socks:
+                if handshake:
+                    p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+                    p.stdin.flush()
                 return p
             time.sleep(0.05)
         self.fail('peer never registered its IPC socket')
@@ -4385,6 +4555,44 @@ class TestEndToEnd(EndToEndCase):
         self.assertEqual((resp.status, resp.read().decode()), (401, 'invalid signature'))
         conn.close()
 
+    def test_emit_owner_source_reaches_only_its_session_as_a_request(self):
+        """An owner-trusted source (0.39.0): a router emits a message keyed on
+        the chosen session; only that session's subscription matches, and it
+        arrives framed as the owner's request, with the note echoed."""
+        self.add_source('inbox', keyPath='session', trust='owner')
+        r = self.cli('subscribe', 'inbox:wa-a', '--note', 'routed owner messages', session='sess-a')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'inbox:wa-b', '--note', 'routed owner messages', session='sess-b')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer_a = self.start_peer('sess-a')
+        peer_b = self.start_peer('sess-b')
+        r = self.cli('emit', 'inbox', json.dumps({'session': 'wa-b', 'text': 'and in Greece?',
+                                                  'channel': 'whatsapp', 'id': 'M1',
+                                                  'reply': 'bridge.mjs reply M1 TEXT'}),
+                     '--event', 'message')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = {}
+
+        def read_line(name, peer):
+            lines[name] = peer.stdout.readline()
+        threads = [threading.Thread(target=read_line, args=(n, p)) for n, p in (('a', peer_a), ('b', peer_b))]
+        for t in threads:
+            t.daemon = True
+            t.start()
+        threads[1].join(15)
+        self.assertTrue(lines.get('b'), 'chosen session never got the owner message')
+        msg = json.loads(lines['b'].decode())
+        content = msg['params']['content']
+        self.assertTrue(content.startswith('[OWNER message via inbox (whatsapp) id=M1'), content)
+        self.assertIn('\nand in Greece?\n', content)
+        self.assertIn('[reply: bridge.mjs reply M1 TEXT]', content)
+        self.assertIn('routed owner messages', content)
+        self.assertNotIn('UNTRUSTED', content)
+        self.assertEqual(msg['params']['meta']['trust'], 'owner')
+        threads[0].join(2)
+        self.assertFalse(lines.get('a'), 'the other session must not get it')
+
     def test_emit_signs_per_source_verification_mode(self):
         """emit's self-test path must sign in whatever mode the source
         declares, or it can never usefully test a non-hmac-hex source."""
@@ -4517,6 +4725,35 @@ class TestEndToEnd(EndToEndCase):
         self.assertTrue(self.wait_file(self.spawn_log, contains='title here'),
                         'no spawn once the claiming codex session was gone')
 
+    def test_owner_message_reaches_a_codex_peer_whole(self):
+        """The supervisor path agent-box's router uses: subscribe a codex
+        session from OUTSIDE it (LOCAL_WEBHOOK_CODEX_THREAD), then emit an
+        owner message with the longest text. codex queue gets the owner
+        framing with the reply line and the note intact."""
+        fake = CodexFake(self.state)
+        env = {'LOCAL_WEBHOOK_CODEX_BIN': fake.path, 'LOCAL_WEBHOOK_CODEX_THREAD': 'thr-owner'}
+        self.addCleanup(self.reap_codex_peer, 'agent-wa-c')
+        self.add_source('inbox', keyPath='session', trust='owner')
+        r = self.cli('subscribe', 'inbox:wa-c', '--note', 'routed owner messages',
+                     session='agent-wa-c', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.codex_peer_record('agent-wa-c'), r.stdout + r.stderr)
+        self.start_daemon()
+        r = self.cli('emit', 'inbox', json.dumps({'session': 'wa-c', 'text': 'y' * 9000, 'id': 'M9',
+                                                  'channel': 'whatsapp', 'reply': 'bridge.mjs reply M9 TEXT'}),
+                     '--event', 'message')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.wait_file(fake.log, contains='OWNER'), 'the codex peer never queued it')
+        sent = fake.messages()
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith('[OWNER message via inbox (whatsapp) id=M9'), sent[0][:200])
+        self.assertIn('[text cut at 5000 characters]', sent[0])
+        self.assertIn('[reply: bridge.mjs reply M9 TEXT]', sent[0])
+        self.assertIn('routed owner messages', sent[0])
+        self.assertNotIn('UNTRUSTED', sent[0])
+        self.assertFalse(sent[0].endswith('...'), 'codex_queue had to cut the message')
+        self.assertEqual(fake.calls()[0][:3], ['queue', '--thread', 'thr-owner'])
+
     def test_codex_delivery_can_be_declined_and_fails_loudly(self):
         env = {'CODEX_THREAD_ID': 'thr-x'}
         # A supervisor running its own peer subscribes without starting one.
@@ -4543,6 +4780,53 @@ class TestEndToEnd(EndToEndCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn(b'codex', r.stdout.lower())
         self.assertFalse(os.path.exists(os.path.join(self.state, 'codex')))
+
+
+class TestBodyCap(EndToEndCase):
+    """Issue #105: the ingress refuses an oversized body before reading it."""
+
+    def test_oversized_body_is_413_and_small_one_is_not(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        status, _ = self.post(b'x' * 5000)
+        self.assertEqual(status, 413)
+        status, _ = self.post(b'x' * 100)
+        self.assertNotEqual(status, 413)  # reaches the signature/parse path
+
+    def test_negative_chunk_size_is_not_read_to_eof(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.putrequest('POST', '/github')
+        conn.putheader('Transfer-Encoding', 'chunked')
+        conn.putheader('x-github-event', 'issues')
+        conn.endheaders()
+        conn.send(b'-1\r\n' + b'z' * 5000)
+        self.assertNotEqual(conn.getresponse().status, 200)
+        conn.close()
+
+    def test_oversized_chunked_body_is_413(self):
+        self.start_daemon(LOCAL_WEBHOOK_MAX_BODY_BYTES='1000')
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/github', iter([b'y' * 600, b'y' * 600]),
+                     {'x-github-event': 'issues', 'Transfer-Encoding': 'chunked'},
+                     encode_chunked=True)
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
+
+
+class TestLimitEnv(SpoolCase):
+    def test_bad_limit_keeps_default_and_only_zero_disables(self):
+        for bad in ('', '256MiB', '-5'):
+            os.environ['X_LIM'] = bad
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.mod._limit_env('X_LIM', 77), 77)
+            finally:
+                del os.environ['X_LIM']
+        os.environ['X_LIM'] = '0'
+        try:
+            self.assertEqual(self.mod._limit_env('X_LIM', 77), 0)
+        finally:
+            del os.environ['X_LIM']
 
 
 class TestSpoolEndToEnd(EndToEndCase):
@@ -4588,7 +4872,7 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(self.status('downsess')['sessions']['downsess']['pending'], 1)
         # ...and the receiver itself goes away before the session is back.
         self.stop_daemon(d)
-        peer = self.start_peer('downsess')
+        peer = self.start_peer('downsess', handshake=False)
         # The backlog waits for the client's MCP handshake.
         self.assertTrue(self.no_line(peer, 1.5), 'backlog delivered before notifications/initialized')
         self.handshake(peer)
@@ -4603,6 +4887,25 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(self.status('downsess')['sessions']['downsess'],
                          {'pending': 0, 'leased': 0, 'oldestAgeS': None})
         self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+
+    def test_backlog_waits_for_the_settle_time_after_the_handshake(self):
+        """0.39.1: Claude Code registers its channel handler only after it
+        sends notifications/initialized, and drops a notification in between.
+        The backlog, and a doorbell that rings in that window, wait for
+        LOCAL_WEBHOOK_SPOOL_SETTLE_MS after the handshake."""
+        r = self.cli('subscribe', 'o/r', '--note', 'woken session', session='settle')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-settle-1'), (200, 'ok'))
+        peer = self.start_peer('settle', LOCAL_WEBHOOK_SPOOL_SETTLE_MS='2500')   # handshakes
+        # A live event inside the settle window rings the doorbell; it must
+        # stay spooled too, not go out before the client can take it.
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-settle-2'), (200, 'ok'))
+        self.assertTrue(self.no_line(peer, 1.5), 'delivered inside the settle window')
+        got = {self.read_peer_line(peer)['params']['meta']['delivery'] for _ in range(2)}
+        self.assertEqual(got, {'gh-settle-1', 'gh-settle-2'})
+        self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+        self.stop_daemon(d)
 
     def test_a_peer_that_dies_and_comes_back_gets_the_event_it_missed(self):
         r = self.cli('subscribe', 'o/r', '--note', 'flaky', session='flaky')
@@ -4803,6 +5106,75 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(len(names), 2)
         for n in names:
             self.assertRegex(n, r'^[0-9a-f]{40}$')
+
+
+class TestReapOrphanFilterLocks(StateDirCase):
+    def touch(self, name):
+        path = os.path.join(self.state, name)
+        open(path, 'w').close()
+        return path
+
+    def test_reaps_only_locks_without_a_filter(self):
+        orphan = self.touch('filter.hook-gone.json.lock')
+        kept_json = self.touch('filter.live.json')
+        kept_lock = self.touch('filter.live.json.lock')
+        other = self.touch('sources.json.lock')
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertTrue(os.path.exists(kept_json))
+        self.assertTrue(os.path.exists(kept_lock))
+        self.assertTrue(os.path.exists(other))
+
+    def test_skips_a_lock_somebody_holds(self):
+        import fcntl
+        held = self.touch('filter.hook-busy.json.lock')
+        fd = os.open(held, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 0)
+        self.assertTrue(os.path.exists(held))
+
+    def test_a_reaped_key_can_lock_again(self):
+        path = os.path.join(self.state, 'filter.hook-x.json')
+        with self.mod.filter_file_lock(path):
+            pass
+        self.assertEqual(self.mod.reap_orphan_filter_locks(), 1)
+        with self.mod.filter_file_lock(path):
+            self.assertTrue(os.path.exists(path + '.lock'))
+
+    def test_waiter_retries_when_its_lock_is_unlinked(self):
+        import fcntl
+        import threading
+        from unittest import mock
+        path = os.path.join(self.state, 'filter.hook-race.json')
+        lock = path + '.lock'
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        seen = []
+
+        def waiter():
+            with self.mod.filter_file_lock(path):
+                seen.append(os.stat(lock).st_ino)
+
+        opened = threading.Event()
+        real_open = os.open
+
+        def open_and_signal(p, *a, **k):
+            fd = real_open(p, *a, **k)
+            if p == lock and threading.current_thread() is t:
+                opened.set()  # waiter now holds the OLD inode
+            return fd
+
+        t = threading.Thread(target=waiter)
+        with mock.patch.object(self.mod.os, 'open', open_and_signal):
+            t.start()
+            self.assertTrue(opened.wait(5))
+            os.unlink(lock)
+            os.close(holder)  # releases; waiter locks the orphaned inode
+            t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(os.path.exists(lock))
 
 
 class TestVersionConsistency(unittest.TestCase):

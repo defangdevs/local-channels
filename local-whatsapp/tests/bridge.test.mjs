@@ -779,3 +779,142 @@ test('an interrupted in-place reset safely retries an already empty thread after
     assert.equal(existsSync(f.lifecycle), false);
   } finally { await stop(daemon); await f.cleanup(); }
 });
+
+function routeFixture(script) {
+  const fixture = setup();
+  const route = join(fixture.dir, 'route');
+  const requests = join(fixture.dir, 'requests.jsonl');
+  const lifecycle = join(fixture.dir, 'lifecycle.txt');
+  writeFileSync(route, `#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' "$body" >> "$REQUESTS"\n${script}\n`);
+  chmodSync(route, 0o700);
+  // Any session-manager call other than listing would mean the bridge chose a
+  // session itself instead of leaving it to the route command.
+  writeFileSync(fixture.sessionBin, `#!/bin/sh\nprintf '%s\\n' "$2" >> "$LIFECYCLE"\ncase "$2" in candidates) printf '%s\\n' '[]' ;; *) printf '%s\\n' '{}' ;; esac\n`);
+  chmodSync(fixture.sessionBin, 0o700);
+  const env = { ...process.env, LOCAL_WHATSAPP_STATE_DIR: fixture.state, FAKE_OUT: fixture.fakeOut,
+    LOCAL_WHATSAPP_SESSION_BIN: fixture.sessionBin, LOCAL_WHATSAPP_ROUTE_CMD: route, REQUESTS: requests, LIFECYCLE: lifecycle };
+  const read = (path) => existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').filter(Boolean) : [];
+  const saved = () => JSON.parse(readFileSync(join(fixture.state, 'messages.json'), 'utf8'));
+  return { fixture, env, requests: () => read(requests).map((line) => JSON.parse(line)), lifecycle: () => read(lifecycle), saved };
+}
+
+for (const debug of ['', '1']) {
+test(`route command decides the session for each message (debug ${JSON.stringify(debug)})`, async () => {
+  const r = routeFixture(`printf '%s\\n' '{"session":"wa-greece","action":"NEW"}'`);
+  const env = { ...r.env, LOCAL_WHATSAPP_DEBUG: debug, FAKE_INBOUND_TEXT: `@${userInfo().username} what is the VAT rate in Greece` };
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const only = () => Object.values(r.saved().messages)[0];
+  try {
+    await waitUntil(() => existsSync(join(r.fixture.state, 'messages.json')) && only()?.deliveredTo, 'routed');
+    const id = only().id;
+    const [request] = r.requests();
+    assert.equal(request.channel, 'whatsapp');
+    assert.equal(request.message.id, id);
+    assert.equal(request.message.text, 'what is the VAT rate in Greece');
+    assert.ok(Number.isInteger(request.message.ts));
+    assert.ok(request.reply.endsWith(`bridge.mjs reply ${id} <reply text>`));
+    assert.ok(request.ack.endsWith(`bridge.mjs ack ${id}`));
+    assert.deepEqual(request.recent, []);
+    assert.equal(only().deliveredTo, 'route:wa-greece');
+    assert.equal(only().routedTo, 'wa-greece');
+    assert.ok(!existsSync(join(r.fixture.state, 'target.json')), 'routing never pins a target');
+    assert.deepEqual(r.lifecycle().filter((call) => call !== 'candidates'), []);
+    // The routed session answers through the same CLI as any session.
+    assert.equal(spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'ack', id], { env, encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'reply', id, '24%'], { env, encoding: 'utf8' }).status, 0);
+    await waitUntil(() => existsSync(r.fixture.fakeOut) && readFileSync(r.fixture.fakeOut, 'utf8').includes('24%'), 'reply sent');
+    const outbound = readFileSync(r.fixture.fakeOut, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(outbound.some((item) => item.payload.text === `Box: ${id} -> wa-greece (NEW)`), debug === '1');
+    const status = JSON.parse(spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' }).stdout);
+    assert.equal(status.routing, true);
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+}
+
+test('a failed route keeps the message pending, keeps order, and never falls back to spawning', async () => {
+  const r = routeFixture(`case "$body" in *'"id":"a"'*) echo 'router down' >&2; exit 3 ;; esac\nprintf '%s\\n' '{"session":"wa-x","action":"CONTINUE"}'`);
+  writeFileSync(join(r.fixture.state, 'messages.json'), JSON.stringify({ messages: {
+    a: { id: 'a', chat: '14155551234@s.whatsapp.net', text: 'first', receivedAt: '2026-11-15T10:00:00.000Z', deliveredTo: null, reply: null },
+    b: { id: 'b', chat: '14155551234@s.whatsapp.net', text: 'second', receivedAt: '2026-11-15T10:00:05.000Z', deliveredTo: null, reply: null },
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'earlier', deliveredTo: 'route:wa-x', routedTo: 'wa-x',
+      reply: { text: 'earlier answer', status: 'sent', sentAt: '2026-11-15T09:00:00.000Z' } },
+  }, sentIds: {} }));
+  const env = r.env;
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let errors = '';
+  daemon.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  try {
+    await waitUntil(() => errors.includes('route failed for a: router down'), 'route failure logged');
+    const requests = r.requests();
+    assert.equal(requests.length, 1, 'b must not overtake a');
+    assert.equal(requests[0].message.id, 'a');
+    assert.equal(requests[0].message.ts, Date.parse('2026-11-15T10:00:00.000Z') / 1000);
+    assert.deepEqual(requests[0].recent, [{ id: 'old', session: 'wa-x', reply: 'earlier answer' }]);
+    assert.equal(r.saved().messages.a.deliveredTo, null);
+    assert.equal(r.saved().messages.b.deliveredTo, null);
+    assert.ok(!existsSync(join(r.fixture.state, 'target.json')));
+    assert.deepEqual(r.lifecycle().filter((call) => call !== 'candidates'), []);
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+
+test('an explicit /target pin wins over the route command', async () => {
+  const r = routeFixture(`printf '%s\\n' '{"session":"wa-x"}'`);
+  writeFileSync(join(r.fixture.state, 'target.json'), JSON.stringify({ harness: 'codex', session: 'thread-1', name: 'pinned' }));
+  writeFileSync(r.fixture.sessionBin, `#!/bin/sh\ncase "$2" in candidates) printf '%s\\n' '[{"name":"pinned","harness":"codex","stopped":false,"selected":true}]' ;; *) printf '%s\\n' '{}' ;; esac\n`);
+  const codex = join(r.fixture.dir, 'codex');
+  const queued = join(r.fixture.dir, 'queued.txt');
+  writeFileSync(codex, `#!/bin/sh\nprintf '%s ' "$@" >> "${queued}"\n`);
+  chmodSync(codex, 0o700);
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env: { ...r.env, LOCAL_WHATSAPP_CODEX_BIN: codex }, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(queued), 'pinned delivery');
+    assert.match(readFileSync(queued, 'utf8'), /--thread thread-1/);
+    assert.deepEqual(r.requests(), []);
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+
+test('a relative route command is refused', () => {
+  const f = setup();
+  const result = spawnSync(process.execPath, [join(f.dir, 'bridge.mjs'), 'status'], {
+    env: { ...process.env, LOCAL_WHATSAPP_STATE_DIR: f.state, LOCAL_WHATSAPP_SESSION_BIN: f.sessionBin, LOCAL_WHATSAPP_ROUTE_CMD: 'route' }, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must be an absolute path/);
+  rmSync(f.dir, { recursive: true, force: true });
+});
+
+test('the chosen session can acknowledge before the route command returns', async () => {
+  // The router delivers first and answers last: run the ack it was handed
+  // while still running, the way a fast session would.
+  const r = routeFixture(`ack=$(printf '%s' "$body" | sed -n 's/.*"ack":"\\([^"]*\\)".*/\\1/p')\n$ack > "$ACKED" 2>&1 || echo FAILED >> "$ACKED"\nprintf '%s\\n' '{"session":"wa-x","action":"NEW"}'`);
+  const acked = join(r.fixture.dir, 'acked.txt');
+  const env = { ...r.env, ACKED: acked };
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => existsSync(join(r.fixture.state, 'messages.json')) && Object.values(r.saved().messages)[0]?.deliveredTo, 'routed');
+    assert.match(readFileSync(acked, 'utf8'), /acknowledgment queued/);
+    assert.doesNotMatch(readFileSync(acked, 'utf8'), /FAILED/);
+    const entry = Object.values(r.saved().messages)[0];
+    assert.equal(entry.routeInFlight, undefined);
+    await waitUntil(() => existsSync(r.fixture.fakeOut) && readFileSync(r.fixture.fakeOut, 'utf8').includes('"react"'), 'reaction');
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+
+test('a hung route command is stopped at the deadline and retried later', async () => {
+  // Ignores SIGTERM and leaves a grandchild holding the pipes.
+  const r = routeFixture(`trap '' TERM\n(sleep 60) &\nsleep 60`);
+  const env = { ...r.env, LOCAL_WHATSAPP_ROUTE_TIMEOUT_MS: '400' };
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let errors = '';
+  daemon.stderr.on('data', (chunk) => { errors += chunk.toString(); });
+  try {
+    await waitUntil(() => errors.includes('route command timed out after 0.4s'), 'deadline');
+    await waitUntil(() => Object.values(r.saved().messages)[0]?.routeRetryAt, 'retry time');
+    const entry = Object.values(r.saved().messages)[0];
+    assert.equal(entry.deliveredTo, null);
+    assert.equal(entry.routeInFlight, undefined);
+    assert.ok(entry.routeRetryAt >= Date.now() + 25000, 'retry waits 30 s after the failure');
+    // The bridge still answers its control socket: nothing is wedged.
+    const status = spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' });
+    assert.equal(status.status, 0, status.stderr);
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
