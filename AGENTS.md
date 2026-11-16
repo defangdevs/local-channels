@@ -78,11 +78,13 @@ new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
 **Do not bump versions in a PR.** Every open PR bumping its own version line
 collides with every other one. The `release` job in `ci.yml` assigns versions
 after merge: `scripts/release_bump.py` bumps each plugin whose non-doc files
-changed in the push (`VERSION`, manifest, README table row) and commits
+changed since the commit that last changed its version value (`VERSION`,
+manifest, README table row; `tests/` and `bench/` do not count) and commits
 `release: <plugin> X.Y.Z` to `main`. The level is minor when a commit subject
 starts with `feat` or contains `[minor]`, otherwise patch, so write the PR title
-accordingly. A PR that does touch a plugin's version files (a deliberate manual
-bump) is left alone by the script.
+accordingly. A deliberate manual bump in a PR also works: it becomes the baseline. The rule
+is stateless, so a cancelled or superseded CI run loses nothing. Each plugin
+has its own tag series (`vX.Y.Z` for local-webhook, `local-slack-vX.Y.Z`, ...).
 
 - Do not write a version number in README or code prose for your change
   (`(0.40.0)`); you do not know it yet. Refer to the issue/PR number instead.

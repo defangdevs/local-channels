@@ -2,6 +2,9 @@
 # RHEL 9 / Ubuntu server baseline) and on current 3.x, so a 3.10+ism or a
 # deprecation on the new side both fail the PR.
 name: CI
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -46,8 +49,9 @@ jobs:
 
   release:
     # Versions are assigned here, after merge, so PRs never bump them and never
-    # collide on the version lines. The bot commit is pushed with GITHUB_TOKEN,
-    # which does not start another run; the tag job below tags it directly.
+    # collide on the version lines. The range is derived from the repo itself
+    # (changes since each plugin's last version change), so a cancelled or
+    # superseded run loses nothing: the next one picks it up.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, whatsapp]
     runs-on: ubuntu-latest
@@ -56,25 +60,36 @@ jobs:
     concurrency:
       group: version-tags
       cancel-in-progress: false
+    outputs:
+      sha: ${{ steps.bump.outputs.sha }}
     steps:
+      # The pushed commit, which the tests above approved, not whatever main is now.
       - uses: actions/checkout@v4
         with:
-          ref: main  # not the pushed sha: an earlier run's bump commit must be seen
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Bump versions for the plugins this push changed
-        env:
-          BEFORE: ${{ github.event.before }}
+      - name: Bump versions for plugins with unreleased changes
+        id: bump
         run: |
-          git cat-file -e "$BEFORE^{commit}" 2>/dev/null || exit 0
-          python scripts/release_bump.py "$BEFORE" "$GITHUB_SHA" | tee bumped.txt
+          # No pipe: a failing script must fail the step (default shell has no pipefail).
+          python scripts/release_bump.py > bumped.txt
+          cat bumped.txt
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           [ -s bumped.txt ] || exit 0
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -am "release: $(paste -sd, bumped.txt)"
-          git push origin HEAD:main
+          # If main moved on, this is rejected as non-fast-forward. That is fine:
+          # the newer push has its own run, and the rule is stateless, so it
+          # releases everything this run would have.
+          if git push origin HEAD:main; then
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "main moved; leaving the bump to the newer run"
+          fi
 
   tag:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -88,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.release.outputs.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:

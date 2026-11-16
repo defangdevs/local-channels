@@ -70,6 +70,17 @@ class VersionTags(unittest.TestCase):
         tags.git('commit', '-m', 'local-router ' + version)
         return tags.git('rev-parse', 'HEAD')
 
+    def test_slack_versions_get_separate_tags(self):
+        path = Path('local-slack/.claude-plugin/plugin.json')
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'version': '0.1.0'}))
+        tags.git('add', '.')
+        tags.git('commit', '-m', 'local-slack 0.1.0')
+        first = tags.git('rev-parse', 'HEAD')
+        self.assertEqual(tags.slack_version_commits('HEAD'), {'0.1.0': first})
+        tags.tag_versions('HEAD')
+        self.assertEqual(tags.git('rev-parse', 'local-slack-v0.1.0^{commit}'), first)
+
     def test_router_versions_get_separate_tags(self):
         self.commit('1.0.0')
         first = self.commit_router('0.1.0')
@@ -165,26 +176,47 @@ class ReleaseBump(unittest.TestCase):
     def test_patch_bump_only_for_changed_plugin(self):
         Path('local-webhook/extra.py').write_text('x\n')
         self.commit('fix a thing')
-        self.assertEqual(rb.release(self.base), {'local-webhook': ('1.2.3', '1.2.4')})
+        self.assertEqual(rb.release(), {'local-webhook': ('1.2.3', '1.2.4')})
         self.assertIn("VERSION = '1.2.4'", Path('local-webhook/webhook.py').read_text())
         self.assertIn('"version": "1.2.4",  "keywords"',
                       Path('local-webhook/.claude-plugin/plugin.json').read_text())
         readme = Path('README.md').read_text()
         self.assertIn('| 1.2.4 |', readme)
         self.assertIn('| 0.1.0 |', readme)
+        # Once committed, the bump is the new baseline: nothing more is due.
+        self.commit('release: local-webhook 1.2.4')
+        self.assertEqual(rb.release(apply=False), {})
 
     def test_feat_is_minor(self):
         Path('local-router/new.py').write_text('x\n')
         self.commit('feat: query-token (#31)')
-        self.assertEqual(rb.release(self.base), {'local-router': ('0.1.0', '0.2.0')})
+        self.assertEqual(rb.release(), {'local-router': ('0.1.0', '0.2.0')})
 
-    def test_docs_only_and_manual_bump_are_left_alone(self):
+    def test_docs_only_is_left_alone(self):
         Path('local-webhook/README.md').write_text('docs\n')
         self.commit('docs')
-        self.assertEqual(rb.release(self.base), {})
+        self.assertEqual(rb.release(apply=False), {})
+
+    def test_behaviour_change_in_version_bearing_file_releases(self):
+        Path('local-webhook/webhook.py').write_text("VERSION = '1.2.3'\nprint('new')\n")
+        self.commit('fix webhook')
+        Path('local-router/router.py').write_text('VERSION = "0.1.0"\nx = 1\n')
+        self.commit('fix router')
+        self.assertEqual(rb.release(apply=False), {
+            'local-webhook': ('1.2.3', '1.2.4'), 'local-router': ('0.1.0', '0.1.1')})
+
+    def test_manual_bump_is_baseline_and_missed_runs_are_recovered(self):
         Path('local-router/router.py').write_text('VERSION = "0.5.0"\n')
         self.commit('manual bump')
-        self.assertEqual(rb.release(self.base, apply=False), {})
+        self.assertEqual(rb.release(apply=False), {})
+        # Two earlier pushes were never released (cancelled runs): both counted.
+        Path('local-whatsapp/.claude-plugin').mkdir(parents=True)
+        Path('local-webhook/a.py').write_text('a\n')
+        self.commit('fix a')
+        Path('local-router/b.py').write_text('b\n')
+        self.commit('feat b')
+        self.assertEqual(rb.release(apply=False), {
+            'local-webhook': ('1.2.3', '1.2.4'), 'local-router': ('0.5.0', '0.6.0')})
 
     def test_refs_are_validated(self):
         for bad in ('--output=x', 'a b', '$(id)'):

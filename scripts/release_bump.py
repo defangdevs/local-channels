@@ -2,11 +2,12 @@
 """Bump plugin versions after a merge to main, so PRs never edit them.
 
 PRs that bump their own version collide with every other open PR. Instead the
-release job runs this on `main`: for each plugin whose files changed in the
-pushed range it bumps VERSION / manifest / README row, and CI commits and tags
+release job runs this on `main`: for each plugin with non-doc changes since its
+last version change it bumps VERSION / manifest / README row, and CI commits and tags
 the result. Bump level: minor when a commit subject starts with `feat` or
-carries `[minor]`, otherwise patch. A plugin whose version files the range
-already touched is left alone (a manual bump still wins).
+carries `[minor]`, otherwise patch. The commit that last changed a plugin's
+version value is the baseline, so a manual bump still wins and a skipped or
+cancelled earlier run loses nothing.
 """
 import argparse
 import json
@@ -81,18 +82,41 @@ def write(plugin, old, new):
     open('README.md', 'w', encoding='utf-8').write(row.sub(r'\g<1>%s\2' % new, readme, count=1))
 
 
-def release(base, head='HEAD', apply=True):
-    """Return {plugin: (old, new)}; write the files when apply."""
-    rng = commit_id(base) + '..' + commit_id(head)
-    files = git('diff', '--name-only', rng, '--').splitlines()
-    subjects = git('log', '--format=%s', rng, '--').splitlines()
-    level = level_for(subjects)
+def last_version_commit(plugin, head):
+    """Newest commit at or before head whose diff changed a version VALUE.
+
+    Pickaxe (-G) on the version line, so a commit that merely edits code in a
+    version-bearing file (webhook.py) is not mistaken for a bump.
+    """
+    found = []
+    for path, kind in PLUGINS[plugin]:
+        pattern = '"version"' if kind == 'json' else kind.split('(')[0].lstrip('^')
+        oid = git('log', '-1', '--format=%H', '-G' + pattern, head, '--', path).strip()
+        if oid:
+            found.append(oid)
+    if not found:
+        return None
+    return git('rev-list', '--no-walk=sorted', *found).split()[0]
+
+
+def release(head='HEAD', apply=True):
+    """Return {plugin: (old, new)}; write the files when apply.
+
+    Stateless: a plugin is due when non-doc files under it changed after the
+    commit that last changed its version value. A skipped, replaced or
+    cancelled earlier run therefore loses nothing; the next one sees it all.
+    """
+    head = commit_id(head)
     result = {}
-    for plugin, targets in PLUGINS.items():
-        own = [f for f in files if f.startswith(plugin + '/')
-               and not f.endswith('.md') and not f.startswith(plugin + '/tests/')]
-        if not own or any(path in files for path, _ in targets):
+    for plugin in PLUGINS:
+        base = last_version_commit(plugin, head)
+        rng = (base + '..' + head) if base else head
+        own = [f for f in git('log', '--format=', '--name-only', rng, '--', plugin + '/').split()
+               if not f.endswith('.md')
+               and not f.startswith((plugin + '/tests/', plugin + '/bench/'))]
+        if not own:
             continue
+        level = level_for(git('log', '--format=%s', rng, '--', plugin + '/').splitlines())
         old = current(plugin)
         result[plugin] = (old, bump(old, level))
         if apply:
@@ -102,9 +126,8 @@ def release(base, head='HEAD', apply=True):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('base', help='revision before the push (github.event.before)')
     parser.add_argument('head', nargs='?', default='HEAD', help='pushed commit (default HEAD)')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
-    for plugin, (old, new) in release(args.base, args.head, apply=not args.dry_run).items():
+    for plugin, (old, new) in release(args.head, apply=not args.dry_run).items():
         print('%s %s -> %s' % (plugin, old, new))

@@ -76,6 +76,29 @@ def whatsapp_version_commits(ref):
     return versions
 
 
+def slack_version_commits(ref):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/~^{}@-]*', ref):
+        raise ValueError('Invalid release ref: ' + ref)
+    commit_ref = git('rev-parse', '--verify', '--end-of-options', ref + '^{commit}')
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit_ref):
+        raise ValueError('Invalid commit ID: ' + commit_ref)
+    path = 'local-slack/.claude-plugin/plugin.json'
+    versions = {}
+    previous = None
+    for commit in git('rev-list', '--first-parent', '--reverse', commit_ref).splitlines():
+        if path not in git('ls-tree', '-r', '--name-only', commit).splitlines():
+            continue
+        version = json.loads(git('show', commit + ':' + path))['version']
+        if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+            raise ValueError('Invalid version: ' + version)
+        if version != previous:
+            if version in versions:
+                raise ValueError('Version reused: ' + version)
+            versions[version] = commit
+        previous = version
+    return versions
+
+
 def router_version_commits(ref):
     """local-router carries its version as VERSION = "X.Y.Z" in its single file."""
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/~^{}@-]*', ref):
@@ -106,6 +129,8 @@ def tag_versions(ref, push=False):
                 for version, commit in version_commits(ref).items()}
     versions.update({'local-whatsapp-v' + version: (commit, 'local-whatsapp ' + version)
                      for version, commit in whatsapp_version_commits(ref).items()})
+    versions.update({'local-slack-v' + version: (commit, 'local-slack ' + version)
+                     for version, commit in slack_version_commits(ref).items()})
     versions.update({'local-router-v' + version: (commit, 'local-router ' + version)
                      for version, commit in router_version_commits(ref).items()})
     existing = set(git('tag', '--list').splitlines())
