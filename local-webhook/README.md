@@ -1247,7 +1247,7 @@ identity and payload separately, so a deployment can implement GitHub and
 Slack reactions without parsing the rendered prompt. It adds no transport
 reply tool or default external writes to local-webhook itself.
 
-## Last accepted delivery (0.40.0)
+## Last accepted delivery (#55)
 
 `receiver.json` (and `webhook.py status`, under `receiver`) carries
 `lastDelivery`: `{"at": ISO time, "source": "github", "topic": "github:owner/repo"}`,

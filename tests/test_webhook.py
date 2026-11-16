@@ -4024,6 +4024,26 @@ class TestEndToEnd(EndToEndCase):
         st = json.loads(self.cli('status').stdout)
         self.assertEqual(st['receiver']['lastDelivery'], last)
 
+    def test_last_delivery_survives_wall_clock_rollback_and_orders_by_acceptance(self):
+        # #55: ordering and throttle use the monotonic clock, so a wall-clock
+        # step back neither blocks later deliveries nor lets a late handler
+        # replace a newer record.
+        state = tempfile.mkdtemp(prefix='webhook-test-')
+        self.addCleanup(shutil.rmtree, state, True)
+        mod = load_webhook({'LOCAL_WEBHOOK_STATE_DIR': state, 'LOCAL_WEBHOOK_SESSION': 'testsess'})
+        mod.LAST_DELIVERY_MIN_S = 0
+        path = os.path.join(state, 'receiver.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid()}, f)
+        mod.note_accepted_delivery('github', 'o/new', 2_000_000_000_000, order=20)
+        mod.note_accepted_delivery('github', 'o/old', 2_000_000_100_000, order=10)  # late handler
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['lastDelivery']['topic'], 'github:o/new')
+        # Wall clock stepped back, but acceptance is newer: it must record.
+        mod.note_accepted_delivery('github', 'o/next', 1_000_000_000_000, order=30)
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['lastDelivery']['topic'], 'github:o/next')
+
     def test_dispatch_spawns_and_peer_fanout_and_isolation(self):
         # Standing watch via CLI (what a session's tool call writes).
         r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',
