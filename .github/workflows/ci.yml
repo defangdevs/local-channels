@@ -2,6 +2,9 @@
 # RHEL 9 / Ubuntu server baseline) and on current 3.x, so a 3.10+ism or a
 # deprecation on the new side both fail the PR.
 name: CI
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -44,18 +47,69 @@ jobs:
       - name: End-to-end test of local-slack (mock Slack, real local-webhook bus)
         run: python tests/e2e/run_e2e.py
 
-  tag:
+  release:
+    # Versions are assigned here, after merge, so PRs never bump them and never
+    # collide on the version lines. The range is derived from the repo itself
+    # (changes since each plugin's last version change), so a cancelled or
+    # superseded run loses nothing: the next one picks it up.
+    # No concurrency group on purpose: GitHub lets a late-finishing OLDER run
+    # replace a NEWER pending job in a group, which would drop the newer bump.
+    # Without one every pushed commit keeps its own release job. A job whose
+    # push is rejected always has a newer main, and the job for main's head
+    # releases everything before it (stateless range), so none is lost.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, whatsapp]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency:
-      group: version-tags
-      cancel-in-progress: false
+    outputs:
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      # The pushed commit, which the tests above approved, not whatever main is now.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Bump versions for plugins with unreleased changes
+        id: bump
+        run: |
+          # No pipe: a failing script must fail the step (default shell has no pipefail).
+          python scripts/release_bump.py > bumped.txt
+          cat bumped.txt
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          [ -s bumped.txt ] || exit 0
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "release: $(paste -sd, bumped.txt)"
+          # A rejected push is fine only when main really moved on: the newer
+          # push has its own run, and the rule is stateless, so it releases
+          # everything this run would have. Any other failure fails the job.
+          if git push origin HEAD:main; then
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            git fetch origin main
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "push failed although main has not moved" >&2
+              exit 1
+            fi
+            echo "main moved; leaving the bump to the newer run"
+          fi
+
+  tag:
+    # No concurrency group, same reason as above. Tagging is idempotent: it
+    # tags the first commit carrying each version and never moves a tag.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.release.outputs.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
