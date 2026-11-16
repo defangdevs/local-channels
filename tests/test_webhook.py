@@ -3317,6 +3317,7 @@ class TestSpoolFailureModes(SpoolCase):
     def test_a_dead_peer_loses_its_marker_with_its_socket(self):
         self.quiet()
         inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
         p = subprocess.Popen([PYTHON, '-c', 'pass'])
         p.wait()
         sock = os.path.join(inst, 'ghost.%d.sock' % p.pid)
@@ -4484,6 +4485,47 @@ class TestEndToEnd(EndToEndCase):
         msg = self.read_peer_line(peer)
         self.assertEqual(msg['params']['meta']['event'], 'issues')
 
+    def _rollbar_post(self, query):
+        raw = b'{"event_name":"new_item","data":{"item":{"project_id":77}}}'
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/rollbar' + query, raw, {'content-type': 'application/json'})
+        resp = conn.getresponse()
+        out = (resp.status, resp.read().decode())
+        conn.close()
+        return out
+
+    def test_query_token_source_reaches_a_peer_with_event_from_body(self):
+        """#31: Rollbar signs nothing; the secret is a URL query parameter and
+        the event name is in the body at event_name."""
+        self.add_source('rollbar', format='generic', verification='query-token',
+                        eventPath='event_name', keyPath='data.item.project_id')
+        r = self.cli('subscribe', 'rollbar:77', '--note', 'rollbar', session='peersess')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer = self.start_peer('peersess')
+        self.assertEqual(self._rollbar_post('?token=' + self.SECRET), (200, 'ok'))
+        msg = self.read_peer_line(peer)
+        self.assertEqual(msg['params']['meta']['event'], 'new_item')
+        self.assertEqual(msg['params']['meta']['key'], '77')
+
+    def test_query_token_source_rejects_missing_wrong_and_header_tokens(self):
+        self.add_source('rollbar', format='generic', verification='query-token')
+        self.start_daemon()
+        for q in ('', '?token=nope', '?other=' + self.SECRET, '?token=', '?token=%ff'):
+            self.assertEqual(self._rollbar_post(q), (401, 'invalid signature'), q)
+        # A header carrying the secret is not accepted in this mode.
+        conn = UnixHTTPConnection(self.http_sock)
+        conn.request('POST', '/rollbar', b'{}', {'x-gitlab-token': self.SECRET})
+        self.assertEqual(conn.getresponse().status, 401)
+        conn.close()
+
+    def test_query_token_param_name_is_configurable(self):
+        self.add_source('rollbar', format='generic', verification='query-token',
+                        tokenParam='auth')
+        self.start_daemon()
+        self.assertEqual(self._rollbar_post('?auth=' + self.SECRET), (200, 'ok'))
+        self.assertEqual(self._rollbar_post('?token=' + self.SECRET)[0], 401)
+
     def test_gitlab_style_token_source_rejects_wrong_token(self):
         self.add_source('gitlab', format='generic', verification='token',
                         keyPath='project.path_with_namespace')
@@ -5179,6 +5221,43 @@ class TestReapOrphanFilterLocks(StateDirCase):
         self.assertFalse(t.is_alive())
         self.assertEqual(len(seen), 1)
         self.assertTrue(os.path.exists(lock))
+
+
+class TestReadOnlyStateDir(unittest.TestCase):
+    """0.39.2 (#147): read-only commands never write, so `status` works on a
+    read-only state dir that has no instances/ directory."""
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root ignores mode bits')
+    def test_status_on_read_only_state_dir(self):
+        state = tempfile.mkdtemp(prefix='webhook-ro-')
+        self.addCleanup(shutil.rmtree, state, True)
+        os.chmod(state, 0o500)
+        self.addCleanup(os.chmod, state, 0o700)
+        env = dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=state)
+        r = subprocess.run([PYTHON, WEBHOOK_PY, 'status'], env=env, capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.listdir(state), [])
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root ignores mode bits')
+    def test_ls_does_not_rewrite_expired_entries(self):
+        state = tempfile.mkdtemp(prefix='webhook-ro-')
+        self.addCleanup(shutil.rmtree, state, True)
+        path = os.path.join(state, 'filter.ro.json')  # session 'ro' below
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'ttlHours': 1, 'topics': [
+                {'topic': 'github:o/r', 'expiresAt': 1}]}, f)
+        with open(path, encoding='utf-8') as f:
+            before = f.read()
+        os.chmod(state, 0o500)
+        self.addCleanup(os.chmod, state, 0o700)
+        env = dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=state, LOCAL_WEBHOOK_SESSION='ro')
+        r = subprocess.run([PYTHON, WEBHOOK_PY, 'ls'], env=env, capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(f.read(), before)
+        self.assertIn('github:o/r', r.stdout)
 
 
 class TestVersionConsistency(unittest.TestCase):
