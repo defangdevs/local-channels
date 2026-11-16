@@ -128,10 +128,42 @@ def tag_versions(ref, push=False):
             subprocess.check_call(['git', 'tag', '-a', tag, commit, '-m', message])
         print(tag + ' ' + commit)
     if push:
-        subprocess.check_call(['git', 'push', '--atomic', 'origin', *(
-            'refs/tags/' + tag for tag in versions
-        )])
+        push_tags({tag: commit for tag, (commit, _) in versions.items()})
 
+
+def remote_tags():
+    """{tag: commit} on origin; an annotated tag's peeled ^{} line wins."""
+    found = {}
+    for line in git('ls-remote', '--tags', 'origin').splitlines():
+        oid, ref = line.split('\t')
+        name = ref[len('refs/tags/'):]
+        if name.endswith('^{}'):
+            found[name[:-3]] = oid
+        else:
+            found.setdefault(name, oid)
+    return found
+
+
+def push_tags(wanted, attempts=3):
+    """Publish tags without ever moving one.
+
+    Two jobs may each create their own annotated object for one commit; the
+    loser's atomic push is then rejected whole. After a rejection, ask the
+    remote what exists: a tag already there at the right commit is done, one
+    at another commit is an error, and the rest are pushed again.
+    """
+    for attempt in range(attempts):
+        remote = remote_tags()
+        for tag, commit in wanted.items():
+            if tag in remote and remote[tag] != commit:
+                raise ValueError('Remote tag points to a different commit: ' + tag)
+        missing = [tag for tag in wanted if tag not in remote]
+        if not missing:
+            return
+        if subprocess.call(['git', 'push', '--atomic', 'origin',
+                            *('refs/tags/' + tag for tag in missing)]) == 0:
+            return
+    raise RuntimeError('Could not publish tags: ' + ', '.join(missing))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

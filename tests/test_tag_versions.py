@@ -140,6 +140,41 @@ class VersionTags(unittest.TestCase):
                 self.assertEqual(tags.git('tag', '--list'), '')
                 self.assertFalse(Path('injected').exists())
 
+    def test_push_tolerates_a_tag_published_by_a_concurrent_job(self):
+        remote = tempfile.TemporaryDirectory()
+        self.addCleanup(remote.cleanup)
+        tags.git('init', '--bare', remote.name)
+        tags.git('remote', 'add', 'origin', remote.name)
+        first = self.commit('1.0.0')
+        second = self.commit('1.1.0')
+        # Another job already published v1.0.0 (its own annotated object).
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        subprocess.check_call(['git', 'clone', '-q', remote.name, other.name],
+                              stderr=subprocess.DEVNULL)
+        tags.git('push', 'origin', 'HEAD:refs/heads/main')
+        subprocess.check_call(['git', '-C', other.name, 'fetch', '-q', 'origin', 'main'])
+        subprocess.check_call(['git', '-C', other.name, '-c', 'user.name=O',
+                               '-c', 'user.email=o@example.com', 'tag', '-a', 'v1.0.0',
+                               first, '-m', 'other job'])
+        subprocess.check_call(['git', '-C', other.name, 'push', '-q', 'origin', 'v1.0.0'])
+        tags.tag_versions('HEAD', push=True)
+        self.assertEqual(tags.remote_tags(), {'v1.0.0': first, 'v1.1.0': second})
+
+    def test_push_refuses_to_move_a_remote_tag(self):
+        remote = tempfile.TemporaryDirectory()
+        self.addCleanup(remote.cleanup)
+        tags.git('init', '--bare', remote.name)
+        tags.git('remote', 'add', 'origin', remote.name)
+        first = self.commit('1.0.0')
+        second = self.commit('1.1.0')
+        tags.git('tag', '-a', 'v1.0.0', second, '-m', 'wrong')
+        tags.git('push', 'origin', 'v1.0.0')
+        tags.git('tag', '-d', 'v1.0.0')
+        with self.assertRaisesRegex(ValueError, 'different commit'):
+            tags.tag_versions('HEAD', push=True)
+        self.assertNotEqual(first, second)
+
 
 class ReleaseBump(unittest.TestCase):
     """scripts/release_bump.py assigns versions after merge (PRs never bump)."""
