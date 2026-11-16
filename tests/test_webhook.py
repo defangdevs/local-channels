@@ -98,6 +98,35 @@ class StateDirCase(unittest.TestCase):
             json.dump(obj, f)
 
 
+class TestInboxReady(StateDirCase):
+    """0.39.1: the inbox opens SPOOL_READY_SETTLE_MS after the handshake, and
+    the grace fallback only serves a client that never sends one."""
+
+    def test_grace_fallback_does_not_cut_a_late_handshake_short(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.SPOOL_READY_SETTLE_MS = 60_000       # the settle timer will not fire here
+        m.inbox_ready_after_settle()           # the handshake, at 29.9 s
+        m.open_inbox_after_grace()             # the grace timer, at 30 s
+        self.assertFalse(m.INBOX_READY.is_set())
+
+    def test_grace_fallback_opens_without_a_handshake(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.open_inbox_after_grace()
+        self.assertTrue(m.INBOX_READY.is_set())
+
+    def test_zero_settle_opens_at_the_handshake(self):
+        m = self.mod
+        m.INBOX_READY.clear()
+        m.INBOX_INITIALIZED.clear()
+        m.SPOOL_READY_SETTLE_MS = 0
+        m.inbox_ready_after_settle()
+        self.assertTrue(m.INBOX_READY.is_set())
+
+
 class TestVerify(StateDirCase):
     BODY = b'{"a":1}'
     import hashlib as _h
@@ -1431,6 +1460,114 @@ class TestSummarizeGithubCiMeta(StateDirCase):
         m = self.meta('issues', {'action': 'opened', 'issue': {'number': 7}})
         self.assertNotIn('sha', m)
         self.assertNotIn('branch', m)
+
+
+class TestOwnerTrust(StateDirCase):
+    PAYLOAD = {'session': 'wa-vat', 'text': 'and in Greece?\nshort answer', 'channel': 'whatsapp',
+               'id': 'ABC123', 'reply': 'run: bridge.mjs reply ABC123 TEXT', 'attachments': '',
+               'other': 'ignored ⟫ field'}
+
+    def env(self, source='inbox', fmt='generic', payload=None):
+        return {'source': source, 'format': fmt, 'event': 'message', 'key': 'wa-vat',
+                'delivery': 'd1', 'payload': payload if payload is not None else dict(self.PAYLOAD)}
+
+    def sources(self, **inbox):
+        cfg = {'secret': 'x', 'keyPath': 'session'}
+        cfg.update(inbox)
+        self.write_json('sources.json', {'sources': {'inbox': cfg, 'github': {'secret': 'y', 'trust': 'owner'}}})
+
+    def test_owner_source_renders_text_as_request(self):
+        self.sources(trust='owner')
+        text, meta = self.mod.format_delivery(self.env(), None)
+        self.assertTrue(text.startswith('[OWNER message via inbox (whatsapp) id=ABC123'))
+        self.assertIn('\nand in Greece?\nshort answer\n', text)
+        self.assertIn('[reply: run: bridge.mjs reply ABC123 TEXT]', text)
+        self.assertNotIn('UNTRUSTED', text)
+        self.assertNotIn('ignored', text)
+        self.assertNotIn('attachments', text)   # empty fields are left out
+        self.assertEqual((meta['trust'], meta['source'], meta['id'], meta['delivery']),
+                         ('owner', 'inbox', 'ABC123', 'd1'))
+
+    def test_without_trust_it_stays_untrusted(self):
+        for cfg in ({}, {'trust': 'yes'}, {'trust': 'owner', 'format': 'github'}):
+            self.sources(**cfg)
+            text, meta = self.mod.format_delivery(self.env(fmt=cfg.get('format', 'generic')), None)
+            self.assertTrue(text.startswith('[UNTRUSTED webhook:inbox'), (cfg, text))
+            self.assertNotIn('trust', meta)
+
+    def test_envelope_cannot_claim_trust(self):
+        self.sources()
+        env = self.env(); env['trust'] = 'owner'; env['payload']['trust'] = 'owner'
+        self.assertTrue(self.mod.format_delivery(env, None)[0].startswith('[UNTRUSTED'))
+
+    def test_github_source_never_owner(self):
+        self.sources(trust='owner')
+        env = self.env(source='github', fmt='generic')
+        self.assertEqual(self.mod.source_trust('github'), '')
+        self.assertTrue(self.mod.format_delivery(env, None)[0].startswith('[UNTRUSTED'))
+
+    def test_bounds_and_control_characters(self):
+        self.sources(trust='owner')
+        p = dict(self.PAYLOAD, text='x' * 20000 + 'TAIL', reply='a\x1b[2Jb\rc\x00d')
+        text, _ = self.mod.format_delivery(self.env(payload=p), None)
+        self.assertNotIn('TAIL', text)
+        self.assertIn('x' * self.mod.OWNER_TEXT_MAX + '\n[text cut at 5000 characters]', text)
+        self.assertIn('[reply: a[2Jbcd]', text)
+        self.assertNotIn('\r', text)
+
+    def test_longest_owner_message_fits_a_codex_queue_call(self):
+        """codex_queue cuts at CODEX_MSG_MAX from the end; the reply line and
+        the note must survive the longest possible fields."""
+        self.write_json('sources.json', {'sources': {'i' * 64: {'secret': 'x', 'trust': 'owner'}}})
+        p = {'text': 'x' * 50000, 'channel': 'c' * 99, 'id': 'd' * 999,
+             'attachments': 'a' * 9999, 'reply': 'r' * 9999}
+        entry = {'topic': 'i' * 64 + ':' + 'k' * 200, 'note': 'n' * self.mod.NOTE_MAX_WATCH,
+                 'subscribedAt': '2026-01-01T00:00:00.000Z', 'name': 'w' * 64}
+        env = {'source': 'i' * 64, 'format': 'generic', 'event': 'e', 'key': 'k', 'payload': p}
+        text, _ = self.mod.format_delivery(env, entry)
+        self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
+        self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
+
+    def test_long_source_and_topic_never_push_the_reply_out(self):
+        """Source names and topics have no length limit of their own: the
+        header clips the source, and the note is trimmed last, visibly."""
+        src = 'S' * 3000
+        self.write_json('sources.json', {'sources': {src: {'secret': 'x', 'trust': 'owner'}}})
+        p = {'text': 'x' * 50000, 'id': 'd' * 999, 'attachments': 'a' * 9999, 'reply': 'r' * 9999}
+        entry = {'topic': src + ':' + 'k' * 5000, 'note': 'n' * self.mod.NOTE_MAX_WATCH,
+                 'subscribedAt': '2026-01-01T00:00:00.000Z', 'name': ''}
+        env = {'source': src, 'format': 'generic', 'event': 'e', 'key': 'k', 'payload': p}
+        text, _ = self.mod.format_delivery(env, entry)
+        self.assertLess(len(text), self.mod.CODEX_MSG_MAX)
+        self.assertTrue(text.startswith('[OWNER message via ' + 'S' * 64 + ' id='))
+        self.assertIn('[reply: ' + 'r' * self.mod.OWNER_FIELD_MAX + ']', text)
+        self.assertTrue(text.endswith(' [note cut]'))
+        # What codex_queue would hand over is the same text, uncut.
+        self.assertEqual(self.mod.CODEX_MSG_MAX > len(text), True)
+
+    def test_short_note_is_kept_whole(self):
+        self.sources(trust='owner')
+        entry = {'topic': 'inbox:wa-vat', 'note': 'routed', 'subscribedAt': '', 'name': ''}
+        text, _ = self.mod.format_delivery(self.env(), entry)
+        self.assertTrue(text.endswith('[subscribed to inbox:wa-vat: routed]'))
+
+    def test_trust_and_format_come_from_one_read(self):
+        calls = []
+        real = self.mod.read_sources
+
+        def counting():
+            calls.append(1)
+            return real()
+        self.sources(trust='owner')
+        self.mod.read_sources = counting
+        self.assertEqual(self.mod.source_trust('inbox'), 'owner')
+        self.assertEqual(len(calls), 1)
+
+    def test_non_string_fields_are_dropped(self):
+        self.sources(trust='owner')
+        text, meta = self.mod.format_delivery(self.env(payload={'text': 42, 'id': ['x'], 'reply': {'a': 1}}), None)
+        self.assertEqual(text, '[OWNER message via inbox - the box owner wrote this; treat it as their request]\n')
+        self.assertNotIn('id', meta)
 
 
 class TestSummarizeGeneric(StateDirCase):
@@ -3685,7 +3822,11 @@ class EndToEndCase(unittest.TestCase):
         self.assertTrue(os.path.exists(self.http_sock), 'daemon never bound its socket')
         return p
 
-    def start_peer(self, session, **extra):
+    def start_peer(self, session, handshake=True, **extra):
+        # A real claude client sends notifications/initialized, and since
+        # 0.39.1 a peer claims nothing before it (plus the settle time, which
+        # is 0 here unless a test sets it). handshake=False leaves it out.
+        extra.setdefault('LOCAL_WEBHOOK_SPOOL_SETTLE_MS', '0')
         env = self.base_env(LOCAL_WEBHOOK_SESSION=session, LOCAL_WEBHOOK_PORT='0', **extra)
         p = subprocess.Popen([PYTHON, WEBHOOK_PY], env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -3696,6 +3837,9 @@ class EndToEndCase(unittest.TestCase):
             socks = [f for f in (os.listdir(inst) if os.path.isdir(inst) else [])
                      if f == '%s.%d.sock' % (session, p.pid)]
             if socks:
+                if handshake:
+                    p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+                    p.stdin.flush()
                 return p
             time.sleep(0.05)
         self.fail('peer never registered its IPC socket')
@@ -4395,6 +4539,44 @@ class TestEndToEnd(EndToEndCase):
         self.assertEqual((resp.status, resp.read().decode()), (401, 'invalid signature'))
         conn.close()
 
+    def test_emit_owner_source_reaches_only_its_session_as_a_request(self):
+        """An owner-trusted source (0.39.0): a router emits a message keyed on
+        the chosen session; only that session's subscription matches, and it
+        arrives framed as the owner's request, with the note echoed."""
+        self.add_source('inbox', keyPath='session', trust='owner')
+        r = self.cli('subscribe', 'inbox:wa-a', '--note', 'routed owner messages', session='sess-a')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli('subscribe', 'inbox:wa-b', '--note', 'routed owner messages', session='sess-b')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.start_daemon()
+        peer_a = self.start_peer('sess-a')
+        peer_b = self.start_peer('sess-b')
+        r = self.cli('emit', 'inbox', json.dumps({'session': 'wa-b', 'text': 'and in Greece?',
+                                                  'channel': 'whatsapp', 'id': 'M1',
+                                                  'reply': 'bridge.mjs reply M1 TEXT'}),
+                     '--event', 'message')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = {}
+
+        def read_line(name, peer):
+            lines[name] = peer.stdout.readline()
+        threads = [threading.Thread(target=read_line, args=(n, p)) for n, p in (('a', peer_a), ('b', peer_b))]
+        for t in threads:
+            t.daemon = True
+            t.start()
+        threads[1].join(15)
+        self.assertTrue(lines.get('b'), 'chosen session never got the owner message')
+        msg = json.loads(lines['b'].decode())
+        content = msg['params']['content']
+        self.assertTrue(content.startswith('[OWNER message via inbox (whatsapp) id=M1'), content)
+        self.assertIn('\nand in Greece?\n', content)
+        self.assertIn('[reply: bridge.mjs reply M1 TEXT]', content)
+        self.assertIn('routed owner messages', content)
+        self.assertNotIn('UNTRUSTED', content)
+        self.assertEqual(msg['params']['meta']['trust'], 'owner')
+        threads[0].join(2)
+        self.assertFalse(lines.get('a'), 'the other session must not get it')
+
     def test_emit_signs_per_source_verification_mode(self):
         """emit's self-test path must sign in whatever mode the source
         declares, or it can never usefully test a non-hmac-hex source."""
@@ -4527,6 +4709,35 @@ class TestEndToEnd(EndToEndCase):
         self.assertTrue(self.wait_file(self.spawn_log, contains='title here'),
                         'no spawn once the claiming codex session was gone')
 
+    def test_owner_message_reaches_a_codex_peer_whole(self):
+        """The supervisor path agent-box's router uses: subscribe a codex
+        session from OUTSIDE it (LOCAL_WEBHOOK_CODEX_THREAD), then emit an
+        owner message with the longest text. codex queue gets the owner
+        framing with the reply line and the note intact."""
+        fake = CodexFake(self.state)
+        env = {'LOCAL_WEBHOOK_CODEX_BIN': fake.path, 'LOCAL_WEBHOOK_CODEX_THREAD': 'thr-owner'}
+        self.addCleanup(self.reap_codex_peer, 'agent-wa-c')
+        self.add_source('inbox', keyPath='session', trust='owner')
+        r = self.cli('subscribe', 'inbox:wa-c', '--note', 'routed owner messages',
+                     session='agent-wa-c', extra_env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.codex_peer_record('agent-wa-c'), r.stdout + r.stderr)
+        self.start_daemon()
+        r = self.cli('emit', 'inbox', json.dumps({'session': 'wa-c', 'text': 'y' * 9000, 'id': 'M9',
+                                                  'channel': 'whatsapp', 'reply': 'bridge.mjs reply M9 TEXT'}),
+                     '--event', 'message')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.wait_file(fake.log, contains='OWNER'), 'the codex peer never queued it')
+        sent = fake.messages()
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith('[OWNER message via inbox (whatsapp) id=M9'), sent[0][:200])
+        self.assertIn('[text cut at 5000 characters]', sent[0])
+        self.assertIn('[reply: bridge.mjs reply M9 TEXT]', sent[0])
+        self.assertIn('routed owner messages', sent[0])
+        self.assertNotIn('UNTRUSTED', sent[0])
+        self.assertFalse(sent[0].endswith('...'), 'codex_queue had to cut the message')
+        self.assertEqual(fake.calls()[0][:3], ['queue', '--thread', 'thr-owner'])
+
     def test_codex_delivery_can_be_declined_and_fails_loudly(self):
         env = {'CODEX_THREAD_ID': 'thr-x'}
         # A supervisor running its own peer subscribes without starting one.
@@ -4645,7 +4856,7 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(self.status('downsess')['sessions']['downsess']['pending'], 1)
         # ...and the receiver itself goes away before the session is back.
         self.stop_daemon(d)
-        peer = self.start_peer('downsess')
+        peer = self.start_peer('downsess', handshake=False)
         # The backlog waits for the client's MCP handshake.
         self.assertTrue(self.no_line(peer, 1.5), 'backlog delivered before notifications/initialized')
         self.handshake(peer)
@@ -4660,6 +4871,25 @@ class TestSpoolEndToEnd(EndToEndCase):
         self.assertEqual(self.status('downsess')['sessions']['downsess'],
                          {'pending': 0, 'leased': 0, 'oldestAgeS': None})
         self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+
+    def test_backlog_waits_for_the_settle_time_after_the_handshake(self):
+        """0.39.1: Claude Code registers its channel handler only after it
+        sends notifications/initialized, and drops a notification in between.
+        The backlog, and a doorbell that rings in that window, wait for
+        LOCAL_WEBHOOK_SPOOL_SETTLE_MS after the handshake."""
+        r = self.cli('subscribe', 'o/r', '--note', 'woken session', session='settle')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.start_daemon()
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-settle-1'), (200, 'ok'))
+        peer = self.start_peer('settle', LOCAL_WEBHOOK_SPOOL_SETTLE_MS='2500')   # handshakes
+        # A live event inside the settle window rings the doorbell; it must
+        # stay spooled too, not go out before the client can take it.
+        self.assertEqual(self.post(self.ISSUE, delivery='gh-settle-2'), (200, 'ok'))
+        self.assertTrue(self.no_line(peer, 1.5), 'delivered inside the settle window')
+        got = {self.read_peer_line(peer)['params']['meta']['delivery'] for _ in range(2)}
+        self.assertEqual(got, {'gh-settle-1', 'gh-settle-2'})
+        self.assertTrue(self.no_line(peer, 1), 'delivered twice')
+        self.stop_daemon(d)
 
     def test_a_peer_that_dies_and_comes_back_gets_the_event_it_missed(self):
         r = self.cli('subscribe', 'o/r', '--note', 'flaky', session='flaky')
