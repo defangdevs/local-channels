@@ -11,6 +11,10 @@ SPEC = importlib.util.spec_from_file_location(
     'tag_versions', Path(__file__).resolve().parents[1] / 'scripts/tag_versions.py')
 tags = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tags)
+RB_SPEC = importlib.util.spec_from_file_location(
+    'release_bump', Path(__file__).resolve().parents[1] / 'scripts/release_bump.py')
+rb = importlib.util.module_from_spec(RB_SPEC)
+RB_SPEC.loader.exec_module(rb)
 
 
 class VersionTags(unittest.TestCase):
@@ -124,3 +128,60 @@ class VersionTags(unittest.TestCase):
                     tags.tag_versions(ref)
                 self.assertEqual(tags.git('tag', '--list'), '')
                 self.assertFalse(Path('injected').exists())
+
+
+class ReleaseBump(unittest.TestCase):
+    """scripts/release_bump.py assigns versions after merge (PRs never bump)."""
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.tmp = tempfile.TemporaryDirectory()
+        os.chdir(self.tmp.name)
+        for a in (('init', '-b', 'main'), ('config', 'user.name', 'T'),
+                  ('config', 'user.email', 't@example.com')):
+            tags.git(*a)
+        files = {
+            'local-webhook/webhook.py': "VERSION = '1.2.3'\n",
+            'local-webhook/.claude-plugin/plugin.json':
+                '{\n  "version": "1.2.3",  "keywords": []\n}\n',
+            'local-router/router.py': 'VERSION = "0.1.0"\n',
+            'README.md': '| [`local-webhook`](local-webhook/) | 1.2.3 | x |\n'
+                         '| [`local-router`](local-router/) | 0.1.0 | y |\n',
+        }
+        for path, text in files.items():
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(text)
+        self.commit('base')
+        self.base = tags.git('rev-parse', 'HEAD')
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        self.tmp.cleanup()
+
+    def commit(self, subject):
+        tags.git('add', '.')
+        tags.git('commit', '-m', subject)
+
+    def test_patch_bump_only_for_changed_plugin(self):
+        Path('local-webhook/extra.py').write_text('x\n')
+        self.commit('fix a thing')
+        self.assertEqual(rb.release(self.base), {'local-webhook': ('1.2.3', '1.2.4')})
+        self.assertIn("VERSION = '1.2.4'", Path('local-webhook/webhook.py').read_text())
+        self.assertIn('"version": "1.2.4",  "keywords"',
+                      Path('local-webhook/.claude-plugin/plugin.json').read_text())
+        readme = Path('README.md').read_text()
+        self.assertIn('| 1.2.4 |', readme)
+        self.assertIn('| 0.1.0 |', readme)
+
+    def test_feat_is_minor(self):
+        Path('local-router/new.py').write_text('x\n')
+        self.commit('feat: query-token (#31)')
+        self.assertEqual(rb.release(self.base), {'local-router': ('0.1.0', '0.2.0')})
+
+    def test_docs_only_and_manual_bump_are_left_alone(self):
+        Path('local-webhook/README.md').write_text('docs\n')
+        self.commit('docs')
+        self.assertEqual(rb.release(self.base), {})
+        Path('local-router/router.py').write_text('VERSION = "0.5.0"\n')
+        self.commit('manual bump')
+        self.assertEqual(rb.release(self.base, apply=False), {})

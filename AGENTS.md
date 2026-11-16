@@ -75,17 +75,25 @@ new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
 
 ## Versioning and release
 
-Every behaviour change to a plugin is a version bump in the same commit:
+**Do not bump versions in a PR.** Every open PR bumping its own version line
+collides with every other one. The `release` job in `ci.yml` assigns versions
+after merge: `scripts/release_bump.py` bumps each plugin whose non-doc files
+changed in the push (`VERSION`, manifest, README table row) and commits
+`release: <plugin> X.Y.Z` to `main`. The level is minor when a commit subject
+starts with `feat` or contains `[minor]`, otherwise patch, so write the PR title
+accordingly. A PR that does touch a plugin's version files (a deliberate manual
+bump) is left alone by the script.
 
-1. `VERSION` in `local-webhook/webhook.py` and `version` in
-   `local-webhook/.claude-plugin/plugin.json` must stay identical.
-2. The plugin's `description` and `keywords` in `.claude-plugin/plugin.json` and
-   its entry in `.claude-plugin/marketplace.json` are kept byte-identical.
-3. Minor bump (`0.7.0` → `0.8.0`) for new capability or a reshaped internal
-   model; patch bump for a fix or a tuned default (`0.5.3` retuned the TTL).
-4. Update `local-webhook/README.md` and the root `README.md` version table.
+- Do not write a version number in README or code prose for your change
+  (`(0.40.0)`); you do not know it yet. Refer to the issue/PR number instead.
+- Keep the plugin's `description`/`keywords` in `.claude-plugin/plugin.json` and
+  its entry in `.claude-plugin/marketplace.json` byte-identical.
+- Update `local-webhook/README.md` and the root README feature text as before;
+  only the version numbers are automatic.
+- Tests that pin a version number must compare against the source constant, not
+  a literal.
 
-CI tags versions as `vX.Y.Z` after the test matrix succeeds on `main`.
+After the `release` job, CI tags versions as `vX.Y.Z` on `main`.
 `scripts/tag_versions.py` walks first-parent history and tags the first mainline
 commit carrying each version (including the historical `gh-webhook` name).
 Existing tags must match that commit; never move or reuse a version tag.
@@ -105,8 +113,8 @@ bump usually needs a companion PR in that repo. Mention it in the PR body.
 ## Commits and PRs
 
 - Branch `feat/<short-topic>`; never commit to `main`.
-- Commit subject: `<plugin> <version>: <what changed>` (for example,
-  `local-whatsapp 0.1.0: add linked-device bridge`), imperative and
+- Commit subject: `<plugin>: <what changed>`, with a `feat` prefix for a new
+  capability (for example, `feat local-whatsapp: add linked-device bridge`), imperative and
   concrete. Body explains the **problem first, then the change**, in prose
   paragraphs and bullets, and ends with the verification evidence. Keep the
   `Co-authored-by:` / `Claude-Session:` trailers.
@@ -128,8 +136,8 @@ zero-dependency constraint as the plugin itself. CI runs it on python 3.9 (the
 supported floor) and current 3.x; a PR merges only when both are green. The
 suite covers signature verification, topic matching, TTL/renewal, the MCP
 tool surface, dispatch batching, and subprocess end-to-end flows (daemon +
-session peer + CLI, real signed deliveries). Version-bump invariants (rule 1/2
-below, plus the README version tables) are themselves asserted by a test.
+session peer + CLI, real signed deliveries). Version consistency invariants
+(manifest, constant, marketplace, README tables) are themselves asserted by a test.
 
 The historical bar remains: a change to delivery behaviour is verified by a
 real signed delivery reaching a real session peer — add it to the e2e tests

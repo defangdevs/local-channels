@@ -3272,6 +3272,7 @@ class TestSpoolFailureModes(SpoolCase):
     def test_a_dead_peer_loses_its_marker_with_its_socket(self):
         self.quiet()
         inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
         p = subprocess.Popen([PYTHON, '-c', 'pass'])
         p.wait()
         sock = os.path.join(inst, 'ghost.%d.sock' % p.pid)
@@ -5175,6 +5176,43 @@ class TestReapOrphanFilterLocks(StateDirCase):
         self.assertFalse(t.is_alive())
         self.assertEqual(len(seen), 1)
         self.assertTrue(os.path.exists(lock))
+
+
+class TestReadOnlyStateDir(unittest.TestCase):
+    """0.39.2 (#147): read-only commands never write, so `status` works on a
+    read-only state dir that has no instances/ directory."""
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root ignores mode bits')
+    def test_status_on_read_only_state_dir(self):
+        state = tempfile.mkdtemp(prefix='webhook-ro-')
+        self.addCleanup(shutil.rmtree, state, True)
+        os.chmod(state, 0o500)
+        self.addCleanup(os.chmod, state, 0o700)
+        env = dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=state)
+        r = subprocess.run([PYTHON, WEBHOOK_PY, 'status'], env=env, capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.listdir(state), [])
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root ignores mode bits')
+    def test_ls_does_not_rewrite_expired_entries(self):
+        state = tempfile.mkdtemp(prefix='webhook-ro-')
+        self.addCleanup(shutil.rmtree, state, True)
+        path = os.path.join(state, 'filter.ro.json')  # session 'ro' below
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True, 'ttlHours': 1, 'topics': [
+                {'topic': 'github:o/r', 'expiresAt': 1}]}, f)
+        with open(path, encoding='utf-8') as f:
+            before = f.read()
+        os.chmod(state, 0o500)
+        self.addCleanup(os.chmod, state, 0o700)
+        env = dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=state, LOCAL_WEBHOOK_SESSION='ro')
+        r = subprocess.run([PYTHON, WEBHOOK_PY, 'ls'], env=env, capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(f.read(), before)
+        self.assertIn('github:o/r', r.stdout)
 
 
 class TestVersionConsistency(unittest.TestCase):

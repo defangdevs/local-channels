@@ -75,6 +75,11 @@ Default `~/.local/state/local-webhook` (override: `LOCAL_WEBHOOK_STATE_DIR`).
 Secrets and config live here — **outside** the plugin install dir, which is a
 managed cache that may be wiped on update, and outside the marketplace repo.
 
+Read-only commands (`status`, `ls`) never write here (0.39.2): `instances/` is
+created only when a session peer binds its socket, and `ls` leaves expired
+entries in `filter.json` (it omits them and names them under `expired`), so both
+work on a read-only state dir.
+
 ### sources.json
 
 ```json
@@ -96,7 +101,7 @@ Per-source keys (all optional except one of `secret`/`secretFile`):
 | `secret` / `secretFile` | — | verification secret (file paths resolve in the state dir) |
 | `previousSecret` / `previousSecretFile` + `previousSecretUntil` | — | rotation overlap: while the ISO-8601 `previousSecretUntil` is in the future, a delivery that fails the current secret is also verified against the previous one, and logged as such. Without a future expiry it is ignored, so an overlap cannot become permanent |
 | `format` | `github` iff source is named github, else `generic` | payload summarizer |
-| `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` \| `query-token` (0.40.0) — see [Verification modes](#verification-modes-0300) |
+| `verification` (0.30.0) | `hmac-hex` | `hmac-hex` \| `token` \| `standard-webhooks` \| `query-token` — see [Verification modes](#verification-modes-0300) |
 | `signatureHeader` | depends on `verification` (`x-hub-signature-256` / `x-gitlab-token` / `webhook-signature`) | the signature, in that mode's own shape |
 | `idHeader` (0.30.0) | `webhook-id` | `standard-webhooks` only |
 | `timestampHeader` (0.30.0) | `webhook-timestamp` | `standard-webhooks` only; more than 5 minutes from now is refused as a possible replay |
@@ -130,7 +135,7 @@ default keeps every existing source verifying exactly as before.
   docs call this out explicitly. The secret may be a plain string or a
   `whsec_`-prefixed base64 string, exactly as Standard Webhooks specifies.
 
-- **`query-token`** (0.40.0, #31) — the secret is a URL query parameter
+- **`query-token`** (#31) — the secret is a URL query parameter
   (`tokenParam`, default `token`), for a sender that signs nothing and cannot
   set a header: Rollbar's documented method is
   `https://host/rollbar?token=...` (the path is the source name; if a proxy
@@ -140,7 +145,7 @@ default keeps every existing source verifying exactly as before.
   Use it only for a sender that offers nothing better, and keep the access log
   of whatever fronts this receiver off the query string. A missing or wrong
   token answers 401 like every other mode.
-- **`eventPath`** (0.40.0, any mode) — dot-path into the body for the event
+- **`eventPath`** (#31, any mode) — dot-path into the body for the event
   name, tried after the event header and before the `event` / `type`
   fallbacks. Rollbar names it `event_name`.
 

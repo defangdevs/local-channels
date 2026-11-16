@@ -44,7 +44,10 @@ jobs:
       - name: End-to-end test of local-slack (mock Slack, real local-webhook bus)
         run: python tests/e2e/run_e2e.py
 
-  tag:
+  release:
+    # Versions are assigned here, after merge, so PRs never bump them and never
+    # collide on the version lines. The bot commit is pushed with GITHUB_TOKEN,
+    # which does not start another run; the tag job below tags it directly.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, whatsapp]
     runs-on: ubuntu-latest
@@ -56,6 +59,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main  # not the pushed sha: an earlier run's bump commit must be seen
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Bump versions for the plugins this push changed
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          git cat-file -e "$BEFORE^{commit}" 2>/dev/null || exit 0
+          python scripts/release_bump.py "$BEFORE" "$GITHUB_SHA" | tee bumped.txt
+          [ -s bumped.txt ] || exit 0
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "release: $(paste -sd, bumped.txt)"
+          git push origin HEAD:main
+
+  tag:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: version-tags
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
