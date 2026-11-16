@@ -82,12 +82,17 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -am "release: $(paste -sd, bumped.txt)"
-          # If main moved on, this is rejected as non-fast-forward. That is fine:
-          # the newer push has its own run, and the rule is stateless, so it
-          # releases everything this run would have.
+          # A rejected push is fine only when main really moved on: the newer
+          # push has its own run, and the rule is stateless, so it releases
+          # everything this run would have. Any other failure fails the job.
           if git push origin HEAD:main; then
             echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           else
+            git fetch origin main
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "push failed although main has not moved" >&2
+              exit 1
+            fi
             echo "main moved; leaving the bump to the newer run"
           fi
 
