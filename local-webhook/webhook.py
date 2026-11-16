@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.39.1'
+VERSION = '0.39.2'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1961,8 +1961,10 @@ def run_codex_peer():
 # before emitting to their session. The daemon has no session of its own, so it
 # only broadcasts (see deliver()) and opens no peer socket of its own.
 # Stale sockets from crashed instances are unlinked on first failed connect.
+# Not created here: importing (and so `status`, `ls`, any read-only CLI command)
+# must not write, or it crashes on a read-only state dir (#147). The directory is
+# made where a peer binds its socket, below. Every reader tolerates it missing.
 INSTANCE_DIR = os.path.join(STATE_DIR, 'instances')
-os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
 # "<filter key>.<pid>.sock" since 0.10.0 — the pid keeps the name unique, the
 # key says WHOSE subscriptions this peer applies, which is what lets the
 # ingress owner ask "is a live session already watching this?" before spawning
@@ -3648,6 +3650,11 @@ def _ipc_serve(srv):
 # socket of whatever PID it happens to reuse).
 IPC_INBOX_MARKER = IPC_SOCK[:-len('.sock')] + '.inbox'
 if not RECEIVER_ONLY and not CLI:
+    try:
+        os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
+    except OSError as e:
+        print('local-webhook: cannot create %s (%s) — this session gets no live deliveries'
+              % (INSTANCE_DIR, e), file=sys.stderr)
     try:
         os.unlink(IPC_SOCK)  # PID reuse after a crash: reclaim our own path
     except OSError:
