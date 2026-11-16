@@ -114,6 +114,7 @@ rc, out = cli('channel', 'add', 'C3')
 check('CLI: channel add C3 refused (bot not a member)', rc != 0, out[:120])
 cfg = json.load(open(CFG))
 cfg['C1'].update({'quiet_minutes': 0.1, 'resettle': True})
+cfg['C1'].setdefault('reactions', {})['ready'] = 'white_check_mark'
 cfg['C1'].setdefault('write', {})['allowed'] = True
 cfg.setdefault('_defaults', {}).setdefault('links', {})['allowed_hosts'] = ['github.com']
 json.dump(cfg, open(CFG, 'w'), indent=2)
@@ -174,10 +175,14 @@ check('E4/E5/E6 unfurl edit, bot echo and unconfigured channel produce nothing',
 mock.event('Ev7', {'type': 'reaction_added', 'user': 'UGUEST', 'reaction': 'white_check_mark',
                    'item': {'type': 'message', 'channel': 'C1', 'ts': B}, 'event_ts': '1760500007.000100'})
 pump(3)
-check('E7 a guest cannot settle a thread with ✅', not [n for n in notes if act(n) == 'thread.settled'])
+# Only a ✅ settle counts. Thread A may also settle as quiet in this window:
+# its 6 s quiet period from reply B ends near here, and whether the 2 s ticker
+# fires first depends on the run's timing, not on what E7 tests.
+ready = [n for n in notes if act(n) == 'thread.settled' and 'reason: ready' in n['content']]
+check('E7 a guest cannot settle a thread with ✅', not ready, ready[0]['content'][:220] if ready else '')
 # E8: a member mentions the bot
 mock.event('Ev8', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': '<@UBOT> can you look?', 'ts': C, 'thread_ts': A})
-got = wait_notes(lambda n: act(n) == 'thread.settled')
+got = wait_notes(lambda n: act(n) == 'thread.settled' and 'reason: mention' in n['content'])
 check('E8 a mention settles the thread immediately', got, got[0]['content'][:220] if got else 'no thread.settled')
 time.sleep(1.5)
 wrote = [c for c in mock.calls if c[1] in ('reactions.add', 'chat.postMessage', 'chat.update')]
@@ -203,7 +208,7 @@ p = posts[-1][3] if posts else {}
 check('W1 reply after a mention is sent (on_request allows it)', rc == 0 and posts, out[:160])
 check('W1 reply is threaded, unfurls off, mention resolved, link tokenised, disclosure appended',
       p.get('thread_ts') == A and p.get('unfurl_links') is False and p.get('unfurl_media') is False
-      and '<@U1>' in p.get('text', '') and '<https://github.com/defangdevs/agent-box/issues/863|github.com>' in p.get('text', '')
+      and '<@U1>' in p.get('text', '') and '<https://github.com/defangdevs/agent-box/issues/863|github.com/defangdevs/agent-box/issues/863>' in p.get('text', '')
       and 'AI agent' in p.get('text', ''), json.dumps(p)[:300])
 bot_ts = sorted([k[1] for k, m in mock.messages.items() if m.get('user') == 'UBOT' and k[0] == 'C1'])[-1] if posts else None
 for name, args in [('W2 ``@channel refused', ('reply', 'C1', A, '``@channel urgent')),
