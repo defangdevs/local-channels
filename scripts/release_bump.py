@@ -28,8 +28,8 @@ PLUGINS = {
 SEMVER = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+')
 
 
-def git(*args):
-    return subprocess.check_output(['git', *args], text=True)
+def git(*args, **kwargs):
+    return subprocess.check_output(['git', *args], text=True, **kwargs)
 
 
 def commit_id(ref):
@@ -82,21 +82,34 @@ def write(plugin, old, new):
     open('README.md', 'w', encoding='utf-8').write(row.sub(r'\g<1>%s\2' % new, readme, count=1))
 
 
-def last_version_commit(plugin, head):
-    """Newest commit at or before head whose diff changed a version VALUE.
-
-    Pickaxe (-G) on the version line, so a commit that merely edits code in a
-    version-bearing file (webhook.py) is not mistaken for a bump.
-    """
-    found = []
+def version_at(plugin, rev):
+    """The plugin's version values at rev, or None when its files are absent."""
+    values = []
     for path, kind in PLUGINS[plugin]:
-        pattern = '"version"' if kind == 'json' else kind.split('(')[0].lstrip('^')
-        oid = git('log', '-1', '--format=%H', '-G' + pattern, head, '--', path).strip()
-        if oid:
-            found.append(oid)
-    if not found:
-        return None
-    return git('rev-list', '--no-walk=sorted', *found).split()[0]
+        try:
+            text = git('show', rev + ':' + path, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            return None
+        m = re.search(kind, text, re.M) if kind != 'json' else None
+        try:
+            values.append(m.group(1) if m else json.loads(text)['version'])
+        except (AttributeError, KeyError, ValueError):
+            return None
+    return tuple(values)
+
+
+def last_version_commit(plugin, head):
+    """Newest commit at or before head that changed a version VALUE.
+
+    Compares the values at each candidate and its parent, so a commit that
+    edits code, or a comment on the VERSION line, is not mistaken for a bump.
+    """
+    paths = [path for path, _ in PLUGINS[plugin]]
+    for commit in git('log', '--format=%H', head, '--', *paths).split():
+        parents = git('rev-list', '--parents', '-n1', commit).split()[1:]
+        if version_at(plugin, commit) != (version_at(plugin, parents[0]) if parents else None):
+            return commit
+    return None
 
 
 def release(head='HEAD', apply=True):

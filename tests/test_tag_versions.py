@@ -240,6 +240,11 @@ class ReleaseBump(unittest.TestCase):
         self.assertEqual(rb.release(apply=False), {
             'local-webhook': ('1.2.3', '1.2.4'), 'local-router': ('0.1.0', '0.1.1')})
 
+    def test_comment_edit_on_the_version_line_is_not_a_bump(self):
+        Path('local-webhook/webhook.py').write_text("VERSION = '1.2.3'  # reviewed\nprint('new')\n")
+        self.commit('fix webhook and touch the VERSION line comment')
+        self.assertEqual(rb.release(apply=False), {'local-webhook': ('1.2.3', '1.2.4')})
+
     def test_manual_bump_is_baseline_and_missed_runs_are_recovered(self):
         Path('local-router/router.py').write_text('VERSION = "0.5.0"\n')
         self.commit('manual bump')
