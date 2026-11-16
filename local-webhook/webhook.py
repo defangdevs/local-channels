@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = '0.39.1'
+VERSION = '0.39.2'
 # One-shot CLI mode (any argv beyond the script path). The MCP tools only exist
 # inside a Claude Code session that loaded the plugin; a codex session, a plain
 # shell, or a script has no way to reach them. Same code, same filter files, so
@@ -1961,8 +1961,10 @@ def run_codex_peer():
 # before emitting to their session. The daemon has no session of its own, so it
 # only broadcasts (see deliver()) and opens no peer socket of its own.
 # Stale sockets from crashed instances are unlinked on first failed connect.
+# Not created here: importing (and so `status`, `ls`, any read-only CLI command)
+# must not write, or it crashes on a read-only state dir (#147). The directory is
+# made where a peer binds its socket, below. Every reader tolerates it missing.
 INSTANCE_DIR = os.path.join(STATE_DIR, 'instances')
-os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
 # "<filter key>.<pid>.sock" since 0.10.0 — the pid keeps the name unique, the
 # key says WHOSE subscriptions this peer applies, which is what lets the
 # ingress owner ask "is a live session already watching this?" before spawning
@@ -3649,6 +3651,11 @@ def _ipc_serve(srv):
 IPC_INBOX_MARKER = IPC_SOCK[:-len('.sock')] + '.inbox'
 if not RECEIVER_ONLY and not CLI:
     try:
+        os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
+    except OSError as e:
+        print('local-webhook: cannot create %s (%s) — this session gets no live deliveries'
+              % (INSTANCE_DIR, e), file=sys.stderr)
+    try:
         os.unlink(IPC_SOCK)  # PID reuse after a crash: reclaim our own path
     except OSError:
         pass
@@ -3673,6 +3680,8 @@ if not RECEIVER_ONLY and not CLI:
         except OSError:
             pass
     try:
+        # Retried here: a transient failure above must not leave the bind to fail.
+        os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
         _ipc_srv = socket.socket(socket.AF_UNIX)
         _addr, _close = _sock_open(IPC_SOCK)
         try:
@@ -5116,17 +5125,24 @@ def call_tool(params):
     # webhook_subscriptions reads and prunes BOTH files regardless of `path`
     # (see below), so both are locked here rather than only the one this call
     # is otherwise scoped to.
-    with FILTER_LOCK, filter_file_lock(FILTER_FILE), filter_file_lock(DISPATCH_FILE):
+    # Listing writes nothing (#147), so it takes no .lock file either: creating
+    # one is a write, and a read-only state dir must still answer `ls`.
+    with contextlib.ExitStack() as _locks:
+        if name != 'webhook_subscriptions':
+            _locks.enter_context(FILTER_LOCK)
+            _locks.enter_context(filter_file_lock(FILTER_FILE))
+            _locks.enter_context(filter_file_lock(DISPATCH_FILE))
         now = now_ms()
 
         # Every tool call is also a pruning opportunity: expired topics drop out
         # here even if no delivery ever arrives to trigger route_event's prune.
-        def pruned(p):
+        def pruned(p, persist=True):
             f = read_filter(p)
             expired = [e for e in f['topics'] if entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
             if expired:
                 f['topics'] = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
-                write_filter(f, p)
+                if persist:
+                    write_filter(f, p)
             return f, expired
 
         def render(e, default_ttl):
@@ -5135,7 +5151,9 @@ def call_tool(params):
         if name == 'webhook_subscriptions':
             if arguments.get('scope', _MISSING) not in (_MISSING, 'all'):
                 return text('error: scope must be "all"')
-            f, expired = pruned(FILTER_FILE)
+            # Listing is read-only (#147): expired entries are left out of the
+            # reply but not rewritten, so `ls` works on a read-only state dir.
+            f, expired = pruned(FILTER_FILE, persist=False)
             body = {'enabled': f['enabled'], 'ttlHours': f['ttlHours']}
             if SELF:
                 body['self'] = SELF
@@ -5161,7 +5179,7 @@ def call_tool(params):
                     'no filter file: this session receives nothing until it subscribes. Before '
                     '0.13.0 this state forwarded EVERY event of every wired source instead.')
             # Dispatch standing watches are shared, so every session sees them.
-            d, dexpired = pruned(DISPATCH_FILE)
+            d, dexpired = pruned(DISPATCH_FILE, persist=False)
             if d['topicsConfigured']:
                 body['dispatch'] = {'filterFile': DISPATCH_FILE, 'enabled': d['enabled'],
                                     'topics': [render(e, d['ttlHours']) for e in d['topics']]}

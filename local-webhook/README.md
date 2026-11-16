@@ -75,6 +75,11 @@ Default `~/.local/state/local-webhook` (override: `LOCAL_WEBHOOK_STATE_DIR`).
 Secrets and config live here — **outside** the plugin install dir, which is a
 managed cache that may be wiped on update, and outside the marketplace repo.
 
+Read-only commands (`status`, `ls`) never write here (0.39.2): `instances/` is
+created only when a session peer binds its socket, and `ls` leaves expired
+entries in `filter.json` (it omits them and names them under `expired`), so both
+work on a read-only state dir.
+
 ### sources.json
 
 ```json
