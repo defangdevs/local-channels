@@ -20,6 +20,7 @@ CHANNELS = {'C1': {'id': 'C1', 'name': 'dev', 'is_member': True, 'is_ext_shared'
 
 class Mock:
     def __init__(self):
+        self.info_errors = set()  # channels whose metadata is temporarily unavailable
         self.calls = []          # (time, method, content_type, params, token_kind)
         self.messages = {}       # (channel, ts) -> message dict (incl. thread_ts)
         self.acks = []           # (time, envelope_id)
@@ -46,6 +47,8 @@ class Mock:
                 return {'ok': False, 'error': 'not_allowed_token_type'}
             return {'ok': True, 'url': 'ws://127.0.0.1:%d/link/?ticket=t' % self.ws_port}
         if method == 'conversations.info':
+            if params.get('channel') in self.info_errors:
+                return {'ok': False, 'error': 'ratelimited'}
             c = CHANNELS.get(params.get('channel'))
             return {'ok': True, 'channel': c} if c else {'ok': False, 'error': 'channel_not_found'}
         if method == 'users.info':

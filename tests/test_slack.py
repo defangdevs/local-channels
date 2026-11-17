@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +54,7 @@ class Rig(unittest.TestCase):
             now=lambda: self.t[0], react=lambda c, ts, e: self.reacts.append((c, ts, e)),
             lookup=lambda c, ts: self.extra.get(ts), users=lambda uid: {'guest': False, 'external': False},
             defaults=self.defaults)
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
 
     def actions(self):
         return [a for a, _ in self.events]
@@ -282,6 +284,7 @@ class TestTracker(Rig):
         self.advance(601)
         tr2 = slack.Tracker(self.store, {'C1': self.cfg}, BOT, lambda a, p: self.events.append((a, p)),
                             now=lambda: self.t[0])
+        tr2.prime('C1', {'is_ext_shared': False, 'is_member': True})
         self.assertEqual(tr2.tick(), 1)
 
     def test_ignore_users(self):
@@ -791,6 +794,7 @@ class TestReviewRegressions(Rig):
     def test_controllers_fail_closed_without_a_users_lookup(self):
         tr = slack.Tracker(self.store, {'C1': self.cfg}, BOT, lambda a, p: self.events.append((a, p)),
                            now=lambda: self.t[0])
+        tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
         tr.handle(msg('1.1'))
         tr.handle(reaction('1.1', 'white_check_mark'))
         self.assertEqual(self.actions(), ['message.posted'])
@@ -936,6 +940,209 @@ class TestReviewRegressions(Rig):
         self.assertEqual(slack.drain_outbox(self.store, lambda a, p: got.append(p['n']) or True), 2)
         self.assertEqual(got, [1, 2])        # in order, then gone
         self.assertIsNone(self.store.outbox_next())
+
+
+class TestTrackerDurability(Rig):
+    def persistent(self):
+        self.store.db.close()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, 'slack.db')
+        self.store = slack.Store(self.path)
+        self.tr.store = self.store
+        self.tr.emit = self.store.outbox_put
+        self.addCleanup(lambda: self.store.db.close())
+
+    def reopen(self):
+        self.store.db.close()
+        self.store = slack.Store(self.path)
+        self.tr = slack.Tracker(self.store, {'C1': self.cfg}, BOT, self.store.outbox_put,
+                                now=lambda: self.t[0])
+
+    def _check_settle_failure_after_restart(self, after_insert):
+        self.persistent()
+        self.tr.handle(msg('1.1'))
+        slack.drain_outbox(self.store, lambda *_: True)
+        self.advance(601)
+        def fail(action, payload):
+            if after_insert:
+                self.store.outbox_put(action, payload)
+            raise OSError('injected enqueue failure')
+        self.tr.emit = fail
+        with self.assertRaises(OSError):
+            self.tr.tick()
+        self.reopen()
+        self.assertEqual(self.store.q('SELECT state FROM threads')[0]['state'], 'open')
+        self.assertIsNone(self.store.outbox_next())
+        self.assertEqual(self.tr.tick(), 0)  # a restart must re-verify channel facts
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        self.assertEqual(self.tr.tick(), 1)
+        self.assertEqual(self.store.outbox_next()['action'], 'thread.settled')
+        self.assertEqual(self.tr.tick(), 0)
+
+    def test_settle_enqueue_failure_before_insert_retries_after_restart(self):
+        self._check_settle_failure_after_restart(False)
+
+    def test_settle_enqueue_failure_after_insert_retries_after_restart(self):
+        self._check_settle_failure_after_restart(True)
+
+    def test_message_settle_failure_rolls_back_index_seen_outbox_and_ack(self):
+        self.persistent()
+        self.cfg['reactions']['ack'] = 'eyes'
+        event = msg('1.1', '<@UBOT> help')
+        def fail(action, payload):
+            if action == 'thread.settled':
+                raise OSError('injected before outbox insert')
+            self.store.outbox_put(action, payload)
+        self.tr.emit = fail
+        with self.assertRaises(OSError):
+            self.tr.handle(event)
+        for table in ('threads', 'msgs', 'seen', 'outbox'):
+            self.assertEqual(self.store.q('SELECT * FROM ' + table), [])
+        self.assertEqual(self.reacts, [])
+        self.tr.emit = self.store.outbox_put
+        def ack(*args):
+            self.assertFalse(self.store.db.in_transaction)
+            self.assertTrue(self.store.seen(event['event_id']))
+            self.assertEqual(len(self.store.q('SELECT * FROM outbox')), 2)
+            self.reacts.append(args)
+            raise RuntimeError('Slack ack failed after commit')
+        self.tr.react = ack
+        self.tr.handle(event)
+        self.tr.handle(event)
+        self.assertEqual(len(self.reacts), 1)
+        self.assertEqual(len(self.store.q('SELECT * FROM outbox')), 2)
+
+    def test_classifier_failure_does_not_settle_or_ack(self):
+        self.tr.emit = self.store.outbox_put
+        self.tr.handle(msg('1.1'))
+        self.cfg['reactions']['ack'] = 'eyes'
+        def classify(*args):
+            raise RuntimeError('classifier failed')
+        self.tr.classify = classify
+        event = reaction('1.1', 'white_check_mark')
+        with self.assertRaises(RuntimeError):
+            self.tr.handle(event)
+        self.assertFalse(self.store.seen(event['event_id']))
+        row = self.store.q('SELECT * FROM threads')[0]
+        self.assertEqual((row['state'], row['asked']), ('open', 0))
+        self.assertEqual(self.reacts, [])
+        self.tr.classify = lambda *_: ['support']
+        self.tr.handle(event)
+        payload = json.loads(self.store.q('SELECT * FROM outbox ORDER BY id DESC')[0]['payload'])
+        self.assertEqual(payload['topics'], ',support,')
+        self.assertEqual(len(self.reacts), 1)
+
+    def test_outbox_worker_cannot_read_uncommitted_rows(self):
+        inserted, release, worker_started, delivered = (threading.Event() for _ in range(4))
+        errors = []
+        def emit(action, payload):
+            self.store.outbox_put(action, payload)
+            inserted.set()
+            if not release.wait(3):
+                raise RuntimeError('test release timed out')
+            raise OSError('rollback the uncommitted outbox row')
+        self.tr.emit = emit
+        def handle():
+            try:
+                self.tr.handle(msg('1.1'))
+            except OSError:
+                pass
+            except Exception as e:
+                errors.append(e)
+        def drain():
+            worker_started.set()
+            slack.drain_outbox(self.store, lambda *_: delivered.set() or True)
+        writer = threading.Thread(target=handle)
+        worker = threading.Thread(target=drain)
+        writer.start()
+        try:
+            self.assertTrue(inserted.wait(3))
+            worker.start()
+            self.assertTrue(worker_started.wait(3))
+            self.assertFalse(delivered.wait(0.1))
+        finally:
+            release.set()
+            writer.join(3)
+            if worker.ident is not None:
+                worker.join(3)
+        self.assertFalse(writer.is_alive() or worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(delivered.is_set())
+        self.assertIsNone(self.store.outbox_next())
+
+    def test_unknown_facts_are_durable_unseen_and_replayed_after_restart(self):
+        self.persistent()
+        self.tr.external.clear()
+        self.tr.member.clear()
+        event = msg('1.1')
+        self.tr.handle(event)
+        self.tr.handle(event)  # Slack redelivery must not grow the pending queue
+        self.assertEqual(len(self.store.q('SELECT * FROM pending')), 1)
+        self.assertFalse(self.store.seen(event['event_id']))
+        self.assertIsNone(self.store.outbox_next())
+        self.reopen()
+        self.assertEqual(self.tr.tick(), 0)
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        self.tr.tick()
+        self.assertEqual(self.store.q('SELECT * FROM pending'), [])
+        self.assertTrue(self.store.seen(event['event_id']))
+        payload = json.loads(self.store.outbox_next()['payload'])
+        self.assertFalse(payload['external'])
+        self.tr.handle(event)
+        self.assertEqual(len(self.store.q('SELECT * FROM outbox')), 1)
+
+    def test_invalid_facts_never_authorize_messages_or_reactions(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        for info in (None, {}, {'is_ext_shared': False}, {'is_member': True},
+                     {'is_ext_shared': 'false', 'is_member': True},
+                     {'is_ext_shared': False, 'is_member': 1}):
+            with self.subTest(info=info), self.assertRaises(ValueError):
+                self.tr.prime('C1', info)
+        self.cfg['allow_external'] = True  # opt-in cannot turn unknown into false
+        self.cfg['track'] = 'reaction:eyes'
+        self.extra['1.1'] = '1.1'
+        event = reaction('1.1', 'eyes')
+        self.tr.handle(event)
+        self.tr.handle(msg('2.1'))
+        self.assertEqual(self.events, [])
+        self.assertFalse(self.store.seen(event['event_id']))
+        self.assertEqual(len(self.store.q('SELECT * FROM pending')), 2)
+        self.tr.prime('C1', {'is_ext_shared': True, 'is_member': True})
+        self.tr.tick()
+        self.assertEqual(self.actions(), ['message.posted'])
+        self.assertTrue(self.events[0][1]['external'])
+
+    def test_external_metadata_recovery_discards_without_emission(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        self.tr.handle(msg('1.1'))
+        self.tr.handle(reaction('1.1', 'eyes'))
+        self.tr.prime('C1', {'is_ext_shared': True, 'is_member': True})
+        self.tr.tick()
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.store.q('SELECT * FROM pending'), [])
+        self.assertEqual(len(self.store.q('SELECT * FROM seen')), 2)
+
+    def test_channel_purge_removes_pending_envelopes(self):
+        self.tr.external.clear()
+        self.tr.handle(msg('1.1'))
+        self.tr.handle(reaction('1.1', 'eyes'))
+        self.assertEqual(len(self.store.q('SELECT * FROM pending')), 2)
+        self.store.purge_channel('C1')
+        self.assertEqual(self.store.q('SELECT * FROM pending'), [])
+
+    def test_pending_capacity_failure_does_not_ack_or_mark_seen(self):
+        self.tr.external.clear()
+        from unittest.mock import patch
+        with patch.object(slack, 'MAX_PENDING_EVENTS', 1):
+            self.tr.handle(msg('1.1'))
+            self.tr.handle(msg('1.1'))
+            with self.assertRaisesRegex(RuntimeError, 'not acknowledged'):
+                self.tr.handle(msg('2.1'))
+        self.assertEqual(len(self.store.q('SELECT * FROM pending')), 1)
+        self.assertEqual(self.store.q('SELECT * FROM seen'), [])
 
 
 class TestBusRouting(unittest.TestCase):
