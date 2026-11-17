@@ -85,6 +85,9 @@ sessions that subscribed to it. It is a single dependency-free file,
 [`local-webhook/webhook.py`](local-webhook/webhook.py): the MCP side is a
 hand-rolled JSON-RPC stdio loop, the HTTP side is `http.server`.
 
+Importing its helpers starts no runtime and creates no state. The script entry
+point (or an explicit `main(argv)` call) starts the CLI, receiver or session peer.
+
 See [`local-webhook/README.md`](local-webhook/README.md) for the exhaustive
 per-source configuration reference and wiring recipes; this section is the
 end-to-end picture.
