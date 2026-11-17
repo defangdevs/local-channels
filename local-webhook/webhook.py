@@ -1103,11 +1103,16 @@ def with_traces(f, gone, path, now):
     """
     if os.path.abspath(path) == os.path.abspath(DISPATCH_FILE):
         return []
-    keep = {(r['topic'], r['name']): r for r in f.get('expired', [])}
+    # Topic identity is case-insensitive everywhere else (subscription lookup),
+    # the name part is case-sensitive.
+    def ident(topic, name):
+        return (topic.lower(), name)
+
+    keep = {ident(r['topic'], r['name']): r for r in f.get('expired', [])}
     for r in gone:
-        keep[(r['topic'], r['name'])] = r
+        keep[ident(r['topic'], r['name'])] = r
     for e in f['topics']:
-        keep.pop((e['topic'], e.get('name') or ''), None)
+        keep.pop(ident(e['topic'], e.get('name') or ''), None)
     return read_expired_traces(list(keep.values()), now)
 
 
@@ -5190,10 +5195,13 @@ def peer_roster(now=None):
     sessions = []
     for key in sorted(pids):
         f = read_filter(filter_path_of(key))
-        rows = [render_entry(e, f['ttlHours'], now) for e in f['topics']
-                if not entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
+        live, gone = expiry_split(f, now) if f['topicsConfigured'] else ([], [])
+        rows = [render_entry(e, f['ttlHours'], now) for e in live]
+        # Traces for entries that expired but are not pruned from the file yet,
+        # merged in memory only: this function never writes.
+        lapsed = with_traces({**f, 'topics': live}, gone, filter_path_of(key), now) if gone else f['expired']
         sessions.append({'session': key, 'pid': pids[key], 'self': key == FILTER_KEY,
-                         'enabled': f['enabled'], 'topics': rows, 'lapsed': f['expired']})
+                         'enabled': f['enabled'], 'topics': rows, 'lapsed': lapsed})
     return sessions
 
 
@@ -5598,12 +5606,17 @@ def call_tool(params):
             # mentions it, same as it survives one naming a DIFFERENT name.
             filtered = [e for e in f['topics'] if not (eq(e['topic'], topic) and e['name'] == watch_name)]
             watch_label = '%s name=%s' % (topic, watch_name) if watch_name else topic
+            # The requested identity's lapsed trace goes too, even when no live
+            # subscription matches (only a trace may remain).
+            traces = [r for r in f['expired'] if not (eq(r['topic'], topic) and r['name'] == watch_name)]
             if len(filtered) == len(f['topics']):
+                if len(traces) != len(f['expired']):
+                    write_filter({**f, 'expired': with_traces({**f, 'expired': traces}, [], path, now)}, path)
                 return text('not subscribed to %s%s (current%s: %s)%s' % (
                     watch_label, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
                     listing(f['topics']), expired_note))
             write_filter({**f, 'topics': filtered,
-                          'expired': with_traces({**f, 'topics': filtered}, [], path, now)}, path)
+                          'expired': with_traces({**f, 'topics': filtered, 'expired': traces}, [], path, now)}, path)
             return text('unsubscribed from %s%s (current%s: %s)%s' % (
                 watch_label, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
                 listing(filtered), expired_note))

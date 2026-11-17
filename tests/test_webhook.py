@@ -909,6 +909,52 @@ class TestCallTool(StateDirCase):
         self.call('webhook_unsubscribe', topic='new/r')
         self.assertNotIn('expired', self.read_json('filter.testsess.json'))
 
+    def lapse(self, topic, name=None):
+        self.call('webhook_subscribe', topic=topic, ttl_hours=1, **({'name': name} if name else {}))
+        path = os.path.join(self.state, 'filter.testsess.json')
+        f = self.read_json('filter.testsess.json')
+        f['topics'][0]['subscribedAt'] = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        with open(path, 'w') as fh:
+            json.dump(f, fh)
+        self.mod.route_event('github', topic, 'x', 'issues')  # prunes, leaves the trace
+        self.assertEqual(len(self.read_json('filter.testsess.json')['expired']), 1)
+
+    def test_unsubscribe_clears_a_trace_with_no_live_subscription(self):
+        self.lapse('o/r')
+        self.assertIn('not subscribed', self.call('webhook_unsubscribe', topic='o/r'))
+        self.assertNotIn('expired', self.read_json('filter.testsess.json'))
+
+    def test_unsubscribe_keeps_traces_of_other_names(self):
+        self.lapse('o/r', name='a')
+        self.call('webhook_unsubscribe', topic='o/r', name='b')
+        self.assertEqual(len(self.read_json('filter.testsess.json')['expired']), 1)
+        self.call('webhook_unsubscribe', topic='o/r', name='a')
+        self.assertNotIn('expired', self.read_json('filter.testsess.json'))
+
+    def test_resubscribing_clears_a_trace_whatever_the_topic_case(self):
+        self.lapse('Owner/Repo')
+        self.call('webhook_subscribe', topic='owner/repo')
+        self.assertNotIn('expired', self.read_json('filter.testsess.json'))
+
+    def test_peer_roster_reports_unpruned_expiry_without_writing(self):
+        inst = os.path.join(self.state, 'instances')
+        os.makedirs(inst, exist_ok=True)
+        live = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        open(os.path.join(inst, 'alive.%d.sock' % live.pid), 'w').close()
+        path = os.path.join(self.state, 'filter.alive.json')
+        old = self.mod.iso_at(self.mod.now_ms() - 5 * 3600e3)
+        with open(path, 'w') as fh:
+            json.dump({'topics': [{'topic': 'github:o/r', 'note': 'n', 'ttlHours': 1,
+                                   'subscribedAt': old}]}, fh)
+        with open(path) as fh:
+            before = fh.read()
+        row = self.mod.peer_roster()[0]
+        self.assertEqual(row['topics'], [])
+        self.assertEqual([r['topic'] for r in row['lapsed']], ['github:o/r'])
+        with open(path) as fh:
+            self.assertEqual(fh.read(), before)
+
     def test_dispatch_entries_leave_no_trace(self):
         m = self.mod
         old = m.iso_at(m.now_ms() - 3 * 3600e3)
