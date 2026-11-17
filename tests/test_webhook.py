@@ -3999,6 +3999,51 @@ class TestEndToEnd(EndToEndCase):
         # emit finds a socket-activated / unix ingress only through this field.
         self.assertEqual(info['ingress'], {'path': self.http_sock})
 
+    def test_receiver_records_last_accepted_delivery(self):
+        # #55: the receiver's own high-water mark, so a waiting session can
+        # tell a quiet repo from a deaf box. Only a verified delivery counts.
+        self.start_daemon()
+        path = os.path.join(self.state, 'receiver.json')
+        self.assertTrue(self.wait_file(path, contains='}'))
+        with open(path, encoding='utf-8') as f:
+            self.assertNotIn('lastDelivery', json.load(f))
+        self.assertEqual(self.post(self.ISSUE, sig='sha256=bad')[0], 401)
+        with open(path, encoding='utf-8') as f:
+            self.assertNotIn('lastDelivery', json.load(f))
+        self.assertEqual(self.post(self.ISSUE)[0], 200)
+        with open(path, encoding='utf-8') as f:
+            info = json.load(f)
+        last = info['lastDelivery']
+        self.assertEqual(last['source'], 'github')
+        self.assertEqual(last['topic'], 'github:o/r')
+        self.assertRegex(last['at'], r'^\d{4}-\d\d-\d\dT.*Z$')
+        # The startup fields survive the rewrite.
+        self.assertTrue(info['spawn'])
+        self.assertEqual(info['ingress'], {'path': self.http_sock})
+        # `status` reports it.
+        st = json.loads(self.cli('status').stdout)
+        self.assertEqual(st['receiver']['lastDelivery'], last)
+
+    def test_last_delivery_survives_wall_clock_rollback_and_orders_by_acceptance(self):
+        # #55: ordering and throttle use the monotonic clock, so a wall-clock
+        # step back neither blocks later deliveries nor lets a late handler
+        # replace a newer record.
+        state = tempfile.mkdtemp(prefix='webhook-test-')
+        self.addCleanup(shutil.rmtree, state, True)
+        mod = load_webhook({'LOCAL_WEBHOOK_STATE_DIR': state, 'LOCAL_WEBHOOK_SESSION': 'testsess'})
+        mod.LAST_DELIVERY_MIN_S = 0
+        path = os.path.join(state, 'receiver.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid()}, f)
+        mod.note_accepted_delivery('github', 'o/new', 2_000_000_000_000, order=20)
+        mod.note_accepted_delivery('github', 'o/old', 2_000_000_100_000, order=10)  # late handler
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['lastDelivery']['topic'], 'github:o/new')
+        # Wall clock stepped back, but acceptance is newer: it must record.
+        mod.note_accepted_delivery('github', 'o/next', 1_000_000_000_000, order=30)
+        with open(path, encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['lastDelivery']['topic'], 'github:o/next')
+
     def test_dispatch_spawns_and_peer_fanout_and_isolation(self):
         # Standing watch via CLI (what a session's tool call writes).
         r = self.cli('subscribe', 'o/r', '--deliver-to', 'subagent', '--note', 'standing watch',

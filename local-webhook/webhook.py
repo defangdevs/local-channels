@@ -4441,7 +4441,8 @@ def dispatch_event(env, sid=None, at=None, enqueue=True):
 # dispatch is actually wired (webhook_subscribe warns when it is not), and so
 # `emit` can find the ingress — under socket activation the bound path exists
 # nowhere in a session's environment, only in the daemon's adopted fd.
-# Advisory only: absent on legacy setups, stale after a crash.
+# Advisory only: absent on legacy setups, stale after a crash. Since 0.40.0 it
+# also carries lastDelivery (see note_accepted_delivery).
 RECEIVER_FILE = os.path.join(STATE_DIR, 'receiver.json')
 
 
@@ -5617,6 +5618,71 @@ def handle_rpc(msg):
 
 
 # ------------------------------------------------------------ HTTP (recv) ---
+# Last-accepted-delivery high-water mark (#55). A session that waits on a
+# topic cannot tell "the repo is quiet" from "this box is deaf": the receiver
+# is the one process that knows when it last ACCEPTED a verified delivery, so
+# it records that in receiver.json and `status` reports it. Mechanism only —
+# what a stale timestamp means is the caller's judgement. Written at most once
+# per LAST_DELIVERY_MIN_S so a burst is one small write, which makes the
+# stored value up to that many seconds behind; "heard anything this hour?"
+# does not need more. Only the receiver that wrote the file (matching pid)
+# updates it, so a session peer never rewrites a daemon's advertisement.
+LAST_DELIVERY_MIN_S = 5
+_LAST_DELIVERY_LOCK = threading.Lock()
+# The throttle and the acceptance order both use the monotonic clock, so a
+# wall-clock step can neither stretch the throttle nor make a newer delivery
+# look older; the wall clock only supplies lastDelivery.at. `order` is taken
+# where the delivery became accepted, and a record older than the stored one is
+# dropped, so a handler that resumes late cannot report an earlier delivery as
+# latest. A file lock serialises the read-modify-write with the startup
+# advertisement, so a stale rewrite cannot restore an old pid/ingress.
+_last_delivery_write_mono = [None]
+_last_delivery_order = [0]
+
+
+@contextlib.contextmanager
+def receiver_file_lock():
+    fd = None
+    try:
+        fd = os.open(RECEIVER_FILE + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        pass  # best effort: the pid check below still guards the common case
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing releases the flock
+
+
+def note_accepted_delivery(source, key, at_ms=None, order=None):
+    at_ms = now_ms() if at_ms is None else at_ms
+    order = time.monotonic_ns() if order is None else order
+    mono = time.monotonic()
+    with _LAST_DELIVERY_LOCK:
+        last = _last_delivery_write_mono[0]
+        if last is not None and mono - last < LAST_DELIVERY_MIN_S:
+            return
+        if order < _last_delivery_order[0]:
+            return
+        with receiver_file_lock():
+            info = receiver_info()
+            if not info or info.get('pid') != os.getpid():
+                return
+            info['lastDelivery'] = {'at': iso_at(at_ms), 'source': source,
+                                    'topic': '%s:%s' % (source, key) if key else source}
+            tmp = '%s.%d.tmp' % (RECEIVER_FILE, os.getpid())
+            try:
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    fh.write(pretty(info) + '\n')
+                os.replace(tmp, RECEIVER_FILE)
+                _last_delivery_write_mono[0] = mono
+                _last_delivery_order[0] = order
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+
+
 def deliver(handler, body):
     def done(code, txt):
         data = txt.encode('utf-8')
@@ -5695,8 +5761,11 @@ def deliver(handler, body):
     if src.get('retainPayload') is True and not SPOOL_ENABLED:
         return done(503, 'payload retention requires the durable spool')
     if not SPOOL_ENABLED:
+        accepted_ms = now_ms()
+        accepted_order = time.monotonic_ns()
+        note_accepted_delivery(name, key, accepted_ms, accepted_order)
         try:
-            learn_merge(env, now_ms())
+            learn_merge(env, accepted_ms)
         except OSError:
             return done(500, 'merge scope unavailable')
         if not RECEIVER_ONLY:
@@ -5711,6 +5780,8 @@ def deliver(handler, body):
     digest = hashlib.sha256(body).hexdigest()
     try:
         accepted = spool_accept(env, digest, retain=src.get('retainPayload') is True)
+        accepted_ms = now_ms()
+        accepted_order = time.monotonic_ns()
     except OSError as e:
         print('local-webhook: could not spool %s delivery %s (%s) — answering 500 so the sender '
               'records it as failed (backfill can re-request it)'
@@ -5723,6 +5794,7 @@ def deliver(handler, body):
               % (name, delivery), file=sys.stderr)
         return done(200, 'ok (duplicate)')
     sid, at = accepted
+    note_accepted_delivery(name, key, accepted_ms, accepted_order)
     with SPOOL_INFLIGHT_LOCK:
         SPOOL_INFLIGHT.add(sid)
     try:
@@ -6432,7 +6504,7 @@ def main():
         except OSError:
             ingress = None
         try:
-            with open(RECEIVER_FILE, 'w', encoding='utf-8') as fh:
+            with receiver_file_lock(), open(RECEIVER_FILE, 'w', encoding='utf-8') as fh:
                 fh.write(pretty({'pid': os.getpid(), 'version': VERSION, 'ingress': ingress,
                                  'spawn': bool(SPAWN_CMD), 'startedAt': iso_at(now_ms())}) + '\n')
         except OSError:
