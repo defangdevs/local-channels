@@ -787,7 +787,7 @@ class Tracker:
         return not u.get('guest') and not u.get('external')
 
     # -- entry point --------------------------------------------------------
-    def handle(self, envelope):
+    def handle(self, envelope, replay=False):
         """`envelope` is a Socket Mode events_api payload (or an HTTP event
         callback body): {'team_id','event_id','event':{...}}. One lock covers
         this and tick(): both read-modify-write `threads`, and an unlocked
@@ -798,8 +798,22 @@ class Tracker:
             # Slack supplies event_id; the digest also keeps direct callers'
             # envelopes stable across retries without inventing a seen ID.
             pending_id = eid or hashlib.sha256(json.dumps(envelope, sort_keys=True).encode()).hexdigest()
+            if replay and not self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id):
+                return   # purged after tick took its snapshot: do not resurrect it
             if self.store.seen(eid):
                 self.store.x('DELETE FROM pending WHERE event_id=?', pending_id)
+                return
+            channel = ((envelope.get('event') or {}).get('channel')
+                       or ((envelope.get('event') or {}).get('item') or {}).get('channel'))
+            if (not replay and channel and
+                    not self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id) and
+                    self.store.q('SELECT 1 FROM pending WHERE channel=? LIMIT 1', channel)):
+                # Keep channel order: a live event queues behind that channel's
+                # pending ones until ordered replay has succeeded.
+                if self.store.q('SELECT COUNT(*) n FROM pending')[0]['n'] >= MAX_PENDING_EVENTS:
+                    raise RuntimeError('channel metadata pending queue is full; event not acknowledged')
+                self.store.x('INSERT INTO pending VALUES (?,?,?)', pending_id, channel,
+                             json.dumps(envelope))
                 return
             team = envelope.get('team_id') or (envelope.get('event') or {}).get('team') or ''
             ev = envelope.get('event') or {}
@@ -1138,8 +1152,16 @@ class Tracker:
         but only if version is unchanged since read (compare-and-swap in
         _finish). Restart-safe: everything is recomputed from the table."""
         with self.lock:
-            for pending in self.store.q('SELECT payload FROM pending ORDER BY rowid'):
-                self.handle(json.loads(pending['payload']))
+            blocked = set()   # a channel whose earlier event is still pending keeps its order
+            for pending in self.store.q('SELECT event_id, channel, payload FROM pending ORDER BY rowid'):
+                if pending['channel'] in blocked:
+                    continue
+                try:
+                    self.handle(json.loads(pending['payload']), replay=True)
+                except Exception as e:   # one bad envelope must not starve the rest or _tick
+                    print('local-slack: pending event failed: %s' % e, file=sys.stderr)
+                if self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending['event_id']):
+                    blocked.add(pending['channel'])
             return self._tick()
 
     def _tick(self):

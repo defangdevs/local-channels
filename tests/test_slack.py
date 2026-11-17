@@ -1133,6 +1133,63 @@ class TestTrackerDurability(Rig):
         self.store.purge_channel('C1')
         self.assertEqual(self.store.q('SELECT * FROM pending'), [])
 
+    def test_live_reply_waits_behind_pending_parent(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        self.tr.handle(msg('1.1'))
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        reply = msg('1.2', thread_ts='1.1')
+        self.tr.handle(reply)  # after prime, before tick: must queue, not be dropped
+        self.assertFalse(self.store.seen(reply['event_id']))
+        self.assertEqual(len(self.store.q('SELECT * FROM pending')), 2)
+        self.tr.tick()
+        self.assertEqual(self.store.q('SELECT * FROM pending'), [])
+        self.assertTrue(self.store.seen(reply['event_id']))
+        row = self.store.q('SELECT * FROM threads')[0]
+        self.assertEqual(row['thread_ts'], '1.1')
+        self.assertEqual(len(self.store.q('SELECT * FROM msgs')), 2)
+
+    def test_replay_skips_row_purged_after_snapshot(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        self.tr.handle(msg('1.1'))
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        real_q = self.store.q
+        def q(sql, *args):
+            rows = real_q(sql, *args)
+            if sql.startswith('SELECT event_id, channel, payload FROM pending'):
+                self.store.purge_channel('C1')  # purge lands after the snapshot
+            return rows
+        self.store.q = q
+        self.tr.tick()
+        self.store.q = real_q
+        self.assertEqual(real_q('SELECT * FROM threads'), [])
+        self.assertEqual(real_q('SELECT * FROM msgs'), [])
+        self.assertEqual(real_q('SELECT * FROM outbox'), [])
+
+    def test_failing_pending_envelope_does_not_starve_others_or_tick(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        bad, good = msg('9.1'), msg('1.1', channel='C2')
+        self.tr.handle(bad)
+        self.tr.handle(good)
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        self.tr.prime('C2', {'is_ext_shared': False, 'is_member': True})
+        real = self.tr._message
+        def message(team, ev, now):
+            if ev['ts'] == '9.1':
+                raise OSError('reaction failed')
+            return real(team, ev, now)
+        self.tr._message = message
+        ticked = []
+        self.tr._tick = lambda: ticked.append(1) or 0
+        self.tr.tick()
+        self.assertEqual(ticked, [1])
+        self.assertTrue(self.store.seen(good['event_id']))
+        self.assertFalse(self.store.seen(bad['event_id']))
+        self.assertEqual([r['event_id'] for r in self.store.q('SELECT event_id FROM pending')],
+                         [bad['event_id']])
+
     def test_pending_capacity_failure_does_not_ack_or_mark_seen(self):
         self.tr.external.clear()
         from unittest.mock import patch
