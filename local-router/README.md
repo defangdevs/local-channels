@@ -43,7 +43,9 @@ The runtime has no third-party dependencies. Building an installable wheel or
 source distribution uses setuptools and wheel; both artifacts include the full
 MIT license and copyright notice. CI checks a clean wheel installation and a
 wheel rebuilt from the source distribution on Python 3.9 and current Python,
-including the minimum supported setuptools on Python 3.9. To run the same check:
+including the minimum supported setuptools and a pinned newer toolchain on
+Python 3.9. CI installs build tooling from hash-locked, wheel-only requirements
+under `.github/requirements/`. To run the same check:
 
 ```sh
 python3 -m pip install 'setuptools>=78.1.1' wheel

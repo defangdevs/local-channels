@@ -32,8 +32,9 @@ tests/test_router_bench.py        benchmark data, mixing and scoring with fake r
 The Python runtime files need no build step. The router's optional installable
 package uses setuptools and wheel; `scripts/check_router_package.py` builds clean
 wheel/source artifacts and checks isolated imports and console scripts. CI also
-checks the minimum setuptools on Python 3.9. There is no Python lockfile or
-generated source file. A new plugin is a
+checks the minimum setuptools on Python 3.9. CI build tooling is hash-locked in
+`.github/requirements/`; there is no Python runtime lockfile or generated source
+file. A new plugin is a
 new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
 `README.md` and a marketplace entry — plus tests under `tests/`.
 

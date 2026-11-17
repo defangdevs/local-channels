@@ -53,21 +53,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Prove the declared backend floor, as well as tooling selected for
-          # each supported interpreter. Old setuptools is not a new-Python promise.
+          # Prove the declared backend floor and pinned newer tooling. Each
+          # lock contains wheel hashes and supports its selected interpreter.
           - python: '3.9'
-            setuptools: 'setuptools==78.1.1'
+            toolchain: minimum
           - python: '3.9'
-            setuptools: 'setuptools'
+            toolchain: py39
           - python: '3.x'
-            setuptools: 'setuptools'
+            toolchain: current
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - name: Install build tooling
-        run: python -m pip install --upgrade '${{ matrix.setuptools }}' wheel
+        run: >-
+          python -m pip install --only-binary :all: --require-hashes
+          -r ".github/requirements/router-build-${{ matrix.toolchain }}.txt"
       - name: Build, install and validate router wheel and source distribution
         run: python scripts/check_router_package.py
 
