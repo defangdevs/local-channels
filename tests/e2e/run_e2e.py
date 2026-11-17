@@ -1,7 +1,7 @@
 """End-to-end test of local-slack (PR #86) against a mock Slack and an isolated
 local-webhook bus with a real MCP session peer. Nothing touches the network or
 this box's live receiver: every path is under E2E_DIR."""
-import atexit, json, os, queue, shutil, subprocess, sys, tempfile, threading, time
+import atexit, json, os, queue, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get('REPO') or os.path.dirname(os.path.dirname(HERE))  # place under <repo>/tests/e2e/
@@ -117,7 +117,14 @@ cfg['C1'].update({'quiet_minutes': 0.1, 'resettle': True})
 cfg['C1'].setdefault('reactions', {})['ready'] = 'white_check_mark'
 cfg['C1'].setdefault('write', {})['allowed'] = True
 cfg.setdefault('_defaults', {}).setdefault('links', {})['allowed_hosts'] = ['github.com']
+# Two configured channels fail their startup metadata lookup. C4 is external;
+# neither its messages nor its reactions may reach the real signed bus.
+mock_slack.CHANNELS['C4'] = {'id': 'C4', 'is_member': True, 'is_ext_shared': True}
+cfg['C4'] = {'track': 'reaction:eyes'}
+mock.info_errors.update(('C1', 'C4'))
 json.dump(cfg, open(CFG, 'w'), indent=2)
+rpc(5, 'tools/call', {'name': 'webhook_subscribe', 'arguments': {
+    'topic': 'slack:T1/C4', 'note': 'e2e: external channel must stay closed'}})
 
 daemon = subprocess.Popen([sys.executable, os.path.join(HERE, 'ls_patched.py'), 'daemon'], env=ls_env,
                           stdout=open(os.path.join(E2E, 'daemon.out'), 'w'), stderr=open(os.path.join(E2E, 'daemon.err'), 'w'))
@@ -142,12 +149,29 @@ def act(n):
 A, B, C = '1760500001.000100', '1760500002.000100', '1760500003.000100'
 # E1: top-level message
 mock.event('Ev1', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': 'Export button does nothing on the reports page', 'ts': A})
+mock.event('EvExtMessage', {'type': 'message', 'channel': 'C4', 'user': 'U1', 'text': 'external', 'ts': A})
+mock.event('EvExtReaction', {'type': 'reaction_added', 'user': 'U1', 'reaction': 'eyes',
+                           'item': {'type': 'message', 'channel': 'C4', 'ts': A}})
+pump(2.5)
+with sqlite3.connect(os.path.join(LS, 'slack.db')) as db:
+    pending = db.execute('SELECT COUNT(*) FROM pending').fetchone()[0]
+    unseen = db.execute('SELECT COUNT(*) FROM seen WHERE event_id IN (?,?,?)',
+                        ('Ev1', 'EvExtMessage', 'EvExtReaction')).fetchone()[0] == 0
+check('failed metadata lookup persists and ACKs envelopes without emission or dedup',
+      not notes and pending == 3 and unseen and len(mock.acks) == 3)
+mock.info_errors.clear()
 got = wait_notes(lambda n: act(n) == 'message.posted')
 check('E1 top-level message reaches the subscribed session as message.posted', got,
       got[0]['content'][:200] if got else 'nothing delivered')
 if got:
     check('E1 delivery is framed untrusted and carries the subscription note',
           got[0]['content'].startswith('[UNTRUSTED webhook:slack') and 'e2e: #dev' in got[0]['content'])
+pump(0.5)
+with sqlite3.connect(os.path.join(LS, 'slack.db')) as db:
+    pending = db.execute('SELECT COUNT(*) FROM pending').fetchone()[0]
+    external_threads = db.execute("SELECT COUNT(*) FROM threads WHERE channel='C4'").fetchone()[0]
+check('metadata retry replays internal traffic and discards external traffic',
+      pending == 0 and external_threads == 0 and len(notes) == 1)
 n_before = len(notes)
 # E2: Slack redelivers E1
 mock.event('Ev1', {'type': 'message', 'channel': 'C1', 'user': 'U1', 'text': 'Export button does nothing on the reports page', 'ts': A}, retry=1)

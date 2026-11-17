@@ -23,6 +23,7 @@
 # isolation hardening are follow-ups; the spec's guardrails that do not depend
 # on grants are all enforced here, in the code path every write passes.
 import base64
+import contextlib
 import hashlib
 import errno
 import http.client
@@ -566,6 +567,7 @@ CREATE TABLE IF NOT EXISTS threads(thread_key TEXT PRIMARY KEY, team TEXT, chann
                                    replies INTEGER, ended_at REAL, asked INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL,
                                    action TEXT, payload TEXT);
+CREATE TABLE IF NOT EXISTS pending (event_id TEXT PRIMARY KEY, channel TEXT, payload TEXT);
 CREATE TABLE IF NOT EXISTS status (thread_key TEXT PRIMARY KEY, ts TEXT);
 CREATE TABLE IF NOT EXISTS audit  (at REAL, channel TEXT, thread TEXT, ts TEXT,
                                    session TEXT, kind TEXT, text TEXT);
@@ -577,11 +579,49 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self._after_commit = []
         self.db.executescript(SCHEMA)
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Keep tracker state, dedup and outbox atomic on this shared connection.
+        The lock spans COMMIT so another thread cannot deliver uncommitted rows
+        or accidentally commit its own writes as part of our transaction.
+        Nested tracker operations join the outer transaction; errors propagate
+        to its owner, which rolls everything back.
+        """
+        callbacks = []
+        with self.lock:
+            if self.db.in_transaction:
+                yield
+                return
+            self.db.execute('BEGIN IMMEDIATE')
+            self._after_commit = []
+            try:
+                yield
+                self.db.execute('COMMIT')
+                callbacks = self._after_commit
+            except BaseException:
+                if self.db.in_transaction:
+                    self.db.execute('ROLLBACK')
+                raise
+            finally:
+                self._after_commit = []
+        for callback in callbacks:
+            callback()
+
+    def after_commit(self, callback):
+        # Only used for best-effort Slack acknowledgement reactions. A callback
+        # must handle its own errors: persistence has already succeeded.
+        with self.lock:
+            if self.db.in_transaction:
+                self._after_commit.append(callback)
+                return
+        callback()
 
     def q(self, sql, *args):
         with self.lock:
@@ -637,21 +677,30 @@ class Store:
         self.x('DELETE FROM audit WHERE at < ?', now - audit_days * 86400)
 
     def purge_channel(self, channel):
-        for t in ('msgs', 'threads', 'audit'):
-            self.x('DELETE FROM %s WHERE channel=?' % t, channel)
-        # Two key shapes: team/channel/ts, and channel/ts when Writer.status
-        # found no record to take a key from.
-        self.x('DELETE FROM status WHERE thread_key LIKE ? OR thread_key LIKE ?',
-               '%/' + channel + '/%', channel + '/%')
+        with self.transaction():   # replay must see all of it or none of it
+            for t in ('msgs', 'threads', 'audit', 'pending'):
+                self.x('DELETE FROM %s WHERE channel=?' % t, channel)
+            # Two key shapes: team/channel/ts, and channel/ts when Writer.status
+            # found no record to take a key from.
+            self.x('DELETE FROM status WHERE thread_key LIKE ? OR thread_key LIKE ?',
+                   '%/' + channel + '/%', channel + '/%')
 
     def purge_all(self):
-        for t in ('seen', 'msgs', 'threads', 'status', 'audit', 'outbox'):
-            self.x('DELETE FROM %s' % t)
+        with self.transaction():
+            for t in ('seen', 'msgs', 'threads', 'status', 'audit', 'outbox', 'pending'):
+                self.x('DELETE FROM %s' % t)
 
 
 # --------------------------------------------------------------------------
 # 4. tracker
 # --------------------------------------------------------------------------
+
+MAX_PENDING_EVENTS = 1000
+
+
+class ChannelFactsUnknown(Exception):
+    pass
+
 
 CONTROL = ('ready', 'hold', 'drop')
 
@@ -674,7 +723,9 @@ class Tracker:
     machine. `emit(action, payload)` is the only way out; `now` is injectable
     so tests control the clock. `bot` is {'user_id','bot_id'} from auth.test.
     `lookup(channel, ts)` resolves a message's thread via conversations.replies
-    on an index miss. `users(user_id)` returns {'guest':bool,'external':bool}."""
+    on an index miss. `users(user_id)` returns {'guest':bool,'external':bool}.
+    Durable emit callbacks must enqueue into this Store; classification is
+    read-only and its failures roll back the whole transition."""
 
     def __init__(self, store, channels, bot, emit, now=time.time, lookup=None, users=None,
                  react=None, classify=None, retention_days=30, defaults=None):
@@ -738,47 +789,87 @@ class Tracker:
         return not u.get('guest') and not u.get('external')
 
     # -- entry point --------------------------------------------------------
-    def handle(self, envelope):
+    def handle(self, envelope, replay=False):
         """`envelope` is a Socket Mode events_api payload (or an HTTP event
         callback body): {'team_id','event_id','event':{...}}. One lock covers
         this and tick(): both read-modify-write `threads`, and an unlocked
         reply could be stranded in a thread the ticker just settled."""
-        with self.lock:
+        with self.lock, self.store.transaction():
             now = self.now()
             eid = envelope.get('event_id')
+            # Slack supplies event_id; the digest also keeps direct callers'
+            # envelopes stable across retries without inventing a seen ID.
+            pending_id = eid or hashlib.sha256(json.dumps(envelope, sort_keys=True).encode()).hexdigest()
+            if replay and not self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id):
+                return   # purged after tick took its snapshot: do not resurrect it
             if self.store.seen(eid):
+                self.store.x('DELETE FROM pending WHERE event_id=?', pending_id)
+                return
+            channel = ((envelope.get('event') or {}).get('channel')
+                       or ((envelope.get('event') or {}).get('item') or {}).get('channel'))
+            own_pending = self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id)
+            if not replay and (own_pending or (channel and
+                    self.store.q('SELECT 1 FROM pending WHERE channel=? LIMIT 1', channel))):
+                # Keep channel order: a live event, or a redelivery of one
+                # already queued, waits behind that channel's pending events
+                # until ordered replay reaches it.
+                if own_pending:
+                    return
+                if self.store.q('SELECT COUNT(*) n FROM pending')[0]['n'] >= MAX_PENDING_EVENTS:
+                    raise RuntimeError('channel metadata pending queue is full; event not acknowledged')
+                self.store.x('INSERT INTO pending VALUES (?,?,?)', pending_id, channel,
+                             json.dumps(envelope))
                 return
             team = envelope.get('team_id') or (envelope.get('event') or {}).get('team') or ''
             ev = envelope.get('event') or {}
             etype = ev.get('type')
-            if etype == 'message':
-                self._message(team, ev, now)
-            elif etype in ('reaction_added', 'reaction_removed'):
-                self._reaction(team, ev, etype, now)
-            elif etype in ('channel_shared', 'channel_unshared'):
-                self.external[ev.get('channel')] = (etype == 'channel_shared')
-            elif etype in ('member_left_channel', 'member_joined_channel'):
-                # Joining restores what leaving paused; without it a bot that is
-                # removed and re-invited would drop every message, silently,
-                # until the daemon restarted.
-                if self._is_bot_self(user=ev.get('user')):
-                    self.member[ev.get('channel')] = (etype == 'member_joined_channel')
+            try:
+                if etype == 'message':
+                    self._message(team, ev, now)
+                elif etype in ('reaction_added', 'reaction_removed'):
+                    self._reaction(team, ev, etype, now)
+                elif etype in ('channel_shared', 'channel_unshared'):
+                    self.external[ev.get('channel')] = (etype == 'channel_shared')
+                elif etype in ('member_left_channel', 'member_joined_channel'):
+                    if self._is_bot_self(user=ev.get('user')):
+                        self.member[ev.get('channel')] = (etype == 'member_joined_channel')
+            except ChannelFactsUnknown:
+                # ACK only after durable storage. Slack retries are finite, so
+                # the ticker owns retry once this envelope is in the inbox.
+                if not self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id):
+                    if self.store.q('SELECT COUNT(*) n FROM pending')[0]['n'] >= MAX_PENDING_EVENTS:
+                        raise RuntimeError('channel metadata pending queue is full; event not acknowledged')
+                    self.store.x('INSERT INTO pending VALUES (?,?,?)', pending_id,
+                                 ev.get('channel') or (ev.get('item') or {}).get('channel'),
+                                 json.dumps(envelope))
+                return
             self.store.mark_seen(eid, now)
+            self.store.x('DELETE FROM pending WHERE event_id=?', pending_id)
 
     def prime(self, channel, info):
-        """Seed per-channel facts from conversations.info, so `external` and
-        membership survive a restart (events only ever flip them)."""
-        self.external[channel] = bool(info.get('is_ext_shared'))
-        self.member[channel] = bool(info.get('is_member', True))
+        """Only explicit boolean facts can authorize a channel after restart."""
+        with self.lock:
+            if not isinstance(info, dict) or any(type(info.get(k)) is not bool
+                                                for k in ('is_ext_shared', 'is_member')):
+                raise ValueError('channel sharing and membership facts must be booleans')
+            self.external[channel] = info['is_ext_shared']
+            self.member[channel] = info['is_member']
+
+    def _channel_allowed(self, channel, cfg):
+        if self.member.get(channel) is False:
+            return False
+        if self.external.get(channel) is True and not cfg['allow_external']:
+            return False
+        if channel not in self.external or channel not in self.member:
+            raise ChannelFactsUnknown(channel)
+        return True
 
     # -- messages -----------------------------------------------------------
     def _message(self, team, ev, now):
         channel = ev.get('channel')
         cfg = self.channels.get(channel)
-        if cfg is None or self.member.get(channel) is False:
-            return  # the config is the allowlist
-        if self.external.get(channel) and not cfg['allow_external']:
-            return  # a Slack Connect channel nobody opted in to
+        if cfg is None or not self._channel_allowed(channel, cfg):
+            return  # the config and verified channel facts are the allowlist
         sub = ev.get('subtype')
         if sub in ('message_changed', 'message_deleted'):
             return self._edit_or_delete(team, ev, sub, cfg, now)
@@ -952,7 +1043,7 @@ class Tracker:
         cfg = self.channels.get(channel)
         if cfg is None or item.get('type') != 'message':
             return
-        if self.external.get(channel) and not cfg['allow_external']:
+        if not self._channel_allowed(channel, cfg):
             return
         user = ev.get('user') or ''
         emoji = ev.get('reaction') or ''
@@ -1026,20 +1117,27 @@ class Tracker:
             return
         if row['state'] == 'held' or row['state'] == 'dropped':
             return
-        # Acknowledge before any agent exists (S1), but only if the deployment
-        # configured an ack reaction: the daemon does not write to Slack by itself.
+        # A configured acknowledgement follows the commit, so a failed enqueue
+        # cannot react as though the request was accepted. The daemon makes no
+        # acknowledgement reaction unless the deployment opts in.
         ack = cfg['reactions'].get('ack')
         if ack:
-            try:
-                self.react(row['channel'], ts, ack)
-            except Exception:
-                pass
+            def acknowledge():
+                try:
+                    self.react(row['channel'], ts, ack)
+                except Exception:
+                    pass  # best effort, and cannot undo an already committed event
+            self.store.after_commit(acknowledge)
         # A human asked for the agent here: this is what unlocks replies in
         # write.mode on_request, and a plain quiet settle never does.
         self.store.x('UPDATE threads SET asked=1 WHERE thread_key=?', row['thread_key'])
         self._finish(row, reason, cfg)
 
     def _finish(self, row, reason, cfg):
+        with self.store.transaction():
+            return self._finish_transaction(row, reason, cfg)
+
+    def _finish_transaction(self, row, reason, cfg):
         now = self.now()
         n = self.store.x("UPDATE threads SET state='settled', settled_version=version, ended_at=? "
                          "WHERE thread_key=? AND version=? AND state IN ('open','settled')",
@@ -1059,14 +1157,32 @@ class Tracker:
         but only if version is unchanged since read (compare-and-swap in
         _finish). Restart-safe: everything is recomputed from the table."""
         with self.lock:
+            blocked = set()   # a channel whose earlier event is still pending keeps its order
+            for pending in self.store.q('SELECT event_id, channel, payload FROM pending ORDER BY rowid'):
+                if pending['channel'] in blocked:
+                    continue
+                try:
+                    self.handle(json.loads(pending['payload']), replay=True)
+                except Exception as e:   # one bad envelope must not starve the rest or _tick
+                    print('local-slack: pending event failed: %s' % e, file=sys.stderr)
+                if self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending['event_id']):
+                    blocked.add(pending['channel'])
             return self._tick()
 
     def _tick(self):
         now = self.now()
         n = 0
+        # A channel with events still pending has an older state than its
+        # events: settling it now could lose them for good.
+        held = {r['channel'] for r in self.store.q('SELECT DISTINCT channel FROM pending')}
         for row in self.store.q("SELECT * FROM threads WHERE state='open' AND settle_at <= ?", now):
             cfg = self.channels.get(row['channel'])
-            if cfg is None:
+            if cfg is None or row['channel'] in held:
+                continue
+            try:
+                if not self._channel_allowed(row['channel'], cfg):
+                    continue
+            except ChannelFactsUnknown:
                 continue
             maxed = now >= row['first_seen_at'] + cfg['max_wait_hours'] * 3600
             if self._finish(row, 'max_wait' if maxed else 'quiet', cfg):
@@ -1472,11 +1588,11 @@ def run_daemon():
 
     def prime_channels():
         for cid in list(tracker.channels):
-            if cid not in tracker.external:
+            if cid not in tracker.external or cid not in tracker.member:
                 try:
                     tracker.prime(cid, web.call('conversations.info', {'channel': cid})['channel'])
-                except (SlackError, KeyError):
-                    pass   # unknown stays unknown; a channel_shared event still flips it
+                except (SlackError, KeyError, TypeError, ValueError):
+                    pass   # unknown stays closed; the next tick retries metadata and pending events
     prime_channels()
 
     emitter = make_emitter()

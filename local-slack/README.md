@@ -82,7 +82,7 @@ the socket lives and who may reach it are the deployment's choice.
 4. Events reach the bus through local-webhook's own `webhook.py emit` (found
    next to this plugin, or in the Claude plugin cache); `LOCAL_SLACK_EMIT`
    overrides the command. Events are written to an outbox table in the same
-   transaction pass that updates the thread and delivered by a worker that
+   SQLite transaction that updates the thread and records de-duplication and delivered by a worker that
    keeps the row until the emit succeeds, so a bus that is down delays events
    and does not lose them. **If the receiver is socket-activated** (agent-box
    runs it as `agent-box-webhook@<user>.socket`), its daemon writes the file
@@ -206,7 +206,17 @@ thread activity.
 
 **Fail-closed, on purpose:** a channel not in `channels.json` is ignored, writing
 is off, a failed user lookup counts as a guest, and a Slack Connect channel is
-refused unless allowed.
+refused unless allowed. Missing or invalid channel sharing/membership facts also
+block messages, reactions and timer settles, including when external channels
+are allowed: an unknown channel is never labelled `external: false`.
+`conversations.info` is retried each tick. While facts are unavailable, up to
+1,000 envelopes are stored in a durable pending queue before Socket Mode ACK;
+they are not marked seen until replay succeeds or verified facts/configuration
+reject them. Pending envelopes survive restarts and wait for metadata recovery
+(or explicit `purge`). If the queue is full, new envelopes are left unacknowledged
+for Slack's finite retries. A failed state/outbox transaction remains retryable;
+configured acknowledgement reactions run only after a successful commit and
+remain best effort. Existing outbox and thread retention limits still apply.
 
 **The daemon does not act in Slack by itself.** With an empty `_defaults` it
 makes no reaction, appends no disclosure line, and keeps no status reactions.
