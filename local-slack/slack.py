@@ -677,16 +677,18 @@ class Store:
         self.x('DELETE FROM audit WHERE at < ?', now - audit_days * 86400)
 
     def purge_channel(self, channel):
-        for t in ('msgs', 'threads', 'audit', 'pending'):
-            self.x('DELETE FROM %s WHERE channel=?' % t, channel)
-        # Two key shapes: team/channel/ts, and channel/ts when Writer.status
-        # found no record to take a key from.
-        self.x('DELETE FROM status WHERE thread_key LIKE ? OR thread_key LIKE ?',
-               '%/' + channel + '/%', channel + '/%')
+        with self.transaction():   # replay must see all of it or none of it
+            for t in ('msgs', 'threads', 'audit', 'pending'):
+                self.x('DELETE FROM %s WHERE channel=?' % t, channel)
+            # Two key shapes: team/channel/ts, and channel/ts when Writer.status
+            # found no record to take a key from.
+            self.x('DELETE FROM status WHERE thread_key LIKE ? OR thread_key LIKE ?',
+                   '%/' + channel + '/%', channel + '/%')
 
     def purge_all(self):
-        for t in ('seen', 'msgs', 'threads', 'status', 'audit', 'outbox', 'pending'):
-            self.x('DELETE FROM %s' % t)
+        with self.transaction():
+            for t in ('seen', 'msgs', 'threads', 'status', 'audit', 'outbox', 'pending'):
+                self.x('DELETE FROM %s' % t)
 
 
 # --------------------------------------------------------------------------
@@ -805,11 +807,14 @@ class Tracker:
                 return
             channel = ((envelope.get('event') or {}).get('channel')
                        or ((envelope.get('event') or {}).get('item') or {}).get('channel'))
-            if (not replay and channel and
-                    not self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id) and
-                    self.store.q('SELECT 1 FROM pending WHERE channel=? LIMIT 1', channel)):
-                # Keep channel order: a live event queues behind that channel's
-                # pending ones until ordered replay has succeeded.
+            own_pending = self.store.q('SELECT 1 FROM pending WHERE event_id=?', pending_id)
+            if not replay and (own_pending or (channel and
+                    self.store.q('SELECT 1 FROM pending WHERE channel=? LIMIT 1', channel))):
+                # Keep channel order: a live event, or a redelivery of one
+                # already queued, waits behind that channel's pending events
+                # until ordered replay reaches it.
+                if own_pending:
+                    return
                 if self.store.q('SELECT COUNT(*) n FROM pending')[0]['n'] >= MAX_PENDING_EVENTS:
                     raise RuntimeError('channel metadata pending queue is full; event not acknowledged')
                 self.store.x('INSERT INTO pending VALUES (?,?,?)', pending_id, channel,
@@ -1167,9 +1172,12 @@ class Tracker:
     def _tick(self):
         now = self.now()
         n = 0
+        # A channel with events still pending has an older state than its
+        # events: settling it now could lose them for good.
+        held = {r['channel'] for r in self.store.q('SELECT DISTINCT channel FROM pending')}
         for row in self.store.q("SELECT * FROM threads WHERE state='open' AND settle_at <= ?", now):
             cfg = self.channels.get(row['channel'])
-            if cfg is None:
+            if cfg is None or row['channel'] in held:
                 continue
             try:
                 if not self._channel_allowed(row['channel'], cfg):

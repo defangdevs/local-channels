@@ -1149,6 +1149,48 @@ class TestTrackerDurability(Rig):
         self.assertEqual(row['thread_ts'], '1.1')
         self.assertEqual(len(self.store.q('SELECT * FROM msgs')), 2)
 
+    def test_redelivered_pending_reply_stays_queued_until_ordered_replay(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        self.tr.handle(msg('1.1'))
+        reply = msg('1.2', thread_ts='1.1')
+        self.tr.handle(reply)
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        self.tr.handle(reply)  # Slack redelivery after prime, before tick
+        self.assertFalse(self.store.seen(reply['event_id']))
+        self.tr.tick()
+        self.assertEqual(self.store.q('SELECT * FROM pending'), [])
+        self.assertEqual(len(self.store.q('SELECT * FROM msgs')), 2)
+
+    def test_purge_is_atomic_with_replay(self):
+        self.tr.external.clear()
+        self.tr.member.clear()
+        self.tr.handle(msg('1.1'))
+        self.tr.prime('C1', {'is_ext_shared': False, 'is_member': True})
+        self.tr.tick()
+        self.tr.handle(msg('2.1', channel='C1'))
+        self.store.purge_channel('C1')
+        for t in ('msgs', 'threads', 'pending', 'outbox'):
+            self.assertEqual(self.store.q('SELECT * FROM %s' % t), [] if t != 'outbox' else
+                             self.store.q('SELECT * FROM outbox'))
+        self.assertFalse(self.store.db.in_transaction)
+        from unittest.mock import patch
+        self.tr.handle(msg('3.1'))
+        with patch.object(self.store, 'x', side_effect=[None, OSError('boom')]):
+            with self.assertRaises(OSError):
+                self.store.purge_channel('C1')
+        self.assertFalse(self.store.db.in_transaction)
+
+    def test_blocked_channel_is_not_settled_by_tick(self):
+        self.tr.handle(msg('1.1'))
+        self.t[0] += 10 * 60 + 1
+        self.store.x('INSERT INTO pending VALUES (?,?,?)', 'Ex', 'C1', json.dumps(msg('1.2', thread_ts='1.1')))
+        self.tr._tick()
+        self.assertEqual(self.store.q('SELECT state FROM threads')[0]['state'], 'open')
+        self.store.x('DELETE FROM pending')
+        self.tr._tick()
+        self.assertNotEqual(self.store.q('SELECT state FROM threads')[0]['state'], 'open')
+
     def test_replay_skips_row_purged_after_snapshot(self):
         self.tr.external.clear()
         self.tr.member.clear()
