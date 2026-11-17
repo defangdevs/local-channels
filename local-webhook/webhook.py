@@ -29,6 +29,7 @@ import fcntl
 import hashlib
 import hmac
 import http.client
+import io
 import json
 import math
 import os
@@ -4917,6 +4918,8 @@ INSTRUCTIONS = (
     'a failing check, review a new PR, note a push); no reply is expected or possible on this channel. '
     'Some sources retain full untrusted payloads: use webhook.py read-content ID from the reference in a delivery; '
     'the reference expires independently of delivery. '
+    'HTTP intake is bounded: busy connections receive 503; an absolute request-read timeout receives 408; '
+    'neither response accepts a delivery. '
     'Routing is controlled by the tools webhook_subscribe / webhook_unsubscribe / webhook_subscriptions, '
     'with webhook_mute / webhook_unmute as a kill switch that keeps the list, '
     'which manage topic patterns of the form "source:key" — e.g. github:owner/repo or github:owner/*; a '
@@ -6093,11 +6096,125 @@ def deliver(handler, body):
     return done(200, 'ok')
 
 
+def _positive_env(name, default):
+    # Ingress bounds cannot be disabled by a typo or by the size-limit
+    # convention of 0 = unlimited: every admitted request must remain bounded.
+    try:
+        value = int(os.environ.get(name, str(default)))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    print('local-webhook: ignoring invalid %s (want a positive integer); using %d'
+          % (name, default), file=sys.stderr)
+    return default
+
+
+HTTP_MAX_CONNECTIONS = _positive_env('LOCAL_WEBHOOK_HTTP_MAX_CONNECTIONS', 8)
+HTTP_READ_TIMEOUT_S = _positive_env('LOCAL_WEBHOOK_HTTP_READ_TIMEOUT_S', 15)
+HTTP_HEADER_BYTES = 64 * 1024  # aggregate request line + headers, or trailers
+
+
+class _ReadDeadlineExceeded(Exception):
+    pass
+
+
+class _HeadersTooLarge(Exception):
+    pass
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    """Enforce one absolute read deadline beneath BufferedReader.
+
+    Setting a socket timeout once is only an idle timeout: a slow sender can
+    keep read()/readline() alive forever. Recompute the remaining budget for
+    EVERY recv, including the refills hidden inside a buffered read.
+    """
+    def __init__(self, connection, deadline):
+        super().__init__()
+        self.connection = connection
+        self.deadline = deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ReadDeadlineExceeded()
+        self.connection.settimeout(remaining)
+        try:
+            return self.connection.recv_into(buffer)
+        except socket.timeout:
+            raise _ReadDeadlineExceeded() from None
+
+
+class _RequestReader(io.BufferedReader):
+    def __init__(self, raw):
+        super().__init__(raw)
+        self.header_budget = HTTP_HEADER_BYTES
+
+    def readline(self, size=-1):
+        if self.header_budget is not None:
+            # Do not buffer a full oversized line before discovering that the
+            # aggregate header budget is exhausted.
+            bound = self.header_budget + 1
+            size = min(size, bound) if size >= 0 else bound
+        line = super().readline(size)
+        if self.header_budget is not None:
+            self.header_budget -= len(line)
+            if self.header_budget < 0:
+                raise _HeadersTooLarge()
+        return line
+
+
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.0 closes each connection after one request; the admission slot
+    # covers header parsing, body reads and delivery, not an idle keepalive.
+    def setup(self):
+        super().setup()
+        self.rfile.close()
+        self.rfile = _RequestReader(_DeadlineSocketReader(
+            self.connection, time.monotonic() + HTTP_READ_TIMEOUT_S))
+
     # Per-request access logging is noise on a webhook ingress; failures are
     # reported explicitly where they matter.
     def log_message(self, fmt, *args):
         pass
+
+    def handle_one_request(self):
+        # BaseHTTPRequestHandler only initializes these after a complete
+        # request line, but a timeout can happen before the first byte.
+        self.request_version = 'HTTP/1.0'
+        self.requestline = ''
+        self.command = None
+        try:
+            super().handle_one_request()
+        except _ReadDeadlineExceeded:
+            self._read_error(408, 'request read deadline exceeded')
+        except _HeadersTooLarge:
+            self._read_error(431, 'request headers too large')
+
+    def _read_error(self, code, message):
+        self.close_connection = True
+        # A read deadline is not a response deadline. Keep even error writes
+        # bounded when the sender has stopped reading as well as writing.
+        self.connection.settimeout(1)
+        try:
+            self.send_error(code, message)
+        except OSError:
+            pass
+
+    def parse_request(self):
+        result = super().parse_request()
+        self.rfile.header_budget = None
+        return result
+
+    def end_headers(self):
+        # Also cover parser errors and non-POST replies. A later raw read
+        # (e.g. after 100 Continue) reinstates the remaining read budget.
+        self.connection.settimeout(1)
+        super().end_headers()
 
     def _refuse(self):
         data = b'method not allowed'
@@ -6119,40 +6236,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _read_exact(self, size):
+        data = self.rfile.read(size)
+        if len(data) != size:
+            raise ValueError('incomplete request body')
+        return data
+
     def _read_body(self):
         # node:http decodes chunked transparently; do the same so a proxy that
         # re-chunks the sender's body doesn't break signature verification.
         if (self.headers.get('Transfer-Encoding') or '').lower() == 'chunked':
-            chunks, got = [], 0
+            body = bytearray()
             while True:
-                size_line = self.rfile.readline(65536).strip()
-                size_hex = size_line.split(b';')[0].strip()
+                size_line = self.rfile.readline(8193)
+                if len(size_line) > 8192 or not size_line.endswith(b'\r\n'):
+                    raise ValueError('bad chunk size line')
+                size_hex = size_line.strip().split(b';')[0].strip()
                 if not re.fullmatch(rb'[0-9a-fA-F]{1,16}', size_hex):
                     raise ValueError('bad chunk size')  # int() would accept "-1"
                 size = int(size_hex, 16)
                 if size == 0:
-                    self.rfile.readline(65536)  # trailing CRLF (no trailers expected)
+                    # Consume trailers with the same aggregate bound as the
+                    # initial headers. They never override signed headers.
+                    self.rfile.header_budget = HTTP_HEADER_BYTES
+                    while True:
+                        line = self.rfile.readline()
+                        if line == b'\r\n':
+                            break
+                        if not line.endswith(b'\r\n'):
+                            raise ValueError('incomplete chunk trailers')
+                    self.rfile.header_budget = None
                     break
-                got += size
-                if MAX_BODY_BYTES and got > MAX_BODY_BYTES:
+                if MAX_BODY_BYTES and len(body) + size > MAX_BODY_BYTES:
                     return None
-                chunks.append(self.rfile.read(size))
-                self.rfile.readline(65536)  # CRLF after each chunk
-            return b''.join(chunks)
+                # A list of one-byte chunks would amplify a 25 MiB body into
+                # millions of Python objects before it was joined.
+                body.extend(self._read_exact(size))
+                if self._read_exact(2) != b'\r\n':
+                    raise ValueError('bad chunk terminator')
+            return bytes(body)
         length = int(self.headers.get('Content-Length') or 0)
         if MAX_BODY_BYTES and length > MAX_BODY_BYTES:
             return None
-        return self.rfile.read(length) if length > 0 else b''
+        return self._read_exact(length) if length > 0 else b''
 
     def do_POST(self):
         try:
             body = self._read_body()
+            # The deadline covers request intake only, not spool fsync or
+            # fan-out. Replies get an independent, bounded socket timeout.
+            self.connection.settimeout(1)
             if body is None:
                 return self._too_large()
             deliver(self, body)
+        except (_ReadDeadlineExceeded, _HeadersTooLarge):
+            raise  # handled once, including failures during header parsing
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the ingress
             print('local-webhook: delivery error: %s' % e, file=sys.stderr)
             try:
+                self.connection.settimeout(1)
                 self.send_response(500)
                 self.send_header('Content-Length', '5')
                 self.end_headers()
@@ -6161,12 +6303,48 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
-class _TcpServer(socketserver.ThreadingMixIn, HTTPServer):
+class _BoundedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
+    def __init__(self, *args, **kwargs):
+        self._init_admission()
+        super().__init__(*args, **kwargs)
 
-class _UnixServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
+    def _init_admission(self):
+        self._request_slots = threading.BoundedSemaphore(HTTP_MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        # Acquire BEFORE ThreadingMixIn creates a worker. Never queue work in
+        # Python or block the accept loop behind an unauthenticated sender.
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.setblocking(False)
+                request.send(b'HTTP/1.0 503 Service Unavailable\r\n'
+                             b'Connection: close\r\nRetry-After: 1\r\n'
+                             b'Content-Length: 4\r\n\r\nbusy')
+            except OSError:
+                pass  # even a peer that cannot receive must release its fd
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
+class _TcpServer(_BoundedHTTPServer):
+    pass
+
+
+class _UnixServer(_BoundedHTTPServer):
     address_family = socket.AF_UNIX
 
     def server_bind(self):
@@ -6183,6 +6361,7 @@ class _UnixServer(socketserver.ThreadingMixIn, HTTPServer):
 class _FdServer(_UnixServer):
     # Wrap a listening socket systemd inherited to us; never bind/listen.
     def __init__(self, fd, handler_cls):
+        self._init_admission()
         socketserver.BaseServer.__init__(self, ('local', 0), handler_cls)
         self.socket = socket.socket(fileno=fd)
         self.server_name = 'local'
@@ -6373,6 +6552,13 @@ into it: codex has no channel to attach at startup, so `codex queue` carries
 each event in as a message at the next turn boundary. It stops itself once no
 live subscription is left. `status` reports the thread and the peer, which is
 where to look when subscriptions seem healthy but nothing arrives.
+
+HTTP intake uses LOCAL_WEBHOOK_HTTP_MAX_CONNECTIONS (8) and
+LOCAL_WEBHOOK_HTTP_READ_TIMEOUT_S (15). Both require positive integers;
+invalid values, including 0, keep the defaults. Busy intake returns 503;
+a total request-read deadline returns 408. Neither accepts a delivery.
+Request headers/trailers have a 64 KiB aggregate limit (431); the existing
+LOCAL_WEBHOOK_MAX_BODY_BYTES limit (25 MiB by default) returns 413.
 
 emit puts a BOX-LOCAL event (a budget warning, a full disk, an OOM kill) on the
 same bus as any webhook: the JSON payload — an argument, or stdin when omitted

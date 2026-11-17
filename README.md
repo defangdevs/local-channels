@@ -440,12 +440,22 @@ sessions for fan-out and routing to work.
 |---|---|---|
 | `LOCAL_WEBHOOK_PORT` (legacy `WEBHOOK_PORT`) | `8788` | loopback TCP ingress port; `0` = no TCP ingress (pure IPC peer) |
 | `LOCAL_WEBHOOK_HTTP_SOCK` | — | serve the HTTP ingress on this unix socket path instead of TCP (a stale socket is reclaimed on start) |
+| `LOCAL_WEBHOOK_HTTP_MAX_CONNECTIONS` | `8` | maximum simultaneous HTTP handlers; excess connections receive `503` and close without starting another thread |
+| `LOCAL_WEBHOOK_HTTP_READ_TIMEOUT_S` | `15` | absolute seconds to read the request line, headers and complete body, including chunk framing/trailers; timeout receives `408` and closes |
 | `LOCAL_WEBHOOK_RECEIVER_ONLY` | — | `1`/`true`/`yes`/`on` = daemon mode: own the ingress and fan out, but no session of its own |
 | `LOCAL_WEBHOOK_SESSION` | — | per-session subscription scope; selects `filter.<session>.json` |
 | `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets, sources, filters and peer sockets |
 | `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; resolves `"@self"` in ignore lists |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source when `sources.json` is absent |
 | `LISTEN_FDS` / `LISTEN_PID` | — | set by systemd socket activation; the ingress adopts fd 3 and ignores the two ingress vars above |
+
+Ingress limits apply to TCP, Unix sockets and socket activation. Both ingress
+settings require positive integers; unset, empty, invalid or zero values use
+the defaults. A slow sender cannot extend the read deadline by trickling
+bytes. Request line plus headers (and, separately, chunk trailers) have a
+64 KiB aggregate cap (`431`); the body retains its configurable 25 MiB
+default cap (`413`). See the [HTTP ingress limits](local-webhook/README.md#http-ingress-limits)
+for response and retry details.
 
 ## Wiring a GitHub repo
 
