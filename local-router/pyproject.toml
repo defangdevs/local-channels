@@ -2,7 +2,7 @@
 #   pip install "git+https://github.com/defangdevs/local-channels#subdirectory=local-router"
 # router.py has no dependencies and also runs straight from a checkout.
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=78.1.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,7 +11,8 @@ dynamic = ["version"]
 description = "Decide which agent session an incoming message belongs to (continue, new, or new with links)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 
 [project.scripts]
 local-router = "router:_entry"

@@ -47,6 +47,30 @@ jobs:
       - name: End-to-end test of local-slack (mock Slack, real local-webhook bus)
         run: python tests/e2e/run_e2e.py
 
+  router-package:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Prove the declared backend floor, as well as tooling selected for
+          # each supported interpreter. Old setuptools is not a new-Python promise.
+          - python: '3.9'
+            setuptools: 'setuptools==78.1.1'
+          - python: '3.9'
+            setuptools: 'setuptools'
+          - python: '3.x'
+            setuptools: 'setuptools'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install build tooling
+        run: python -m pip install --upgrade '${{ matrix.setuptools }}' wheel
+      - name: Build, install and validate router wheel and source distribution
+        run: python scripts/check_router_package.py
+
   release:
     # Versions are assigned here, after merge, so PRs never bump them and never
     # collide on the version lines. The range is derived from the repo itself
@@ -58,7 +82,7 @@ jobs:
     # push is rejected always has a newer main, and the job for main's head
     # releases everything before it (stateless range), so none is lost.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, whatsapp]
+    needs: [test, whatsapp, router-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write

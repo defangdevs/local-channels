@@ -23,6 +23,36 @@ It is one file, `router.py`, with the standard library only and Python 3.9 or
 later, like the rest of this repo. It is not a Claude Code plugin and has no
 marketplace entry.
 
+## Install
+
+Run `python3 local-router/router.py` from a repository checkout, or install the
+library and `local-router` command into a virtual environment:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install "git+https://github.com/defangdevs/local-channels#subdirectory=local-router"
+.venv/bin/local-router version
+```
+
+Use a full commit revision after `local-channels@` in the URL when pinning a
+deployment. Installation retains the `import router` API shown below. Because
+that module name is generic, use a dedicated environment if another dependency
+also provides a module named `router`.
+
+The runtime has no third-party dependencies. Building an installable wheel or
+source distribution uses setuptools and wheel; both artifacts include the full
+MIT license and copyright notice. CI checks a clean wheel installation and a
+wheel rebuilt from the source distribution on Python 3.9 and current Python,
+including the minimum supported setuptools on Python 3.9. To run the same check:
+
+```sh
+python3 -m pip install 'setuptools>=78.1.1' wheel
+python3 scripts/check_router_package.py
+```
+
+Run that check from the repository root; it builds and installs in temporary
+directories without modifying the checkout or contacting model backends.
+
 ## How it decides
 
 1. **Reply hint.** If the channel knows what the message replies to (a WhatsApp

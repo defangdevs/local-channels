@@ -19,7 +19,9 @@ local-router/
   router.py                       NOT a plugin: library + CLI that decides which session an
                                   inbound message belongs to; single file, stdlib only, VERSION
                                   constant is its version (tags local-router-vX.Y.Z)
-  pyproject.toml                  only so `pip install git+...#subdirectory=local-router` works
+  pyproject.toml                  setuptools metadata for optional pip installation and CLI
+  LICENSE                         MIT notice shipped in both wheel and source distribution;
+                                  must match the root LICENSE
   bench/bench.py                  benchmark: runs route() over labelled streams (teacher-forced
                                   and live); stdlib only. bench/data/ is WildChat-derived (ODC-BY);
                                   never add private chats there
@@ -27,7 +29,11 @@ tests/test_router.py              router decisions, prompt bounds and CLI with f
 tests/test_router_bench.py        benchmark data, mixing and scoring with fake routers
 ```
 
-There is no build system, no lockfile and no generated file. A new plugin is a
+The Python runtime files need no build step. The router's optional installable
+package uses setuptools and wheel; `scripts/check_router_package.py` builds clean
+wheel/source artifacts and checks isolated imports and console scripts. CI also
+checks the minimum setuptools on Python 3.9. There is no Python lockfile or
+generated source file. A new plugin is a
 new top-level directory with its own `.claude-plugin/plugin.json`, `.mcp.json`,
 `README.md` and a marketplace entry — plus tests under `tests/`.
 
