@@ -41,7 +41,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 ACTIONS = ("CONTINUE", "NEW", "NEW_LINKS")
 

@@ -19,10 +19,10 @@ one implementation for both harnesses. See
 
 | plugin | version | what it delivers |
 |---|---|---|
-| [`local-webhook`](local-webhook/) | 0.42.0 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, a per-watch `spawnWindowS` coalescing window (#93) and note limits that refuse rather than cut (#95), an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a per-source `verification` mode (`hmac-hex` \| `token` \| `standard-webhooks` \| `query-token`, #30 and #31) and an `eventPath` for senders that name the event in the body (Rollbar) so GitLab and other Standard-Webhooks senders can deliver too, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, an owner-trusted source kind (`"trust": "owner"`) for box-local messages the owner wrote, such as a routed WhatsApp self-chat, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run, and the sender's `identifier` in the spawn meta of any other source, and a durable on-disk inbox (#60) so an accepted delivery survives a session that is down, a receiver restart or a spawn command at capacity |
+| [`local-webhook`](local-webhook/) | 0.42.1 | HMAC-verified webhook deliveries from GitHub or any other sender that signs the raw body with HMAC-SHA256, plus `webhook_subscribe` / `webhook_unsubscribe` / `webhook_subscriptions` MCP tools (and an equivalent `webhook.py` CLI) for topic routing — including `deliver_to:"subagent"` standing watches that spawn a fresh session per event batch, per-subscription `include`/`exclude` payload predicates, a per-watch `spawnConfig` the spawn command receives, a per-watch `spawnWindowS` coalescing window (#93) and note limits that refuse rather than cut (#95), an optional `name` (#63) so two watches can share a topic as independently managed subscriptions instead of one renewing the other, an `ownership: "none"` opt-out (#69) so a read-only reviewer watch is not suppressed by a live worker session's own claim, a per-source `verification` mode (`hmac-hex` \| `token` \| `standard-webhooks` \| `query-token`, #30 and #31) and an `eventPath` for senders that name the event in the body (Rollbar) so GitLab and other Standard-Webhooks senders can deliver too, a `webhook.py emit` producer path that puts box-local events (budget, disk, OOM) on the same bus, an owner-trusted source kind (`"trust": "owner"`) for box-local messages the owner wrote, such as a routed WhatsApp self-chat, codex-session delivery via `codex queue`, and a commit `sha` in the spawn meta of every GitHub CI event so a spawn command can scope its claim to one run, and the sender's `identifier` in the spawn meta of any other source, and a durable on-disk inbox (#60) so an accepted delivery survives a session that is down, a receiver restart or a spawn command at capacity |
 | [`local-whatsapp`](local-whatsapp/) | 0.7.0 | Personal WhatsApp linked-device bridge with /clear for in-process Codex context resets and a configurable prefix (empty for plain Message Yourself text), incoming images and documents. Pairing failures include safe stage, category, status, and attempt ID diagnostics. Optional per-message routing through a route command (`LOCAL_WHATSAPP_ROUTE_CMD`, for example `local-router`), or one selected recipient at a time with automatic profile-based session creation and cold-session activation, Claude channel delivery, Codex queue delivery, and a reply tool/CLI. |
 | [`local-slack`](local-slack/) | 0.2.2 | Slack threads from channels the bot was invited to, as events on the local-webhook bus (source `slack`): `message.posted`, `thread.settled` after a quiet period, reactions as controls (`ready`/`hold`/`drop`), plus a guarded `slack.py` CLI for `reply`, `post`, `status`, `react`, `upload` (files as one message) and `dm` (allowlisted people), in plain or socket-service mode. Channel metadata fails closed with durable retry; thread state, de-duplication and queued delivery commit atomically. |
-| [`local-router`](local-router/) | 0.1.0 | Not a channel: a library and CLI that sits behind the channels. For each inbound message it decides whether to continue an existing session, start a new one, or start one that links older sessions, using a small LLM through whichever harness is signed in (`claude -p`, `codex exec`) or an HTTP API. Single file, stdlib only. |
+| [`local-router`](local-router/) | 0.1.1 | Not a channel: a library and CLI that sits behind the channels. For each inbound message it decides whether to continue an existing session, start a new one, or start one that links older sessions, using a small LLM through whichever harness is signed in (`claude -p`, `codex exec`) or an HTTP API. Single file, stdlib only. |
 
 ## Version tags
 
@@ -32,8 +32,8 @@ For merged branches this is the merge commit, so the tag includes the whole
 change. Versions 0.1.0 and 0.2.0 predate the rename from `gh-webhook`.
 The early 0.5.x manifests were stale; those tags follow the versions explicitly
 named in their release commit subjects.
-Tags are immutable and CI publishes missing tags after both Python test jobs
-and both Node test jobs pass on `main`. Documentation-only commits do not move
+Tags are immutable and CI publishes missing tags after the Python, Node and
+router packaging checks pass on `main`. Documentation-only commits do not move
 an existing tag. `local-whatsapp` uses `local-whatsapp-vX.Y.Z` tags and `local-router` uses
 `local-router-vX.Y.Z` tags, so their independent version sequences cannot
 collide with `local-webhook` tags.
@@ -48,6 +48,10 @@ full commit hashes, with tags providing the version lookup.
 - For `local-webhook`: `python3` >= 3.9, with no pip packages or Node runtime.
 - For `local-whatsapp`: Node.js >= 20, the pinned npm dependencies, and outbound
   network access to WhatsApp. See its [setup guide](local-whatsapp/README.md).
+- For `local-router`: Python >= 3.9, with no runtime packages. Run the single
+  file or [install the library and CLI](local-router/README.md#install) in a
+  virtual environment. Its wheel and source distribution include the MIT
+  license and copyright notice; CI builds and tests both installation paths.
 - For `local-webhook` only: a way for the sender to reach the box. In practice a
   TLS-terminating reverse proxy (Caddy) in front of the loopback port or unix
   socket the plugin listens on.
@@ -436,12 +440,22 @@ sessions for fan-out and routing to work.
 |---|---|---|
 | `LOCAL_WEBHOOK_PORT` (legacy `WEBHOOK_PORT`) | `8788` | loopback TCP ingress port; `0` = no TCP ingress (pure IPC peer) |
 | `LOCAL_WEBHOOK_HTTP_SOCK` | — | serve the HTTP ingress on this unix socket path instead of TCP (a stale socket is reclaimed on start) |
+| `LOCAL_WEBHOOK_HTTP_MAX_CONNECTIONS` | `8` | maximum simultaneous HTTP handlers; excess connections receive `503` and close without starting another thread |
+| `LOCAL_WEBHOOK_HTTP_READ_TIMEOUT_S` | `15` | absolute seconds to read the request line, headers and complete body, including chunk framing/trailers; timeout receives `408` and closes |
 | `LOCAL_WEBHOOK_RECEIVER_ONLY` | — | `1`/`true`/`yes`/`on` = daemon mode: own the ingress and fan out, but no session of its own |
 | `LOCAL_WEBHOOK_SESSION` | — | per-session subscription scope; selects `filter.<session>.json` |
 | `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets, sources, filters and peer sockets |
 | `LOCAL_WEBHOOK_SELF` | — | identity this session acts as; resolves `"@self"` in ignore lists |
 | `WEBHOOK_SECRET` | — | legacy: implies a single `github` source when `sources.json` is absent |
 | `LISTEN_FDS` / `LISTEN_PID` | — | set by systemd socket activation; the ingress adopts fd 3 and ignores the two ingress vars above |
+
+Ingress limits apply to TCP, Unix sockets and socket activation. Both ingress
+settings require positive integers; unset, empty, invalid or zero values use
+the defaults. A slow sender cannot extend the read deadline by trickling
+bytes. Request line plus headers (and, separately, chunk trailers) have a
+64 KiB aggregate cap (`431`); the body retains its configurable 25 MiB
+default cap (`413`). See the [HTTP ingress limits](local-webhook/README.md#http-ingress-limits)
+for response and retry details.
 
 ## Wiring a GitHub repo
 
