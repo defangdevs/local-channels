@@ -1051,6 +1051,37 @@ The delivery text is passed as one argv element to `codex queue` with no shell
 involved: payload strings are hostile, and this is the equivalent of the
 stdin-only rule the dispatch path follows for spawn prompts.
 
+## Delivering into a Claude session with no channel
+
+A Claude Remote Control daemon (`claude remote-control`) runs each app
+conversation as a `claude --print --sdk-url` child, and it cannot pass
+`--channels` to that child. The plugin still loads there, so subscriptions are
+written and claims hold, but Claude Code drops every channel notification. The
+events vanish, and the claim stops standing watches from starting anyone else.
+
+Set `LOCAL_WEBHOOK_CLAUDE_DELIVERY=send` in the environment of such a session
+(for example, on the daemon, whose children inherit it). Then the session peer
+keeps everything above the last inch and replaces the notification with a
+one-shot relay:
+
+    claude -p --model haiku --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+      --tools SendMessage,ToolSearch --allowedTools SendMessage --permission-mode dontAsk ...
+
+The relay sends the rendered delivery (`[UNTRUSTED webhook:…]` prefix
+included) with `SendMessage` to `uds:<messagingSocketPath>`. That path comes
+from the parent Claude process's record in `~/.claude/sessions/<pid>.json`
+(or from `LOCAL_WEBHOOK_CLAUDE_TARGET`). The event arrives as a cross-session
+message at the next turn boundary, about 10 s later. A relay that does not
+confirm `"success":true` counts as failed, and the spool offers the event again.
+
+Know the costs before you enable it:
+
+- one model call per delivery;
+- a model relays the text, so a verbatim copy is requested, not guaranteed;
+- the receiving session frames a cross-session message as a request from a
+  teammate, which is weaker than a channel's data framing. The UNTRUSTED
+  prefix inside the text is the only marker that remains.
+
 ## Wiring a GitHub repo
 
 1. Put the shared secret in `<state-dir>/github.secret` (mode 0600).
@@ -1158,6 +1189,11 @@ the same as for `emit`: the state directory's file permissions.
 | `LOCAL_WEBHOOK_CODEX_IDLE` | `300` | seconds with no live subscription before a codex peer exits (min 30) |
 | `LOCAL_WEBHOOK_CODEX_QUEUE_TIMEOUT` | `30` | seconds before one `codex queue` call is abandoned |
 | `LOCAL_WEBHOOK_CODEX_FAIL_MAX` | `3` | consecutive `codex queue` failures before the peer gives up |
+| `LOCAL_WEBHOOK_CLAUDE_DELIVERY` | — | `send` = this Claude session has no channel (a Remote Control daemon conversation): deliver each event through Claude Code's cross-session inbox with a one-shot `claude -p` instead of a channel notification. Never set it in a session that has the channel, or every event arrives twice |
+| `LOCAL_WEBHOOK_CLAUDE_TARGET` | the parent Claude process's `messagingSocketPath` | the Claude messaging socket to send to |
+| `LOCAL_WEBHOOK_CLAUDE_BIN` | `claude` | the Claude CLI that runs the relay |
+| `LOCAL_WEBHOOK_CLAUDE_SEND_MODEL` | `haiku` | model of the relay call |
+| `LOCAL_WEBHOOK_CLAUDE_SEND_TIMEOUT` | `120` | seconds before one relay call is abandoned (min 10) |
 | `LOCAL_WEBHOOK_SPOOL` | on | `off`/`0`/`false`/`no` = keep accepted events in memory only, as before 0.33.0 |
 | `LOCAL_WEBHOOK_SPOOL_PEER_MAX_S` | `28800` | seconds an undelivered event waits for its session before it is discarded |
 | `LOCAL_WEBHOOK_SPOOL_PEER_MAX` | `500` | max undelivered events per session; past it the oldest are discarded |
