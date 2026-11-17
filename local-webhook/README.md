@@ -14,6 +14,21 @@ Single dependency-free file (`webhook.py`); runs under the stock `python3`
 build step. (Until 0.8.0 this was `webhook.mjs` under node/bun — the Python
 port removed the only runtime dependency the plugin had.)
 
+## Importing helpers
+
+Importing `webhook.py` does not create state, bind sockets, start background
+threads, register exit handlers, or interpret the importing application's
+command-line arguments. Environment-based configuration is still read once
+when the module is loaded. Calling helpers that write subscriptions or deliver
+messages performs those operations explicitly.
+
+Run the script, or call `main(argv)`, to start its CLI, receiver or session-peer
+runtime. `main([])` starts the configured receiver/peer; `main(["status"])`
+runs the status command. Read-only commands also leave a missing state directory
+absent; a subscription write or daemon/peer startup creates it when needed.
+The runtime remains one process per receiver or session peer; this change does
+not introduce a multi-instance service API.
+
 ## How it fits together
 
 ```

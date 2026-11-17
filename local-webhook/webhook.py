@@ -56,7 +56,9 @@ VERSION = '0.42.2'
 # agent calling webhook_subscribe. A CLI invocation must touch NO listener: it
 # is not a session peer (no IPC socket to claim, no stdio loop) and must never
 # steal the ingress from the daemon — it reads/writes the filter file and exits.
-CLI_ARGV = sys.argv[1:]
+# Importing helpers must not interpret the embedding application's argv.
+# main() chooses the runtime mode before starting any listener.
+CLI_ARGV = []
 # `codex-peer` is the one argv that is NOT a one-shot CLI call: it IS a session
 # peer (see "codex delivery"), so it must claim an IPC socket and run forever
 # like the stdio peer does, not read the filter file and exit.
@@ -115,7 +117,6 @@ RECEIVER_ONLY = bool(re.match(r'^(1|true|yes|on)$',
 # wiped/replaced on update, and secrets must never sit in the marketplace repo.
 STATE_DIR = os.environ.get('LOCAL_WEBHOOK_STATE_DIR') or os.path.join(
     os.path.expanduser('~'), '.local', 'state', 'local-webhook')
-os.makedirs(STATE_DIR, exist_ok=True)
 
 # Identity this session acts as (e.g. the GitHub login it uses for writes).
 # Used ONLY to resolve "@self" in a subscription's ignoreSenders — it is no
@@ -789,6 +790,9 @@ FILTER_LOCK = threading.RLock()
 # whatever process it runs in — against every other one on the same path.
 @contextlib.contextmanager
 def filter_file_lock(path):
+    # State is created by an explicit write, never by importing this module or
+    # listing subscriptions. The parent must exist before the lock is opened.
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     while True:
         fd = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -1862,19 +1866,9 @@ def codex_queue(thread, text):
     return True, out_text
 
 
-# Set at import so it is in place before the IPC listener below starts
-# accepting deliveries; a peer that learned its thread in main() could be
-# handed an event first.
+# main() resolves this before it starts the peer listener.
 CODEX_PEER_THREAD = ''
-if CODEX_PEER:
-    _rest = CLI_ARGV[1:]
-    for _i, _a in enumerate(_rest):
-        if _a in ('--thread', '--codex-thread') and _i + 1 < len(_rest):
-            CODEX_PEER_THREAD = _rest[_i + 1].strip()
-        elif _a.startswith('--thread='):
-            CODEX_PEER_THREAD = _a.split('=', 1)[1].strip()
-    if not CODEX_PEER_THREAD:
-        CODEX_PEER_THREAD = codex_thread_from_env()
+
 
 # Delivery counters, read by the peer's own idle loop. Written from the IPC
 # thread, read from the main one; both are single assignments of ints, and the
@@ -2014,8 +2008,8 @@ def codex_peer_status(key=None):
 
 
 def run_codex_peer():
-    """The peer process: an IPC listener (opened at import, like any session
-    peer) plus this loop, whose only job is deciding when to stop existing."""
+    """The peer process: main() starts its IPC listener before entering this
+    loop, whose only job is deciding when to stop existing."""
     reason = codex_thread_invalid_reason(CODEX_PEER_THREAD)
     if reason:
         print('local-webhook: codex peer refusing to start — %s' % reason, file=sys.stderr)
@@ -3773,6 +3767,7 @@ ACK_QUEUE_MAX = 64
 _ack_queue = queue.Queue(maxsize=ACK_QUEUE_MAX)
 _ack_lock = threading.Lock()
 _ack_worker = None
+_ack_exit_registered = False
 
 
 def _run_ack(envelope, target):
@@ -3799,10 +3794,13 @@ def _ack_loop():
 
 
 def acknowledge_accepted(envelope, target):
-    global _ack_worker
+    global _ack_worker, _ack_exit_registered
     if not ACK_CMD or not isinstance(envelope, dict):
         return
     with _ack_lock:
+        if not _ack_exit_registered:
+            atexit.register(drain_acks)
+            _ack_exit_registered = True
         if _ack_worker is None or not _ack_worker.is_alive():
             _ack_worker = threading.Thread(target=_ack_loop, name='ack-worker', daemon=True)
             _ack_worker.start()
@@ -3821,9 +3819,6 @@ def drain_acks(timeout=ACK_TIMEOUT_S * 2):
         done.set()
     threading.Thread(target=wait, daemon=True).start()
     done.wait(timeout)
-
-
-atexit.register(drain_acks)
 
 
 def handle_event(env, at=None, sid=None):
@@ -3984,7 +3979,14 @@ def _ipc_serve(srv):
 # and a CLI invocation is not a peer at all (it would claim — then unlink — the
 # socket of whatever PID it happens to reuse).
 IPC_INBOX_MARKER = IPC_SOCK[:-len('.sock')] + '.inbox'
-if not RECEIVER_ONLY and not CLI:
+
+
+def start_peer():
+    """Start this process's IPC listener, inbox worker and cleanup handlers.
+
+    Called only by main() after it has selected the delivery mode. Importing
+    helpers must neither claim a session nor consume its pending deliveries.
+    """
     try:
         os.makedirs(INSTANCE_DIR, mode=0o700, exist_ok=True)
     except OSError as e:
@@ -6973,15 +6975,35 @@ def run_cli(argv):
 # Behind a __main__ guard so the test suite can import the module and exercise
 # its pieces; .mcp.json and the daemon run the script directly, so nothing
 # changes for real callers.
-def main():
+def configure_run(argv):
+    """Select a process entry mode without starting it or touching state."""
+    global CLI_ARGV, CODEX_PEER, CLI, CODEX_PEER_THREAD
+    CLI_ARGV = list(argv)
+    CODEX_PEER = bool(CLI_ARGV and CLI_ARGV[0] == 'codex-peer')
+    CLI = bool(CLI_ARGV and not CODEX_PEER)
+    CODEX_PEER_THREAD = ''
     if CODEX_PEER:
-        # A session peer with no stdio transport: the IPC listener is already
-        # up (opened at import, like every peer's), so all that is left is the
-        # loop that decides when this session's deliveries stop mattering. It
-        # binds no ingress — the daemon owns that.
+        rest = CLI_ARGV[1:]
+        for i, arg in enumerate(rest):
+            if arg in ('--thread', '--codex-thread') and i + 1 < len(rest):
+                CODEX_PEER_THREAD = rest[i + 1].strip()
+            elif arg.startswith('--thread='):
+                CODEX_PEER_THREAD = arg.split('=', 1)[1].strip()
+        if not CODEX_PEER_THREAD:
+            CODEX_PEER_THREAD = codex_thread_from_env()
+
+
+def main(argv=None):
+    configure_run(sys.argv[1:] if argv is None else argv)
+    if CLI:
+        return run_cli(CLI_ARGV)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not RECEIVER_ONLY:
+        start_peer()
+    if CODEX_PEER:
+        # A session peer with no stdio transport: its configured thread was in
+        # place before start_peer() could accept a delivery. It binds no ingress.
         run_codex_peer()
-    elif CLI:
-        run_cli(CLI_ARGV)
     elif RECEIVER_ONLY:
         httpd = listen_ingress()
         if httpd is None:

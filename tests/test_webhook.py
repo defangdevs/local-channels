@@ -48,8 +48,8 @@ os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
 def load_webhook(env):
     """Import webhook.py under a controlled environment, as a unique module.
 
-    RECEIVER_ONLY=1 keeps the import side-effect free (no IPC peer socket, no
-    stdio loop — the main() guard means nothing serves either way).
+    Imports start no runtime. RECEIVER_ONLY=1 selects daemon semantics for
+    tests that call delivery helpers directly, without starting main().
     """
     _module_seq[0] += 1
     base = {
@@ -105,6 +105,59 @@ class StateDirCase(unittest.TestCase):
     def write_json(self, name, obj):
         with open(os.path.join(self.state, name), 'w', encoding='utf-8') as f:
             json.dump(obj, f)
+
+
+class TestImportLifecycle(unittest.TestCase):
+    def test_import_does_not_start_runtime_or_read_host_argv(self):
+        # A fresh process catches the actual import boundary, without the
+        # RECEIVER_ONLY test-helper setting that previously hid these effects.
+        code = r"""
+import atexit, http.client, http.server, importlib.util, os, socket, sys, threading
+from unittest.mock import patch
+path = sys.argv[1]
+sys.argv = ['embedding-app'] + sys.argv[2:]
+spec = importlib.util.spec_from_file_location('embedded_webhook', path)
+mod = importlib.util.module_from_spec(spec)
+with patch.object(os, 'makedirs', side_effect=AssertionError('created state')), \
+     patch.object(socket, 'socket', side_effect=AssertionError('opened socket')), \
+     patch.object(threading.Thread, 'start', side_effect=AssertionError('started thread')), \
+     patch.object(atexit, 'register', side_effect=AssertionError('registered exit hook')):
+    spec.loader.exec_module(mod)
+assert mod.CLI_ARGV == [] and not mod.CLI and not mod.CODEX_PEER
+assert mod.CODEX_PEER_THREAD == ''
+assert not os.path.exists(mod.STATE_DIR)
+assert mod.verify('dummy', '', b'{}') is False
+"""
+        with tempfile.TemporaryDirectory() as parent:
+            state = os.path.join(parent, 'missing', 'state')
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(('LOCAL_WEBHOOK_', 'CODEX_'))}
+            env.update(LOCAL_WEBHOOK_STATE_DIR=state, LOCAL_WEBHOOK_PORT='0')
+            for args in ([], ['--host-option'], ['codex-peer', '--thread', 'host-thread']):
+                with self.subTest(args=args):
+                    result = subprocess.run([PYTHON, '-c', code, WEBHOOK_PY] + args,
+                                            env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertFalse(os.path.exists(state))
+
+    def test_read_only_cli_does_not_create_missing_state(self):
+        with tempfile.TemporaryDirectory() as parent:
+            state = os.path.join(parent, 'missing', 'state')
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(('LOCAL_WEBHOOK_', 'CODEX_'))}
+            env.update(LOCAL_WEBHOOK_STATE_DIR=state)
+            for cmd in ('status', 'ls', '--help', '--version'):
+                with self.subTest(cmd=cmd):
+                    result = subprocess.run([PYTHON, WEBHOOK_PY, cmd], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(os.path.exists(state))
+            result = subprocess.run([PYTHON, WEBHOOK_PY, 'subscribe', 'github:owner/repo'],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(state, 'filter.json')))
+            self.assertFalse(os.path.exists(os.path.join(state, 'instances')))
 
 
 class TestInboxReady(StateDirCase):
@@ -3357,12 +3410,8 @@ class TestSpoolFailureModes(SpoolCase):
         sid = self.accept(self.env('mine-1'))
         q = self.box('peerkey')
         q.claim(sid, owner=os.getpid())   # a dead predecessor that had our pid
-        argv = sys.argv
-        sys.argv = argv[:1]     # any argv beyond the script makes the module a one-shot CLI
-        try:
-            peer = self.load(LOCAL_WEBHOOK_RECEIVER_ONLY='', LOCAL_WEBHOOK_SESSION='peerkey')
-        finally:
-            sys.argv = argv
+        peer = self.load(LOCAL_WEBHOOK_RECEIVER_ONLY='', LOCAL_WEBHOOK_SESSION='peerkey')
+        peer.start_peer()
         self.addCleanup(lambda: [os.unlink(f) for f in (peer.IPC_SOCK, peer.IPC_INBOX_MARKER)
                                  if os.path.exists(f)])
         self.assertTrue(os.path.exists(peer.IPC_INBOX_MARKER))
@@ -3905,12 +3954,8 @@ class TestCodexDelivery(StateDirCase):
         routing, same UNTRUSTED text, delivered with `codex queue` and NOT as a
         notifications/claude/channel line on stdout."""
         fake = CodexFake(self.state)
-        argv = sys.argv
-        sys.argv = ['webhook.py', 'codex-peer', '--thread', 'thr-9']
-        try:
-            mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
-        finally:
-            sys.argv = argv
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        mod.configure_run(['codex-peer', '--thread', 'thr-9'])
         self.assertTrue(mod.CODEX_PEER)
         self.assertFalse(mod.CLI, 'codex-peer must not be treated as a one-shot CLI call')
         self.assertEqual(mod.CODEX_PEER_THREAD, 'thr-9')
@@ -3933,12 +3978,8 @@ class TestCodexDelivery(StateDirCase):
 
     def test_a_failed_delivery_counts_towards_giving_up(self):
         fake = CodexFake(self.state, exit_code=1, message='Error: thread is archived')
-        argv = sys.argv
-        sys.argv = ['webhook.py', 'codex-peer', '--thread', 'thr-9']
-        try:
-            mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
-        finally:
-            sys.argv = argv
+        mod = self.load(LOCAL_WEBHOOK_CODEX_BIN=fake.path)
+        mod.configure_run(['codex-peer', '--thread', 'thr-9'])
         mod.call_tool({'name': 'webhook_subscribe', 'arguments': {'topic': 'github:o/r'}})
         for _ in range(2):
             with contextlib.redirect_stderr(io.StringIO()):
