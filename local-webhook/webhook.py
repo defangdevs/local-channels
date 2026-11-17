@@ -520,6 +520,11 @@ DEFAULT_TTL_HOURS = 1
 # interruption; subscribe rejects a longer ttl_hours rather than clamping it
 # silently, and read_filter clamps entries written before this rule.
 MAX_SESSION_TTL_HOURS = 8
+# How long a session filter remembers that an entry lapsed (#141). A pruned
+# entry otherwise leaves the file reading exactly like a session that never
+# subscribed; readers such as agent-box `peers` need to tell the two apart.
+EXPIRED_TRACE_HOURS = 24
+EXPIRED_TRACE_MAX = 20
 # A delivery is "warm" (and so renews the TTL) if it lands within this window
 # of the previous delivery — ~2× the ~5min prompt-cache TTL, enough slack that
 # a couple of slow turns don't break an active streak, still well short of a
@@ -1058,6 +1063,59 @@ def capped_ttl(ttl, session):
     return MAX_SESSION_TTL_HOURS if ttl == 0 or ttl > MAX_SESSION_TTL_HOURS else ttl
 
 
+def read_expired_traces(raw, now=None):
+    """Parse the `expired` list: {topic, name, note, expiredAt} rows, bounded in age and count."""
+    if not isinstance(raw, list):
+        return []
+    now = now_ms() if now is None else now
+    rows = []
+    for r in raw:
+        if not isinstance(r, dict) or not isinstance(r.get('topic'), str):
+            continue
+        at = parse_ms(r.get('expiredAt'))
+        if at is None or now - at > EXPIRED_TRACE_HOURS * 3600e3:
+            continue
+        rows.append({'topic': r['topic'],
+                     'name': r['name'] if isinstance(r.get('name'), str) else '',
+                     'note': r['note'][:NOTE_MAX_SESSION] if isinstance(r.get('note'), str) else '',
+                     'expiredAt': r['expiredAt']})
+    return rows[-EXPIRED_TRACE_MAX:]
+
+
+def expiry_split(f, now):
+    """Split f['topics'] into live entries and trace rows for the expired ones."""
+    live, gone = [], []
+    for e in f['topics']:
+        if not entry_expired(e, f['ttlHours'], now):
+            live.append(e)
+            continue
+        ttl = f['ttlHours'] if e['ttlHours'] is None else e['ttlHours']
+        start = parse_ms(e['subscribedAt']) or now
+        gone.append({'topic': e['topic'], 'name': e.get('name') or '', 'note': e['note'] or '',
+                     'expiredAt': iso_at(min(now, start + ttl * 3600e3))})
+    return live, gone
+
+
+def with_traces(f, gone, path, now):
+    """f's `expired` list after adding `gone`; a (topic, name) that is live again is dropped.
+
+    Dispatch files keep no trace: a standing watch is not something a peer waits on.
+    """
+    if os.path.abspath(path) == os.path.abspath(DISPATCH_FILE):
+        return []
+    # Topic identity is case-insensitive everywhere else (subscription lookup),
+    # the name part is case-sensitive.
+    def ident(topic, name):
+        return (topic.lower(), name)
+
+    keep = {ident(r['topic'], r['name']): r for r in f.get('expired', [])}
+    for r in gone:
+        keep[ident(r['topic'], r['name'])] = r
+    for e in f['topics']:
+        keep.pop(ident(e['topic'], e.get('name') or ''), None)
+    return read_expired_traces(list(keep.values()), now)
+
+
 def read_filter(path=FILTER_FILE):
     session = os.path.abspath(path) != os.path.abspath(DISPATCH_FILE)
     try:
@@ -1071,6 +1129,7 @@ def read_filter(path=FILTER_FILE):
                       for r in raw['repos'] if isinstance(r, str)]
         ttl = raw.get('ttlHours')
         return {
+            'expired': read_expired_traces(raw.get('expired')) if session else [],
             'enabled': raw.get('enabled') is not False,
             'ttlHours': capped_ttl(
                 ttl if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else DEFAULT_TTL_HOURS,
@@ -1085,13 +1144,13 @@ def read_filter(path=FILTER_FILE):
         # No file: this session never subscribed. Distinct from the case below,
         # and the whole point of 0.13.0 — see route_event.
         return {'enabled': True, 'ttlHours': DEFAULT_TTL_HOURS, 'topicsConfigured': False,
-                'state': 'absent', 'topics': []}
+                'state': 'absent', 'topics': [], 'expired': []}
     except ValueError:
         # File present but unparseable: a botched edit, or a read that raced a
         # non-atomic writer. Also routes nothing now, but it is an error to
         # report rather than an ordinary starting state.
         return {'enabled': True, 'ttlHours': DEFAULT_TTL_HOURS, 'topicsConfigured': False,
-                'state': 'invalid', 'topics': []}
+                'state': 'invalid', 'topics': [], 'expired': []}
 
 
 # Atomic replace: the filter is re-read on every delivery, so a partial write
@@ -1141,6 +1200,9 @@ def write_filter(f, path=FILTER_FILE):
     comment = DISPATCH_COMMENT if path == DISPATCH_FILE else FILTER_COMMENT
     body = {'//': comment, 'enabled': f['enabled'],
             'ttlHours': DEFAULT_TTL_HOURS if ttl is None else ttl, 'topics': topics}
+    traces = read_expired_traces(f.get('expired')) if os.path.abspath(path) != os.path.abspath(DISPATCH_FILE) else []
+    if traces:
+        body['expired'] = traces
     with open(path + '.tmp', 'w', encoding='utf-8') as fh:
         fh.write(pretty(body) + '\n')
     os.replace(path + '.tmp', path)
@@ -1439,7 +1501,7 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, requ
         if not f['topicsConfigured']:
             return {'forward': False, 'entry': None, 'refused': False, 'ruleless': False}
         now = now_ms() if at is None else at
-        live = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
+        live, gone = expiry_split(f, now)
         pruned = len(live) != len(f['topics'])
         forward = False
         matched = None
@@ -1487,7 +1549,8 @@ def route_event(source, key, sender, event, payload=None, path=FILTER_FILE, requ
                 break
         if pruned or matched:
             try:
-                write_filter({**f, 'topics': live}, path)
+                write_filter({**f, 'topics': live,
+                              'expired': with_traces({**f, 'topics': live}, gone, path, now)}, path)
             except OSError:
                 pass
         # refused: subscribed to the topic, but every matching entry said no
@@ -5133,10 +5196,13 @@ def peer_roster(now=None):
     sessions = []
     for key in sorted(pids):
         f = read_filter(filter_path_of(key))
-        rows = [render_entry(e, f['ttlHours'], now) for e in f['topics']
-                if not entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
+        live, gone = expiry_split(f, now) if f['topicsConfigured'] else ([], [])
+        rows = [render_entry(e, f['ttlHours'], now) for e in live]
+        # Traces for entries that expired but are not pruned from the file yet,
+        # merged in memory only: this function never writes.
+        lapsed = with_traces({**f, 'topics': live}, gone, filter_path_of(key), now) if gone else f['expired']
         sessions.append({'session': key, 'pid': pids[key], 'self': key == FILTER_KEY,
-                         'enabled': f['enabled'], 'topics': rows})
+                         'enabled': f['enabled'], 'topics': rows, 'lapsed': lapsed})
     return sessions
 
 
@@ -5172,9 +5238,11 @@ def call_tool(params):
         # here even if no delivery ever arrives to trigger route_event's prune.
         def pruned(p, persist=True):
             f = read_filter(p)
-            expired = [e for e in f['topics'] if entry_expired(e, f['ttlHours'], now)] if f['topicsConfigured'] else []
+            live, gone = expiry_split(f, now) if f['topicsConfigured'] else (f['topics'], [])
+            expired = [e for e in f['topics'] if e not in live]
             if expired:
-                f['topics'] = [e for e in f['topics'] if not entry_expired(e, f['ttlHours'], now)]
+                f['topics'] = live
+                f['expired'] = with_traces(f, gone, p, now)
                 if persist:
                     write_filter(f, p)
             return f, expired
@@ -5193,6 +5261,9 @@ def call_tool(params):
                 body['self'] = SELF
             body['filterFile'] = FILTER_FILE
             body['topics'] = [render(e, f['ttlHours']) for e in f['topics']]
+            # #141: a lapsed subscription is not the same as never subscribing.
+            if f['expired']:
+                body['lapsed'] = f['expired']
             # scope:"all" (#27): every OTHER live session's subscriptions too,
             # so "is anyone else on this topic?" is answerable before
             # subscribing. Opt-in: the default reply stays this session's own.
@@ -5483,7 +5554,8 @@ def call_tool(params):
                     e['spawnWindowS'] = raw_win
                 topics = list(f['topics'])
                 topics[idx] = e
-                write_filter({**f, 'enabled': True, 'topics': topics}, path)
+                write_filter({**f, 'enabled': True, 'topics': topics,
+                              'expired': with_traces({**f, 'topics': topics}, [], path, now)}, path)
                 return text('renewed subscription %s%s%s (current%s: %s)%s' % (
                     show(e), ttl_msg(e), scope, ' dispatch' if dispatch else '', listing(topics), expired_note))
             # First subscribe only (never a renew, and never for a dispatch
@@ -5523,7 +5595,8 @@ def call_tool(params):
                 'lastActivityAt': '',
             }
             topics = f['topics'] + [entry]
-            write_filter({**f, 'enabled': True, 'topics': topics}, path)
+            write_filter({**f, 'enabled': True, 'topics': topics,
+                              'expired': with_traces({**f, 'topics': topics}, [], path, now)}, path)
             return text('subscribed to %s%s%s (current%s: %s)%s' % (
                 show(entry), ttl_msg(entry), scope, ' dispatch' if dispatch else '', listing(topics), expired_note))
 
@@ -5534,11 +5607,17 @@ def call_tool(params):
             # mentions it, same as it survives one naming a DIFFERENT name.
             filtered = [e for e in f['topics'] if not (eq(e['topic'], topic) and e['name'] == watch_name)]
             watch_label = '%s name=%s' % (topic, watch_name) if watch_name else topic
+            # The requested identity's lapsed trace goes too, even when no live
+            # subscription matches (only a trace may remain).
+            traces = [r for r in f['expired'] if not (eq(r['topic'], topic) and r['name'] == watch_name)]
             if len(filtered) == len(f['topics']):
+                if len(traces) != len(f['expired']):
+                    write_filter({**f, 'expired': with_traces({**f, 'expired': traces}, [], path, now)}, path)
                 return text('not subscribed to %s%s (current%s: %s)%s' % (
                     watch_label, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
                     listing(f['topics']), expired_note))
-            write_filter({**f, 'topics': filtered}, path)
+            write_filter({**f, 'topics': filtered,
+                          'expired': with_traces({**f, 'topics': filtered, 'expired': traces}, [], path, now)}, path)
             return text('unsubscribed from %s%s (current%s: %s)%s' % (
                 watch_label, ' [dispatch]' if dispatch else '', ' dispatch' if dispatch else '',
                 listing(filtered), expired_note))

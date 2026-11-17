@@ -354,6 +354,15 @@ a straggler event can't trigger an expensive cold re-read; per-entry `ttlHours`
 overrides it; `0` = pinned, never expires). Expired topics are pruned at
 delivery time and on every tool call.
 
+When a **session** entry is pruned, the filter file keeps a trace so a lapsed
+subscription reads differently from one that never existed: a top-level
+`"expired": [{"topic", "name", "note", "expiredAt"}]` list (no predicates).
+`expiredAt` is `subscribedAt + ttl`, not the time of the prune. A row is dropped
+after 24 hours (`EXPIRED_TRACE_HOURS`), when the same topic and name subscribes
+or unsubscribes again, and the list holds at most 20 rows. `webhook_subscriptions`
+reports it as `lapsed`, and each `scope:"all"` peer row carries `lapsed` too.
+Dispatch watches keep no trace.
+
 A **session** subscription is capped at **8 hours** (`MAX_SESSION_TTL_HOURS`)
 and may not be pinned: `webhook_subscribe` refuses a longer `ttl_hours`, and
 entries written before the cap are clamped when the file is read. The reason is
