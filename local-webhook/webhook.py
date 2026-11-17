@@ -132,6 +132,38 @@ SELF = re.sub(r'[^A-Za-z0-9._-]', '', (os.environ.get('LOCAL_WEBHOOK_SELF') or '
 SESSION = re.sub(r'[^A-Za-z0-9._-]', '', (os.environ.get('LOCAL_WEBHOOK_SESSION') or '').strip())
 
 
+def conversation_scoped(session, env=None):
+    """The filter key for ONE Claude conversation in claude-send mode.
+
+    A Claude Remote Control daemon runs every app conversation with the
+    daemon's single LOCAL_WEBHOOK_SESSION, and each conversation runs its own
+    copy of this plugin. With one shared key, all of them read one filter: a
+    subscription made in one conversation was delivered to every conversation
+    of the daemon (one `claude -p` per conversation per event), and its claims
+    braked standing watches for all of them. In claude-send mode the key gets
+    the conversation's own id (CLAUDE_CODE_SESSION_ID, which Claude Code sets
+    for its MCP servers and its Bash tool alike), so the CLI that subscribes
+    and the plugin that delivers agree on one key per conversation.
+
+    The '.' separator keeps the result a valid key and outside the
+    "<user>-<session>" shape agent-box's orphan sweep deletes. Idempotent: a
+    key that already carries this conversation's suffix is returned as is, so
+    a caller that exported the scoped key (agent-box-webhook) is not scoped
+    twice.
+    """
+    env = os.environ if env is None else env
+    if (env.get('LOCAL_WEBHOOK_CLAUDE_DELIVERY') or '').strip().lower() != 'send':
+        return session
+    conv = re.sub(r'[^0-9a-f]', '', (env.get('CLAUDE_CODE_SESSION_ID') or '').strip().lower())[:8]
+    if not session or len(conv) < 8:
+        return session
+    suffix = '.c' + conv
+    return session if session.endswith(suffix) else session + suffix
+
+
+SESSION = conversation_scoped(SESSION)
+
+
 def s(v):
     # JS String() renders JSON scalars as they were written (true, 42, 4.5);
     # mirror that so payload previews and meta stay byte-identical.

@@ -39,6 +39,12 @@ ANY_EVENT = {'path': 'event', 'notIn': [None]}
 _module_seq = [0]
 
 
+# Run inside a Claude conversation, an inherited CLAUDE_CODE_SESSION_ID would
+# scope the filter key of every subprocess test that also inherits claude-send
+# mode (conversation_scoped). Only a test that passes it may decide that.
+os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+
+
 def load_webhook(env):
     """Import webhook.py under a controlled environment, as a unique module.
 
@@ -56,8 +62,11 @@ def load_webhook(env):
         # CODEX_* too: run inside a codex session, an inherited CODEX_THREAD_ID
         # would make the module resolve a real thread and answer differently
         # than it does in CI. Only what a test passes may decide that.
+        # CLAUDE_CODE_SESSION_ID likewise: inside a Claude conversation it
+        # would scope the filter key in claude-send mode (conversation_scoped).
         if (k.startswith('LOCAL_WEBHOOK_') or k.startswith('CODEX_')
-                or k in ('WEBHOOK_SECRET', 'WEBHOOK_PORT', 'LISTEN_FDS', 'LISTEN_PID')):
+                or k in ('WEBHOOK_SECRET', 'WEBHOOK_PORT', 'LISTEN_FDS', 'LISTEN_PID',
+                         'CLAUDE_CODE_SESSION_ID')):
             saved[k] = os.environ.pop(k)
     os.environ.update(base)
     try:
@@ -3616,6 +3625,51 @@ class ClaudeFake:
             return []
         with open(self.log, encoding='utf-8') as f:
             return [json.loads(line) for line in f if line.strip()]
+
+
+class TestClaudeSendConversationKey(StateDirCase):
+    """A Remote Control daemon's conversations share one LOCAL_WEBHOOK_SESSION;
+    in claude-send mode each conversation must still get its own filter."""
+
+    CONV_A = '7296ab26-573e-5039-a5ae-16851f64884e'
+    CONV_B = '0de5ba11-0000-4000-8000-000000000000'
+
+    def test_send_mode_scopes_the_key_per_conversation(self):
+        a = self.load(LOCAL_WEBHOOK_SESSION='agent-claude-ae9c',
+                      LOCAL_WEBHOOK_CLAUDE_DELIVERY='send', CLAUDE_CODE_SESSION_ID=self.CONV_A)
+        b = self.load(LOCAL_WEBHOOK_SESSION='agent-claude-ae9c',
+                      LOCAL_WEBHOOK_CLAUDE_DELIVERY='send', CLAUDE_CODE_SESSION_ID=self.CONV_B)
+        self.assertEqual(a.FILTER_KEY, 'agent-claude-ae9c.c7296ab26')
+        self.assertEqual(b.FILTER_KEY, 'agent-claude-ae9c.c0de5ba11')
+        self.assertNotEqual(a.FILTER_FILE, b.FILTER_FILE)
+
+    def test_a_subscription_reaches_only_its_own_conversation(self):
+        a = self.load(LOCAL_WEBHOOK_SESSION='agent-claude-ae9c',
+                      LOCAL_WEBHOOK_CLAUDE_DELIVERY='send', CLAUDE_CODE_SESSION_ID=self.CONV_A)
+        b = self.load(LOCAL_WEBHOOK_SESSION='agent-claude-ae9c',
+                      LOCAL_WEBHOOK_CLAUDE_DELIVERY='send', CLAUDE_CODE_SESSION_ID=self.CONV_B)
+        self.mod = a
+        self.call('webhook_subscribe', topic='github:o/r', note='PR 1: mine')
+        payload = {'action': 'opened', 'pull_request': {'number': 1}}
+        routed_a = a.route_event('github', 'o/r', 'someone', 'pull_request', payload)
+        routed_b = b.route_event('github', 'o/r', 'someone', 'pull_request', payload)
+        self.assertTrue(routed_a['forward'])
+        self.assertFalse(routed_b['forward'])
+
+    def test_scoping_is_idempotent_and_send_mode_only(self):
+        mod = self.load()
+        env = {'LOCAL_WEBHOOK_CLAUDE_DELIVERY': 'send', 'CLAUDE_CODE_SESSION_ID': self.CONV_A}
+        once = mod.conversation_scoped('agent-claude-ae9c', env)
+        self.assertEqual(mod.conversation_scoped(once, env), once)
+        # Without send mode, or without a usable id, the key is unchanged:
+        # an interactive session's channel delivery keeps its supervisor key.
+        self.assertEqual(mod.conversation_scoped('agent-x', {'CLAUDE_CODE_SESSION_ID': self.CONV_A}),
+                         'agent-x')
+        self.assertEqual(mod.conversation_scoped('agent-x', {'LOCAL_WEBHOOK_CLAUDE_DELIVERY': 'send'}),
+                         'agent-x')
+        self.assertEqual(mod.conversation_scoped('agent-x', dict(env, CLAUDE_CODE_SESSION_ID='zz')),
+                         'agent-x')
+        self.assertEqual(mod.conversation_scoped('', env), '')
 
 
 class TestClaudeSendDelivery(StateDirCase):
