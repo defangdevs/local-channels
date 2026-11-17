@@ -1,0 +1,4 @@
+# Build/test tooling only; router wheels have no runtime dependencies.
+# Hashes are for the universal wheels published on PyPI. Install wheel-only.
+wheel==0.46.1 --hash=sha256:f796f65d72750ccde090663e466d0ca37cd72b62870f7520b96d34cdc07d86d8
+packaging==26.0 --hash=sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529

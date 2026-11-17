@@ -32,8 +32,8 @@ For merged branches this is the merge commit, so the tag includes the whole
 change. Versions 0.1.0 and 0.2.0 predate the rename from `gh-webhook`.
 The early 0.5.x manifests were stale; those tags follow the versions explicitly
 named in their release commit subjects.
-Tags are immutable and CI publishes missing tags after both Python test jobs
-and both Node test jobs pass on `main`. Documentation-only commits do not move
+Tags are immutable and CI publishes missing tags after the Python, Node and
+router packaging checks pass on `main`. Documentation-only commits do not move
 an existing tag. `local-whatsapp` uses `local-whatsapp-vX.Y.Z` tags and `local-router` uses
 `local-router-vX.Y.Z` tags, so their independent version sequences cannot
 collide with `local-webhook` tags.
@@ -48,6 +48,10 @@ full commit hashes, with tags providing the version lookup.
 - For `local-webhook`: `python3` >= 3.9, with no pip packages or Node runtime.
 - For `local-whatsapp`: Node.js >= 20, the pinned npm dependencies, and outbound
   network access to WhatsApp. See its [setup guide](local-whatsapp/README.md).
+- For `local-router`: Python >= 3.9, with no runtime packages. Run the single
+  file or [install the library and CLI](local-router/README.md#install) in a
+  virtual environment. Its wheel and source distribution include the MIT
+  license and copyright notice; CI builds and tests both installation paths.
 - For `local-webhook` only: a way for the sender to reach the box. In practice a
   TLS-terminating reverse proxy (Caddy) in front of the loopback port or unix
   socket the plugin listens on.
