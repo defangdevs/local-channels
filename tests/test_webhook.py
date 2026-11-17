@@ -3588,7 +3588,7 @@ class ClaudeFake:
     """A stand-in `claude` binary: records argv, stdin and the environment
     keys it was given, and answers like a model that ran SendMessage."""
 
-    def __init__(self, dirpath, reply='{"success":true,"message":"ok"}', exit_code=0):
+    def __init__(self, dirpath, reply=None, exit_code=0):
         bindir = os.path.join(dirpath, 'fake-claude-bin')
         os.makedirs(bindir, exist_ok=True)
         self.log = os.path.join(bindir, 'claude-calls.jsonl')
@@ -3598,7 +3598,16 @@ class ClaudeFake:
             f.write('import json, os, sys\n')
             f.write('rec = {"argv": sys.argv[1:], "stdin": sys.stdin.read(), "env": sorted(os.environ)}\n')
             f.write('open(%r, "a").write(json.dumps(rec) + "\\n")\n' % self.log)
-            f.write('sys.stdout.write(%r)\n' % reply)
+            if reply is None:
+                f.write('import re\n')
+                f.write('m = re.search(r"to=\\"([^\\"]+)\\"", rec["stdin"])\n')
+                f.write('ev = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", '
+                        '"name": "SendMessage", "input": {"to": m.group(1)}}]}}, '
+                        '{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", '
+                        '"content": "{\\"success\\":true}"}]}}]\n')
+                f.write('sys.stdout.write("\\n".join(json.dumps(e) for e in ev))\n')
+            else:
+                f.write('sys.stdout.write(%r)\n' % reply)
             f.write('sys.exit(%d)\n' % exit_code)
         os.chmod(self.path, 0o755)
 
@@ -3651,7 +3660,10 @@ class TestClaudeSendDelivery(StateDirCase):
 
     def test_unconfirmed_or_failed_send_is_a_failure(self):
         target = self.target()
+        quoted = json.dumps({'type': 'result', 'result': 'expected "success":true from SendMessage'})
         for fake in (ClaudeFake(os.path.join(self.state, 'a'), reply='I sent it, trust me'),
+                     ClaudeFake(os.path.join(self.state, 'c'), reply=quoted),
+                     ClaudeFake(os.path.join(self.state, 'd'), reply='{"success":true}'),
                      ClaudeFake(os.path.join(self.state, 'b'), exit_code=1, reply='boom')):
             mod = self.load(LOCAL_WEBHOOK_CLAUDE_BIN=fake.path)
             ok, _ = mod.claude_send('t', target=target)

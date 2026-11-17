@@ -2154,6 +2154,41 @@ def claude_send_prompt(target, text):
         % (target, CLAUDE_SEND_BEGIN, text, CLAUDE_SEND_END))
 
 
+def claude_send_confirmed(stream, target):
+    """True when a stream-json transcript holds a SendMessage tool_use aimed at
+    uds:<target> and a matching, non-error tool_result reporting success."""
+    calls = set()
+    for line in stream.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        msg = rec.get('message') if isinstance(rec, dict) else None
+        content = msg.get('content') if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if (rec.get('type') == 'assistant' and block.get('type') == 'tool_use'
+                    and block.get('name') == 'SendMessage'
+                    and isinstance(block.get('input'), dict)
+                    and block['input'].get('to') == 'uds:%s' % target):
+                calls.add(block.get('id'))
+            elif (rec.get('type') == 'user' and block.get('type') == 'tool_result'
+                    and block.get('tool_use_id') in calls and not block.get('is_error')):
+                body = block.get('content')
+                if isinstance(body, list):
+                    body = ''.join(b.get('text', '') for b in body if isinstance(b, dict))
+                try:
+                    res = json.loads(body) if isinstance(body, str) else None
+                except ValueError:
+                    res = None
+                if isinstance(res, dict) and res.get('success') is True:
+                    return True
+    return False
+
+
 def claude_send(text, target=None):
     """Hand one delivery to a Claude conversation's inbox. Returns (ok, detail).
 
@@ -2170,7 +2205,8 @@ def claude_send(text, target=None):
     msg = msg.replace(CLAUDE_SEND_END, '-----END-----')
     env = {k: v for k, v in os.environ.items()
            if not k.startswith('LOCAL_WEBHOOK_') and k != 'CLAUDE_CODE_ENTRYPOINT'}
-    argv = [CLAUDE_BIN, '-p', '--model', CLAUDE_SEND_MODEL,
+    argv = [CLAUDE_BIN, '-p', '--output-format', 'stream-json', '--verbose',
+            '--model', CLAUDE_SEND_MODEL,
             '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
             '--tools', 'SendMessage,ToolSearch', '--allowedTools', 'SendMessage',
             '--permission-mode', 'dontAsk', '--no-session-persistence', '--disable-slash-commands']
@@ -2187,9 +2223,9 @@ def claude_send(text, target=None):
     out_text = (p.stdout or b'').decode('utf-8', 'replace').strip()
     if p.returncode != 0:
         return False, out_text[-500:] or 'claude -p exited %d' % p.returncode
-    # SendMessage answers {"success":true,...}; anything else (an unreachable
-    # target, a model that did not call the tool) is a failure to retry.
-    if not re.search(r'"success"\s*:\s*true', out_text):
+    # Only a structured SendMessage tool result for OUR target counts; text the
+    # model printed (or quoted from the payload) is never proof of delivery.
+    if not claude_send_confirmed(out_text, target):
         return False, 'SendMessage did not confirm delivery: %s' % out_text[-300:]
     return True, ''
 
