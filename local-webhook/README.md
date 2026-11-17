@@ -1059,6 +1059,13 @@ conversation as a `claude --print --sdk-url` child, and it cannot pass
 written and claims hold, but Claude Code drops every channel notification. The
 events vanish, and the claim stops standing watches from starting anyone else.
 
+In this mode the subscription key is per conversation: `LOCAL_WEBHOOK_SESSION`
+plus `.c` and the first 8 hex digits of `CLAUDE_CODE_SESSION_ID`, which Claude
+Code sets for its MCP servers and its Bash tool alike. A daemon gives every
+conversation the same `LOCAL_WEBHOOK_SESSION`; without the suffix, one
+conversation's subscription reached every conversation of the daemon, and its
+claims braked standing watches for all of them.
+
 Set `LOCAL_WEBHOOK_CLAUDE_DELIVERY=send` in the environment of such a session
 (for example, on the daemon, whose children inherit it). Then the session peer
 keeps everything above the last inch and replaces the notification with a
