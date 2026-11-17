@@ -1170,6 +1170,8 @@ the same as for `emit`: the state directory's file permissions.
 |---|---|---|
 | `LOCAL_WEBHOOK_PORT` (or legacy `WEBHOOK_PORT`) | `8788` | loopback TCP ingress port; `0` = no TCP ingress (pure IPC peer) |
 | `LOCAL_WEBHOOK_HTTP_SOCK` | — | listen for the HTTP ingress on this unix socket path instead of TCP (stale socket reclaimed on start) |
+| `LOCAL_WEBHOOK_HTTP_MAX_CONNECTIONS` | `8` | maximum simultaneous HTTP handlers; excess connections receive `503` and close without starting another thread |
+| `LOCAL_WEBHOOK_HTTP_READ_TIMEOUT_S` | `15` | absolute seconds to read the request line, headers and complete body, including chunk framing/trailers; timeout receives `408` and closes |
 | `LOCAL_WEBHOOK_RECEIVER_ONLY` | — | `1`/`true` = daemon mode: own the ingress and fan out to peers, but no session of its own (no MCP stdio, no self-delivery) |
 | `LOCAL_WEBHOOK_SESSION` | — | per-session subscription scope; selects `filter.<session>.json` (falls back to `SELF`, then default) |
 | `LOCAL_WEBHOOK_STATE_DIR` | `~/.local/state/local-webhook` | secrets + filters (must be shared across a box's daemon + sessions for fan-out) |
@@ -1205,6 +1207,40 @@ the same as for `emit`: the state directory's file permissions.
 When systemd socket activation is in effect (`LISTEN_FDS` set), the ingress
 adopts the passed fd (fd 3) and both `LOCAL_WEBHOOK_HTTP_SOCK` and
 `LOCAL_WEBHOOK_PORT` are ignored — the `.socket` unit owns the path and perms.
+
+### HTTP ingress limits
+
+TCP, explicit Unix sockets and socket-activated listeners share the same
+admission and read limits. At most `LOCAL_WEBHOOK_HTTP_MAX_CONNECTIONS`
+handlers run at once (default **8**); an excess connection receives **503**
+with `Retry-After: 1` and closes, without allocating another handler thread.
+The rejection is best effort: a client that cannot receive the immediate
+response is simply disconnected. No delivery is accepted by this rejection.
+
+Each admitted connection has **15 seconds** by default
+(`LOCAL_WEBHOOK_HTTP_READ_TIMEOUT_S`) to supply its request line, headers and
+complete body, including chunk framing and trailers. This is an **absolute
+read deadline**, not an idle timeout; sending occasional bytes does not renew
+it. Expiry returns **408** and closes the connection. Both settings accept
+positive integer values only; unset, empty, malformed, negative and zero
+values use their defaults. Set them in the ingress owner's environment and
+restart that process to apply changes.
+
+The request line plus headers have a **64 KiB aggregate limit**; chunk
+trailers have a separate 64 KiB limit. Exceeding either returns **431**. Chunk
+size lines, including extensions, are limited to **8 KiB**; malformed or
+incomplete body framing follows the existing **500** error path. The
+configurable body cap remains **25 MiB** by default (**413**), for both
+Content-Length and chunked bodies. Invalid signatures still return **401**,
+unknown sources **404**, and unsupported methods **405**.
+
+The read deadline ends before signature verification, durable writes and
+fan-out; these still retain their admission slot until completion. Socket
+response writes have a separate one-second timeout, so a client that stops
+reading cannot hold a slot indefinitely. A sender or proxy must retry a
+408/503 if it wants delivery; local-webhook has not accepted or queued that
+request. Tune the read limit for the slowest expected body upload, and keep
+reverse-proxy limits in place for the public endpoint.
 
 ## Full payloads and email (0.35.0)
 
