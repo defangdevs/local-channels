@@ -3278,12 +3278,28 @@ class TestSpoolReaper(SpoolCase):
         self.mod.spool_reap()
         self.assertFalse(os.path.exists(self.mod.peer_queue('..').root))
 
-    def conv_filter(self, key, hours_ago, **kw):
+    def conv_filter(self, key, hours_ago, marked=True, **kw):
         at = self.mod.iso_at(self.mod.now_ms() - int(hours_ago * 3600e3))
         e = {'topic': 'github:o/r', 'subscribedAt': at}
         e.update(kw)
-        self.write_json('filter.%s.json' % key, {'ttlHours': 1, 'topics': [e]})
+        body = {'ttlHours': 1, 'topics': [e]}
+        if marked:
+            body['conversation'] = True
+        self.write_json('filter.%s.json' % key, body)
         return os.path.join(self.state, 'filter.%s.json' % key)
+
+    def test_an_unmarked_file_with_a_conversation_shaped_name_is_kept(self):
+        # A plain session may be named daemon.c0123abcd; legacy files carry no marker.
+        plain = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1, marked=False)
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(plain))
+
+    def test_the_conversation_marker_survives_a_rewrite(self):
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        f = self.mod.read_filter(path)
+        self.assertTrue(f['conversation'])
+        self.mod.write_filter(f, path)
+        self.assertTrue(self.mod.read_filter(path)['conversation'])
 
     def long_ago(self):
         return 1 + self.mod.SPOOL_PEER_MAX_S / 3600.0

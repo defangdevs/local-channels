@@ -165,6 +165,15 @@ def conversation_scoped(session, env=None):
 SESSION = conversation_scoped(SESSION)
 
 
+def _is_conversation_key(key, env=None):
+    """True when `key` is the claude-send conversation key of this process."""
+    env = os.environ if env is None else env
+    if (env.get('LOCAL_WEBHOOK_CLAUDE_DELIVERY') or '').strip().lower() != 'send':
+        return False
+    conv = re.sub(r'[^0-9a-f]', '', (env.get('CLAUDE_CODE_SESSION_ID') or '').strip().lower())[:8]
+    return len(conv) == 8 and bool(key) and key.endswith('.c' + conv)
+
+
 def s(v):
     # JS String() renders JSON scalars as they were written (true, 42, 4.5);
     # mirror that so payload previews and meta stay byte-identical.
@@ -1166,6 +1175,7 @@ def read_filter(path=FILTER_FILE):
                       for r in raw['repos'] if isinstance(r, str)]
         ttl = raw.get('ttlHours')
         return {
+            'conversation': session and raw.get('conversation') is True,
             'expired': read_expired_traces(raw.get('expired')) if session else [],
             'enabled': raw.get('enabled') is not False,
             'ttlHours': capped_ttl(
@@ -1240,6 +1250,11 @@ def write_filter(f, path=FILTER_FILE):
     traces = read_expired_traces(f.get('expired')) if os.path.abspath(path) != os.path.abspath(DISPATCH_FILE) else []
     if traces:
         body['expired'] = traces
+    # Stored scope: a key's `.c<8hex>` suffix alone cannot tell a conversation
+    # filter from a plain session that happens to be named that way, so the
+    # file says so. Only files marked this way are ever pruned.
+    if f.get('conversation') or (path == FILTER_FILE and _is_conversation_key(SESSION)):
+        body['conversation'] = True
     with open(path + '.tmp', 'w', encoding='utf-8') as fh:
         fh.write(pretty(body) + '\n')
     os.replace(path + '.tmp', path)
@@ -2966,8 +2981,9 @@ def prune_conversation_filters(now=None):
     record that is still being retried. The same bound is what write_filter
     uses for mergeCommits.
 
-    Only conversation-scoped keys are touched: a plain session's file is
-    owned by `session rm`. An unreadable file stays, so nothing here fails
+    Only files marked `"conversation": true` (stored by write_filter) are
+    touched: a plain session's file is owned by `session rm`, and a legacy
+    file without the marker is kept because its scope cannot be established. An unreadable file stays, so nothing here fails
     open. A session entry's pin (ttlHours 0) is already capped at
     MAX_SESSION_TTL_HOURS by read_filter, so "expired" here means expired for
     routing too. The check runs again under the filter lock, so a subscribe
@@ -2985,6 +3001,8 @@ def prune_conversation_filters(now=None):
                 f = read_filter(path)
                 if f['state'] not in ('ok', 'unconfigured'):
                     continue
+                if not f['conversation']:
+                    continue  # unmarked (legacy or plain session): scope unknown
                 if any(not entry_expired(e, f['ttlHours'], cutoff) for e in f['topics']):
                     continue
                 q = peer_queue(key)
