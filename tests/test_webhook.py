@@ -3278,6 +3278,114 @@ class TestSpoolReaper(SpoolCase):
         self.mod.spool_reap()
         self.assertFalse(os.path.exists(self.mod.peer_queue('..').root))
 
+    def conv_filter(self, key, hours_ago, marked=True, **kw):
+        at = self.mod.iso_at(self.mod.now_ms() - int(hours_ago * 3600e3))
+        e = {'topic': 'github:o/r', 'subscribedAt': at}
+        e.update(kw)
+        body = {'ttlHours': 1, 'topics': [e]}
+        if marked:
+            body['conversation'] = True
+        self.write_json('filter.%s.json' % key, body)
+        return os.path.join(self.state, 'filter.%s.json' % key)
+
+    def test_an_unmarked_file_with_a_conversation_shaped_name_is_kept(self):
+        # A plain session may be named daemon.c0123abcd; legacy files carry no marker.
+        plain = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1, marked=False)
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(plain))
+
+    def test_the_conversation_marker_survives_a_rewrite(self):
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        f = self.mod.read_filter(path)
+        self.assertTrue(f['conversation'])
+        self.mod.write_filter(f, path)
+        self.assertTrue(self.mod.read_filter(path)['conversation'])
+
+    def long_ago(self):
+        return 1 + self.mod.SPOOL_PEER_MAX_S / 3600.0
+
+    def test_an_expired_conversation_filter_is_pruned(self):
+        gone = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        live = self.conv_filter('daemon.c1123abcd', 0)
+        recent = self.conv_filter('daemon.c2123abcd', 5)     # expired, but inside the grace
+        plain = self.conv_filter('hook-old', self.long_ago() + 1)   # not a conversation key
+        self.assertEqual(self.mod.prune_conversation_filters(), ['daemon.c0123abcd'])
+        self.assertFalse(os.path.exists(gone))
+        self.assertFalse(os.path.exists(gone + '.lock'))   # no orphan lock left behind
+        for p in (live, recent, plain):
+            self.assertTrue(os.path.exists(p))
+
+    def test_a_pin_is_capped_so_an_old_pinned_filter_is_pruned(self):
+        gone = self.conv_filter('daemon.c0123abcd', self.long_ago() + 10, ttlHours=0)
+        self.assertEqual(self.mod.prune_conversation_filters(), ['daemon.c0123abcd'])
+        self.assertFalse(os.path.exists(gone))
+
+    def test_a_conversation_filter_with_queued_mail_is_kept(self):
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        self.accept(self.env('conv-1'))
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_conversation_filter_with_a_leased_record_is_kept(self):
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        sid = self.accept(self.env('conv-lease'))
+        q = self.box('daemon.c0123abcd')
+        self.assertIsNotNone(q.claim(sid))
+        self.assertEqual(q.names(), [])
+        self.assertEqual(len(q.leases()), 1)
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_an_unreadable_queue_keeps_the_filter(self):
+        from unittest import mock
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        self.accept(self.env('conv-unreadable'))
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        real = os.listdir
+
+        def listdir(d):
+            if os.sep + 'cur' == d[-4:]:
+                raise PermissionError(13, 'denied', d)
+            return real(d)
+        self.box('daemon.c0123abcd').ensure()
+        with mock.patch.object(self.mod.os, 'listdir', listdir):
+            self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_corrupt_conversation_filter_is_kept(self):
+        path = os.path.join(self.state, 'filter.daemon.c0123abcd.json')
+        with open(path, 'w') as fh:
+            fh.write('{nope')
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_the_reaper_prunes_and_then_drops_the_empty_box(self):
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        sid = self.accept(self.env('conv-2'))
+        self.mod.peer_queue('daemon.c0123abcd').drop(sid)
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(path))
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(self.box('daemon.c0123abcd').root))
+
+    def test_startup_prunes_even_with_the_spool_off(self):
+        path = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        from unittest import mock
+        self.mod.SPOOL_ENABLED = False   # what LOCAL_WEBHOOK_SPOOL=off sets at import
+        with mock.patch.object(self.mod.threading, 'Thread') as thread, \
+                mock.patch.object(self.mod, 'spool_recover') as recover:
+            self.mod.spool_start_owner()
+        self.assertFalse(os.path.exists(path))
+        thread.assert_not_called()       # no reaper thread without a spool
+        recover.assert_not_called()
+
     def test_dedup_memory_expires(self):
         self.accept(self.env('seen-1'))
         seen = os.path.join(self.state, 'spool', 'seen', 'github~seen-1')

@@ -165,6 +165,15 @@ def conversation_scoped(session, env=None):
 SESSION = conversation_scoped(SESSION)
 
 
+def _is_conversation_key(key, env=None):
+    """True when `key` is the claude-send conversation key of this process."""
+    env = os.environ if env is None else env
+    if (env.get('LOCAL_WEBHOOK_CLAUDE_DELIVERY') or '').strip().lower() != 'send':
+        return False
+    conv = re.sub(r'[^0-9a-f]', '', (env.get('CLAUDE_CODE_SESSION_ID') or '').strip().lower())[:8]
+    return len(conv) == 8 and bool(key) and key.endswith('.c' + conv)
+
+
 def s(v):
     # JS String() renders JSON scalars as they were written (true, 42, 4.5);
     # mirror that so payload previews and meta stay byte-identical.
@@ -1166,6 +1175,7 @@ def read_filter(path=FILTER_FILE):
                       for r in raw['repos'] if isinstance(r, str)]
         ttl = raw.get('ttlHours')
         return {
+            'conversation': session and raw.get('conversation') is True,
             'expired': read_expired_traces(raw.get('expired')) if session else [],
             'enabled': raw.get('enabled') is not False,
             'ttlHours': capped_ttl(
@@ -1240,6 +1250,11 @@ def write_filter(f, path=FILTER_FILE):
     traces = read_expired_traces(f.get('expired')) if os.path.abspath(path) != os.path.abspath(DISPATCH_FILE) else []
     if traces:
         body['expired'] = traces
+    # Stored scope: a key's `.c<8hex>` suffix alone cannot tell a conversation
+    # filter from a plain session that happens to be named that way, so the
+    # file says so. Only files marked this way are ever pruned.
+    if f.get('conversation') or (path == FILTER_FILE and _is_conversation_key(SESSION)):
+        body['conversation'] = True
     with open(path + '.tmp', 'w', encoding='utf-8') as fh:
         fh.write(pretty(body) + '\n')
     os.replace(path + '.tmp', path)
@@ -2937,6 +2952,77 @@ def filter_keys():
     return sorted(keys)
 
 
+CONVERSATION_KEY = re.compile(r'^.+\.c[0-9a-f]{8}$')
+
+
+def _queue_dirs_readable(q):
+    """False when new/ or cur/ exists but cannot be listed. A missing
+    directory is an empty queue; any other error is unknown."""
+    for d in (q.new, q.cur):
+        try:
+            os.listdir(d)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+    return True
+
+
+def prune_conversation_filters(now=None):
+    """Delete per-conversation filter files (`filter.<key>.c<8hex>.json`, made
+    by claude-send mode) whose subscriptions have all been expired for longer
+    than the inbox retention bound (SPOOL_PEER_MAX_S) and whose inbox holds
+    nothing queued or leased. Nothing else removes them, and every receiver
+    fan-out and merge scan reads each one. Returns the keys removed.
+
+    The grace period matters: fan-out and its retries match an event against
+    the filter as of the event's acceptance time, and an inbox record is kept
+    at most that long, so a filter expired for longer can no longer match any
+    record that is still being retried. The same bound is what write_filter
+    uses for mergeCommits.
+
+    Only files marked `"conversation": true` (stored by write_filter) are
+    touched: a plain session's file is owned by `session rm`, and a legacy
+    file without the marker is kept because its scope cannot be established. An unreadable file stays, so nothing here fails
+    open. A session entry's pin (ttlHours 0) is already capped at
+    MAX_SESSION_TTL_HOURS by read_filter, so "expired" here means expired for
+    routing too. The check runs again under the filter lock, so a subscribe
+    racing the prune keeps its file.
+    """
+    now = now_ms() if now is None else now
+    cutoff = now - SPOOL_PEER_MAX_S * 1000
+    removed = []
+    for key in filter_keys():
+        if not CONVERSATION_KEY.match(key):
+            continue
+        path = filter_path_of(key)
+        try:
+            with FILTER_LOCK, filter_file_lock(path):
+                f = read_filter(path)
+                if f['state'] not in ('ok', 'unconfigured'):
+                    continue
+                if not f['conversation']:
+                    continue  # unmarked (legacy or plain session): scope unknown
+                if any(not entry_expired(e, f['ttlHours'], cutoff) for e in f['topics']):
+                    continue
+                q = peer_queue(key)
+                # A record moves new -> cur when claimed and cur -> new when a
+                # delivery fails; reading new, cur, new again cannot miss a
+                # single move. An unreadable queue is not an empty one.
+                if not _queue_dirs_readable(q) or q.names() or q.leases() or q.names():
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+                removed.append(key)
+        except OSError as e:
+            print('local-webhook: could not prune filter for %s: %s' % (key, e), file=sys.stderr)
+    if removed:
+        reap_orphan_filter_locks()  # the lock files of the filters just removed
+    return removed
+
+
 def filter_accepts(path, env, at=None):
     """Would the session behind this filter receive `env` (as of `at`)?
 
@@ -3603,6 +3689,10 @@ def spool_reap(now_s=None):
         stale = [r for r in SPOOL_DISPATCH.aged() if r[2] == 'new' and now_s - r[1] > SPAWN_DEFER_MAX_S]
         _drop_logged(SPOOL_DISPATCH, stale, 'no LOCAL_WEBHOOK_SPAWN_CMD is configured to run them, '
                      'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=%d' % SPAWN_DEFER_MAX_S, 'standing watches')
+    try:
+        prune_conversation_filters()
+    except Exception as e:  # noqa: BLE001 — hygiene must not stop the reaper
+        print('local-webhook: filter prune failed: %s' % e, file=sys.stderr)
     # Session inboxes.
     try:
         boxes = os.listdir(SPOOL_PEERS)
@@ -3675,6 +3765,10 @@ def spool_start_owner():
     except Exception as e:  # noqa: BLE001 — hygiene must not keep the ingress down
         print('local-webhook: lock reap failed: %s' % e, file=sys.stderr)
     if not SPOOL_ENABLED:
+        try:
+            prune_conversation_filters()
+        except Exception as e:  # noqa: BLE001
+            print('local-webhook: filter prune failed: %s' % e, file=sys.stderr)
         return
     try:
         spool_recover()
