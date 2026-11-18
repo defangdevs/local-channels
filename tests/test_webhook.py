@@ -3343,9 +3343,14 @@ class TestSpoolReaper(SpoolCase):
 
     def test_startup_prunes_even_with_the_spool_off(self):
         path = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
-        self.mod.SPOOL_ENABLED = False
-        self.mod.spool_start_owner()
+        from unittest import mock
+        self.mod.SPOOL_ENABLED = False   # what LOCAL_WEBHOOK_SPOOL=off sets at import
+        with mock.patch.object(self.mod.threading, 'Thread') as thread, \
+                mock.patch.object(self.mod, 'spool_recover') as recover:
+            self.mod.spool_start_owner()
         self.assertFalse(os.path.exists(path))
+        thread.assert_not_called()       # no reaper thread without a spool
+        recover.assert_not_called()
 
     def test_dedup_memory_expires(self):
         self.accept(self.env('seen-1'))
