@@ -3285,21 +3285,41 @@ class TestSpoolReaper(SpoolCase):
         self.write_json('filter.%s.json' % key, {'ttlHours': 1, 'topics': [e]})
         return os.path.join(self.state, 'filter.%s.json' % key)
 
+    def long_ago(self):
+        return 1 + self.mod.SPOOL_PEER_MAX_S / 3600.0
+
     def test_an_expired_conversation_filter_is_pruned(self):
-        gone = self.conv_filter('daemon.c0123abcd', 5)
+        gone = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
         live = self.conv_filter('daemon.c1123abcd', 0)
-        pinned = self.conv_filter('daemon.c2123abcd', 5, ttlHours=0)
-        plain = self.conv_filter('hook-old', 5)      # not a conversation key
+        recent = self.conv_filter('daemon.c2123abcd', 5)     # expired, but inside the grace
+        plain = self.conv_filter('hook-old', self.long_ago() + 1)   # not a conversation key
         self.assertEqual(self.mod.prune_conversation_filters(), ['daemon.c0123abcd'])
         self.assertFalse(os.path.exists(gone))
-        for p in (live, pinned, plain):
+        for p in (live, recent, plain):
             self.assertTrue(os.path.exists(p))
+
+    def test_a_pin_is_capped_so_an_old_pinned_filter_is_pruned(self):
+        gone = self.conv_filter('daemon.c0123abcd', self.long_ago() + 10, ttlHours=0)
+        self.assertEqual(self.mod.prune_conversation_filters(), ['daemon.c0123abcd'])
+        self.assertFalse(os.path.exists(gone))
 
     def test_a_conversation_filter_with_queued_mail_is_kept(self):
         self.quiet()
         path = self.conv_filter('daemon.c0123abcd', 0)
         self.accept(self.env('conv-1'))
-        self.conv_filter('daemon.c0123abcd', 5)
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_conversation_filter_with_a_leased_record_is_kept(self):
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        sid = self.accept(self.env('conv-lease'))
+        q = self.box('daemon.c0123abcd')
+        self.assertIsNotNone(q.claim(sid))
+        self.assertEqual(q.names(), [])
+        self.assertEqual(len(q.leases()), 1)
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
         self.assertEqual(self.mod.prune_conversation_filters(), [])
         self.assertTrue(os.path.exists(path))
 
@@ -3315,11 +3335,17 @@ class TestSpoolReaper(SpoolCase):
         path = self.conv_filter('daemon.c0123abcd', 0)
         sid = self.accept(self.env('conv-2'))
         self.mod.peer_queue('daemon.c0123abcd').drop(sid)
-        self.conv_filter('daemon.c0123abcd', 5)
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
         self.mod.spool_reap()
         self.assertFalse(os.path.exists(path))
         self.mod.spool_reap()
         self.assertFalse(os.path.exists(self.box('daemon.c0123abcd').root))
+
+    def test_startup_prunes_even_with_the_spool_off(self):
+        path = self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        self.mod.SPOOL_ENABLED = False
+        self.mod.spool_start_owner()
+        self.assertFalse(os.path.exists(path))
 
     def test_dedup_memory_expires(self):
         self.accept(self.env('seen-1'))

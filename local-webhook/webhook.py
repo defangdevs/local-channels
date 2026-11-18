@@ -2942,17 +2942,26 @@ CONVERSATION_KEY = re.compile(r'^.+\.c[0-9a-f]{8}$')
 
 def prune_conversation_filters(now=None):
     """Delete per-conversation filter files (`filter.<key>.c<8hex>.json`, made
-    by claude-send mode) whose subscriptions have all expired and whose inbox
-    holds nothing queued or leased. Nothing else removes them, and every
-    receiver fan-out and merge scan reads each one. Returns the keys removed.
+    by claude-send mode) whose subscriptions have all been expired for longer
+    than the inbox retention bound (SPOOL_PEER_MAX_S) and whose inbox holds
+    nothing queued or leased. Nothing else removes them, and every receiver
+    fan-out and merge scan reads each one. Returns the keys removed.
+
+    The grace period matters: fan-out and its retries match an event against
+    the filter as of the event's acceptance time, and an inbox record is kept
+    at most that long, so a filter expired for longer can no longer match any
+    record that is still being retried. The same bound is what write_filter
+    uses for mergeCommits.
 
     Only conversation-scoped keys are touched: a plain session's file is
-    owned by `session rm`, and a file with an entry that never expires
-    (pinned, or no timestamp yet) stays. An unreadable file stays too, so
-    nothing here fails open. The check runs again under the filter lock, so
-    a subscribe racing the prune keeps its file.
+    owned by `session rm`. An unreadable file stays, so nothing here fails
+    open. A session entry's pin (ttlHours 0) is already capped at
+    MAX_SESSION_TTL_HOURS by read_filter, so "expired" here means expired for
+    routing too. The check runs again under the filter lock, so a subscribe
+    racing the prune keeps its file.
     """
     now = now_ms() if now is None else now
+    cutoff = now - SPOOL_PEER_MAX_S * 1000
     removed = []
     for key in filter_keys():
         if not CONVERSATION_KEY.match(key):
@@ -2963,10 +2972,13 @@ def prune_conversation_filters(now=None):
                 f = read_filter(path)
                 if f['state'] not in ('ok', 'unconfigured'):
                     continue
-                if any(not entry_expired(e, f['ttlHours'], now) for e in f['topics']):
+                if any(not entry_expired(e, f['ttlHours'], cutoff) for e in f['topics']):
                     continue
                 q = peer_queue(key)
-                if q.names() or q.leases():
+                # A record moves new -> cur when claimed and cur -> new when a
+                # delivery fails; reading new, cur, new again cannot miss it in
+                # either direction.
+                if q.names() or q.leases() or q.names():
                     continue
                 try:
                     os.unlink(path)
