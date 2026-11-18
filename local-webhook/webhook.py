@@ -2940,6 +2940,19 @@ def filter_keys():
 CONVERSATION_KEY = re.compile(r'^.+\.c[0-9a-f]{8}$')
 
 
+def _queue_dirs_readable(q):
+    """False when new/ or cur/ exists but cannot be listed. A missing
+    directory is an empty queue; any other error is unknown."""
+    for d in (q.new, q.cur):
+        try:
+            os.listdir(d)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+    return True
+
+
 def prune_conversation_filters(now=None):
     """Delete per-conversation filter files (`filter.<key>.c<8hex>.json`, made
     by claude-send mode) whose subscriptions have all been expired for longer
@@ -2976,9 +2989,9 @@ def prune_conversation_filters(now=None):
                     continue
                 q = peer_queue(key)
                 # A record moves new -> cur when claimed and cur -> new when a
-                # delivery fails; reading new, cur, new again cannot miss it in
-                # either direction.
-                if q.names() or q.leases() or q.names():
+                # delivery fails; reading new, cur, new again cannot miss a
+                # single move. An unreadable queue is not an empty one.
+                if not _queue_dirs_readable(q) or q.names() or q.leases() or q.names():
                     continue
                 try:
                     os.unlink(path)

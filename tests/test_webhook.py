@@ -3323,6 +3323,23 @@ class TestSpoolReaper(SpoolCase):
         self.assertEqual(self.mod.prune_conversation_filters(), [])
         self.assertTrue(os.path.exists(path))
 
+    def test_an_unreadable_queue_keeps_the_filter(self):
+        from unittest import mock
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        self.accept(self.env('conv-unreadable'))
+        self.conv_filter('daemon.c0123abcd', self.long_ago() + 1)
+        real = os.listdir
+
+        def listdir(d):
+            if os.sep + 'cur' == d[-4:]:
+                raise PermissionError(13, 'denied', d)
+            return real(d)
+        self.box('daemon.c0123abcd').ensure()
+        with mock.patch.object(self.mod.os, 'listdir', listdir):
+            self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
     def test_a_corrupt_conversation_filter_is_kept(self):
         path = os.path.join(self.state, 'filter.daemon.c0123abcd.json')
         with open(path, 'w') as fh:
