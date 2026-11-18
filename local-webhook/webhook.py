@@ -3000,6 +3000,8 @@ def prune_conversation_filters(now=None):
                 removed.append(key)
         except OSError as e:
             print('local-webhook: could not prune filter for %s: %s' % (key, e), file=sys.stderr)
+    if removed:
+        reap_orphan_filter_locks()  # the lock files of the filters just removed
     return removed
 
 

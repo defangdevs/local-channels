@@ -3295,6 +3295,7 @@ class TestSpoolReaper(SpoolCase):
         plain = self.conv_filter('hook-old', self.long_ago() + 1)   # not a conversation key
         self.assertEqual(self.mod.prune_conversation_filters(), ['daemon.c0123abcd'])
         self.assertFalse(os.path.exists(gone))
+        self.assertFalse(os.path.exists(gone + '.lock'))   # no orphan lock left behind
         for p in (live, recent, plain):
             self.assertTrue(os.path.exists(p))
 
