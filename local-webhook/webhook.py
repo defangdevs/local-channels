@@ -2937,6 +2937,47 @@ def filter_keys():
     return sorted(keys)
 
 
+CONVERSATION_KEY = re.compile(r'^.+\.c[0-9a-f]{8}$')
+
+
+def prune_conversation_filters(now=None):
+    """Delete per-conversation filter files (`filter.<key>.c<8hex>.json`, made
+    by claude-send mode) whose subscriptions have all expired and whose inbox
+    holds nothing queued or leased. Nothing else removes them, and every
+    receiver fan-out and merge scan reads each one. Returns the keys removed.
+
+    Only conversation-scoped keys are touched: a plain session's file is
+    owned by `session rm`, and a file with an entry that never expires
+    (pinned, or no timestamp yet) stays. An unreadable file stays too, so
+    nothing here fails open. The check runs again under the filter lock, so
+    a subscribe racing the prune keeps its file.
+    """
+    now = now_ms() if now is None else now
+    removed = []
+    for key in filter_keys():
+        if not CONVERSATION_KEY.match(key):
+            continue
+        path = filter_path_of(key)
+        try:
+            with FILTER_LOCK, filter_file_lock(path):
+                f = read_filter(path)
+                if f['state'] not in ('ok', 'unconfigured'):
+                    continue
+                if any(not entry_expired(e, f['ttlHours'], now) for e in f['topics']):
+                    continue
+                q = peer_queue(key)
+                if q.names() or q.leases():
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+                removed.append(key)
+        except OSError as e:
+            print('local-webhook: could not prune filter for %s: %s' % (key, e), file=sys.stderr)
+    return removed
+
+
 def filter_accepts(path, env, at=None):
     """Would the session behind this filter receive `env` (as of `at`)?
 
@@ -3603,6 +3644,10 @@ def spool_reap(now_s=None):
         stale = [r for r in SPOOL_DISPATCH.aged() if r[2] == 'new' and now_s - r[1] > SPAWN_DEFER_MAX_S]
         _drop_logged(SPOOL_DISPATCH, stale, 'no LOCAL_WEBHOOK_SPAWN_CMD is configured to run them, '
                      'past LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=%d' % SPAWN_DEFER_MAX_S, 'standing watches')
+    try:
+        prune_conversation_filters()
+    except Exception as e:  # noqa: BLE001 — hygiene must not stop the reaper
+        print('local-webhook: filter prune failed: %s' % e, file=sys.stderr)
     # Session inboxes.
     try:
         boxes = os.listdir(SPOOL_PEERS)
@@ -3675,6 +3720,10 @@ def spool_start_owner():
     except Exception as e:  # noqa: BLE001 — hygiene must not keep the ingress down
         print('local-webhook: lock reap failed: %s' % e, file=sys.stderr)
     if not SPOOL_ENABLED:
+        try:
+            prune_conversation_filters()
+        except Exception as e:  # noqa: BLE001
+            print('local-webhook: filter prune failed: %s' % e, file=sys.stderr)
         return
     try:
         spool_recover()

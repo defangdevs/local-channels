@@ -3278,6 +3278,49 @@ class TestSpoolReaper(SpoolCase):
         self.mod.spool_reap()
         self.assertFalse(os.path.exists(self.mod.peer_queue('..').root))
 
+    def conv_filter(self, key, hours_ago, **kw):
+        at = self.mod.iso_at(self.mod.now_ms() - int(hours_ago * 3600e3))
+        e = {'topic': 'github:o/r', 'subscribedAt': at}
+        e.update(kw)
+        self.write_json('filter.%s.json' % key, {'ttlHours': 1, 'topics': [e]})
+        return os.path.join(self.state, 'filter.%s.json' % key)
+
+    def test_an_expired_conversation_filter_is_pruned(self):
+        gone = self.conv_filter('daemon.c0123abcd', 5)
+        live = self.conv_filter('daemon.c1123abcd', 0)
+        pinned = self.conv_filter('daemon.c2123abcd', 5, ttlHours=0)
+        plain = self.conv_filter('hook-old', 5)      # not a conversation key
+        self.assertEqual(self.mod.prune_conversation_filters(), ['daemon.c0123abcd'])
+        self.assertFalse(os.path.exists(gone))
+        for p in (live, pinned, plain):
+            self.assertTrue(os.path.exists(p))
+
+    def test_a_conversation_filter_with_queued_mail_is_kept(self):
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        self.accept(self.env('conv-1'))
+        self.conv_filter('daemon.c0123abcd', 5)
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_corrupt_conversation_filter_is_kept(self):
+        path = os.path.join(self.state, 'filter.daemon.c0123abcd.json')
+        with open(path, 'w') as fh:
+            fh.write('{nope')
+        self.assertEqual(self.mod.prune_conversation_filters(), [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_the_reaper_prunes_and_then_drops_the_empty_box(self):
+        self.quiet()
+        path = self.conv_filter('daemon.c0123abcd', 0)
+        sid = self.accept(self.env('conv-2'))
+        self.mod.peer_queue('daemon.c0123abcd').drop(sid)
+        self.conv_filter('daemon.c0123abcd', 5)
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(path))
+        self.mod.spool_reap()
+        self.assertFalse(os.path.exists(self.box('daemon.c0123abcd').root))
+
     def test_dedup_memory_expires(self):
         self.accept(self.env('seen-1'))
         seen = os.path.join(self.state, 'spool', 'seen', 'github~seen-1')
