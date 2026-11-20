@@ -804,10 +804,12 @@ async function serve() {
     whatsapp = socket;
     socket.ev.on('creds.update', saveCreds);
     socket.ev.on('messages.upsert', ({ messages, type }) => {
+      // The attach window is judged at arrival, not when the queue gets to it.
+      const arrivedAt = Date.now();
       inboundQueue = inboundQueue.then(async () => {
         if (type !== 'notify') return;
         for (const message of messages) {
-          const inbound = parseInbound(message, credentials.creds, state.sentIds, addressPrefix, Date.now() < (state.acceptMediaUntil || 0));
+          const inbound = parseInbound(message, credentials.creds, state.sentIds, addressPrefix, arrivedAt < (state.acceptMediaUntil || 0));
           if (!inbound || Object.hasOwn(state.messages, inbound.id)) continue;
           try {
             if (Object.values(state.messages).filter((m) => !m.reply && !m.clearedAt).length >= 200 && !(!inbound.attachment && inbound.text === '/clear')) throw new Error('inbox full');
