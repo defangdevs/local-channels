@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import WebSocket from 'ws';
 import pino from 'pino';
-import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, retireConversation, lastRoutedSession, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -131,6 +131,7 @@ async function resetCodexThread(binding) {
     ws.send(JSON.stringify({ method: 'initialized', params: {} }));
     const { thread } = await rpc('thread/read', { threadId: binding.session, includeTurns: false });
     if (!thread || thread.id !== binding.session) throw new Error('Codex returned a different current thread');
+    if (thread.status?.type === 'active') throw Object.assign(new Error('The conversation is busy; context was not changed'), { resetUnsupported: true });
     if (thread.historyMode !== 'paginated') throw Object.assign(new Error('In-process clear requires a paginated Codex thread; context was not changed'), { resetUnsupported: true });
     await rpc('thread/resume', { threadId: thread.id, excludeTurns: true,
       ...(thread.model ? { model: thread.model } : {}), ...(thread.modelProvider ? { modelProvider: thread.modelProvider } : {}) });
@@ -604,6 +605,22 @@ async function serve() {
     } finally { draining = false; }
   }
 
+  // Automatic routing keeps no pin: bind /clear to the exact session the router
+  // last used, and only if it is a registered, running Codex thread.
+  async function routedBinding(clearId) {
+    if (!routeCmd) return null;
+    const name = lastRoutedSession(state, clearId);
+    if (!name) return null;
+    const unsupported = (text) => Object.assign(new Error(text), { resetUnsupported: true });
+    const item = (await sessions()).find((entry) => entry.name === name);
+    if (!item) throw unsupported(`Routed session ${name} is unavailable; context was not changed`);
+    if (item.harness !== 'codex') throw unsupported('In-process clear is not supported for this Claude connection; context was not changed and no replacement harness was started');
+    if (item.stopped) throw unsupported(`Routed session ${name} is stopped; context was not changed`);
+    const registered = codexThreads()[name];
+    if (!registered?.thread) throw unsupported(`Routed session ${name} has no registered Codex thread; context was not changed`);
+    return { harness: 'codex', session: registered.thread, name };
+  }
+
   async function handleControls() {
     if (handlingControls) return;
     handlingControls = true;
@@ -619,11 +636,13 @@ async function serve() {
             saveState(dir, state);
             try {
               if (dispatchFinished) await dispatchFinished;
-              const binding = target();
+              let binding = target();
+              let routedTo = null;
+              if (!binding) { binding = await routedBinding(inbound.id); routedTo = binding?.name || null; }
               if (!binding) throw Object.assign(new Error('No selected conversation to clear'), { resetUnsupported: true });
               if (binding.harness !== 'codex') throw Object.assign(new Error('In-process clear is not supported for this Claude connection; context was not changed and no replacement harness was started'), { resetUnsupported: true });
               await resetCodexThread(binding);
-              retireConversation(state, inbound.id);
+              retireConversation(state, inbound.id, routedTo);
               saveState(dir, state);
               delete state.resetUncertain;
               state.resetPending = Object.values(state.messages).find((entry) => entry.id !== inbound.id && entry.control && entry.text === '/clear' && !entry.reply && !entry.clearedAt)?.id || null;

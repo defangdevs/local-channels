@@ -105,18 +105,31 @@ export function addInbound(state, inbound) {
 
 // Retain the old transcript/attachments for inspection, but never route old
 // unanswered messages or accept late replies after a context reset.
-export function retireConversation(state, clearId) {
+// With `routedTo`, retire only the messages the router sent to that session;
+// every other conversation (and the media window) is left alone.
+export function retireConversation(state, clearId, routedTo = null) {
   if (!Object.hasOwn(state.messages, clearId)) throw new Error('unknown clear message');
   const clearedAt = new Date().toISOString();
   for (const entry of Object.values(state.messages)) {
     if (entry.id === clearId) break;
     if (entry.clearedAt) continue;
+    if (routedTo && entry.routedTo !== routedTo) continue;
     entry.clearedAt = clearedAt;
     if (entry.ack?.status === 'queued') entry.ack.status = 'cleared';
     if (entry.debugAck?.status === 'queued') entry.debugAck.status = 'cleared';
     if (entry.reply?.status === 'queued') entry.reply.status = 'cleared';
   }
-  state.acceptMediaUntil = 0;
+  if (!routedTo) state.acceptMediaUntil = 0;
+}
+
+// The session of the newest uncleared message the router delivered before the clear.
+export function lastRoutedSession(state, clearId) {
+  let found = null;
+  for (const entry of Object.values(state.messages)) {
+    if (entry.id === clearId) break;
+    if (!entry.clearedAt && entry.routedTo) found = entry.routedTo;
+  }
+  return found;
 }
 
 export function publicMessage(entry) {

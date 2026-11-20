@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync, unlinkSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -917,4 +917,26 @@ test('a hung route command is stopped at the deadline and retried later', async 
     const status = spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' });
     assert.equal(status.status, 0, status.stderr);
   } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+
+test('/clear with automatic routing resets only the last routed Codex conversation', async () => {
+  const f = await resetFixture();
+  unlinkSync(join(f.state, 'target.json'));
+  const route = join(f.dir, 'route.sh');
+  writeFileSync(route, '#!/bin/sh\nexit 1\n'); chmodSync(route, 0o700);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    other: { id: 'other', chat: '14155551234@s.whatsapp.net', text: 'other topic', reply: null, deliveredTo: 'route:elsewhere', routedTo: 'elsewhere' },
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'SECRET_OLD_CONTEXT', reply: null, deliveredTo: 'route:existing', routedTo: 'existing' },
+  }, sentIds: {}, acceptMediaUntil: Date.now() + 600000 }));
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route } });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('Context cleared'), 'reset confirmation');
+    assert.deepEqual(f.calls.find((m) => m.method === 'thread/revert').params, { threadId: 'old-thread', beforeTurnId: 'first-turn' });
+    assert.equal(existsSync(f.lifecycle), false);
+    assert.equal(existsSync(join(f.state, 'target.json')), false, 'no explicit pin is created');
+    const saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(saved.messages.old.clearedAt);
+    assert.equal(saved.messages.other.clearedAt, undefined);
+    assert.ok(saved.acceptMediaUntil > 0);
+  } finally { await stop(daemon); await f.cleanup(); }
 });

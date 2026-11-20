@@ -243,6 +243,12 @@ Codex histories currently report an unsupported-operation error instead of
 silently starting another harness; the current conversation remains usable. If the server rejects clearing an active
 turn, retry `/clear` once that turn has finished.
 
+With automatic routing and no `/target` pin, `/clear` applies to the session the
+router last delivered to, and only if it is a running Codex session with a
+registered thread that is not mid-turn. Otherwise nothing changes and the reply
+says why. Only messages routed to that session are retired; other conversations,
+the upload window and any explicit pin are untouched, and no pin is created.
+
 Old pending WhatsApp messages are retired, queued replies are suppressed,
 and late text/image replies for old messages are rejected. The upload window
 closes. A persisted routing barrier blocks input after a failed or interrupted
