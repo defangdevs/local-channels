@@ -926,7 +926,7 @@ test('/clear with automatic routing resets only the last routed Codex conversati
   writeFileSync(route, '#!/bin/sh\nexit 1\n'); chmodSync(route, 0o700);
   writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
     other: { id: 'other', chat: '14155551234@s.whatsapp.net', text: 'other topic', reply: null, deliveredTo: 'route:elsewhere', routedTo: 'elsewhere' },
-    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'SECRET_OLD_CONTEXT', reply: null, deliveredTo: 'route:existing', routedTo: 'existing' },
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'SECRET_OLD_CONTEXT', reply: null, deliveredTo: 'route:existing', routedTo: 'existing', routedThread: 'old-thread' },
   }, sentIds: {}, acceptMediaUntil: Date.now() + 600000 }));
   const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route } });
   try {
@@ -973,5 +973,20 @@ test('/clear under routing releases the barrier when the session listing fails b
     await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('Box:'), 'failure reply');
     await waitUntil(() => { const s = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')); return s.resetPending === null; }, 'barrier released');
     assert.equal(f.calls.length, 0);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+
+test('/clear under routing refuses when the routed thread identity was never recorded', async () => {
+  const f = await resetFixture();
+  unlinkSync(join(f.state, 'target.json'));
+  const route = join(f.dir, 'route.sh');
+  writeFileSync(route, '#!/bin/sh\nexit 1\n'); chmodSync(route, 0o700);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'x', reply: null, deliveredTo: 'route:existing', routedTo: 'existing' },
+  }, sentIds: {} }));
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route } });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('is unknown'), 'unknown-thread refusal');
+    assert.equal(f.calls.some((m) => m.method === 'thread/revert'), false);
   } finally { await stop(daemon); await f.cleanup(); }
 });

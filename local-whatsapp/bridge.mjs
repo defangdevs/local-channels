@@ -485,6 +485,7 @@ async function serve() {
           message.routeInFlight = true;
           saveState(dir, state);
           let decision;
+          const threadsBefore = (() => { try { return codexThreads(); } catch { return {}; } })();
           try { decision = await routeMessage(message, state); }
           catch (error) {
             delete message.routeInFlight;
@@ -497,7 +498,12 @@ async function serve() {
           delete message.routeRetryAt;
           message.deliveredTo = `route:${decision.session}`;
           message.routedTo = decision.session;
-          try { const thread = codexThreads()[decision.session]?.thread; if (thread) message.routedThread = thread; } catch { /* not a registered Codex session */ }
+          // Record the thread only if the registry agrees before and after delivery;
+          // otherwise its identity at delivery time is unknown and /clear refuses.
+          try {
+            const thread = threadsBefore[decision.session]?.thread;
+            if (thread && codexThreads()[decision.session]?.thread === thread) message.routedThread = thread;
+          } catch { /* not a registered Codex session */ }
           if (debugReceipts) {
             const action = typeof decision.action === 'string' ? decision.action.slice(0, 20) : '';
             message.debugRoute = { text: `Box: ${message.id} -> ${decision.session}${action ? ` (${action})` : ''}`, status: 'queued' };
@@ -627,7 +633,8 @@ async function serve() {
     if (!registered?.thread) throw unsupported(`Routed session ${name} has no registered Codex thread; context was not changed`);
     // The thread must be the one the messages were routed to, not a later registration.
     const routedThread = saved?.thread || Object.values(state.messages).filter((entry) => entry.routedTo === name && !entry.clearedAt && entry.routedThread).at(-1)?.routedThread;
-    if (routedThread && routedThread !== registered.thread) throw unsupported(`Routed session ${name} was replaced by another Codex thread; context was not changed`);
+    if (!routedThread) throw unsupported(`The Codex thread that received the routed messages for ${name} is unknown; context was not changed`);
+    if (routedThread !== registered.thread) throw unsupported(`Routed session ${name} was replaced by another Codex thread; context was not changed`);
     return { harness: 'codex', session: registered.thread, name };
   }
 
