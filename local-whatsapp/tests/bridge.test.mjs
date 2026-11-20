@@ -990,3 +990,20 @@ test('/clear under routing refuses when the routed thread identity was never rec
     assert.equal(f.calls.some((m) => m.method === 'thread/revert'), false);
   } finally { await stop(daemon); await f.cleanup(); }
 });
+
+test('/clear under routing refuses when the newest routed message has no recorded thread, even if an older one does', async () => {
+  const f = await resetFixture();
+  unlinkSync(join(f.state, 'target.json'));
+  const route = join(f.dir, 'route.sh');
+  writeFileSync(route, '#!/bin/sh\nexit 1\n'); chmodSync(route, 0o700);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    a: { id: 'a', chat: '14155551234@s.whatsapp.net', text: 'x', reply: null, deliveredTo: 'route:existing', routedTo: 'existing', routedThread: 'old-thread' },
+    b: { id: 'b', chat: '14155551234@s.whatsapp.net', text: 'y', reply: null, deliveredTo: 'route:existing', routedTo: 'existing' },
+  }, sentIds: {} }));
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route } });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('is unknown'), 'unknown-thread refusal');
+    assert.equal(f.calls.some((m) => m.method === 'thread/revert'), false);
+    assert.equal(JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).messages.a.clearedAt, undefined);
+  } finally { await stop(daemon); await f.cleanup(); }
+});

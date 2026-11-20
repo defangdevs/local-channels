@@ -632,7 +632,10 @@ async function serve() {
     const registered = threads[name];
     if (!registered?.thread) throw unsupported(`Routed session ${name} has no registered Codex thread; context was not changed`);
     // The thread must be the one the messages were routed to, not a later registration.
-    const routedThread = saved?.thread || Object.values(state.messages).filter((entry) => entry.routedTo === name && !entry.clearedAt && entry.routedThread).at(-1)?.routedThread;
+    // Every message about to be retired must have gone to this same thread; an
+    // unrecorded one (newest or not) means the identity is unknown.
+    const threadsSeen = new Set(Object.values(state.messages).filter((entry) => entry.routedTo === name && !entry.clearedAt).map((entry) => entry.routedThread || ''));
+    const routedThread = saved?.thread || (threadsSeen.size === 1 ? [...threadsSeen][0] : '');
     if (!routedThread) throw unsupported(`The Codex thread that received the routed messages for ${name} is unknown; context was not changed`);
     if (routedThread !== registered.thread) throw unsupported(`Routed session ${name} was replaced by another Codex thread; context was not changed`);
     return { harness: 'codex', session: registered.thread, name };
