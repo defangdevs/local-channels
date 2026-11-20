@@ -100,3 +100,59 @@ test('plain mode accepts captionless media only from the owner self-chat', () =>
   assert.equal(parseInbound(video, creds, {}), null);
   assert.equal(parseInbound(video, creds, {}, '@box', true).attachment.kind, 'video');
 });
+
+import { pendingTranscription, finishTranscription, MAX_TRANSCRIBE_ATTEMPTS } from '../state.mjs';
+
+function voice(overrides = {}) {
+  return raw({ audioMessage: { ptt: true, mimetype: 'audio/ogg; codecs=opus', fileLength: 3, ...overrides } });
+}
+
+test('voice notes: captionless accepted in plain mode, gated by the attach window with a prefix', () => {
+  const plain = parseInbound(voice(), creds, {}, '');
+  assert.equal(plain.attachment.kind, 'voice');
+  assert.equal(plain.text, '');
+  assert.equal(plain.transcription.status, 'pending');
+  assert.equal(parseInbound(voice(), creds, {}, '@box'), null);
+  assert.ok(parseInbound(voice(), creds, {}, '@box', true).transcription);
+  assert.equal(parseInbound(raw(voice().message, { fromMe: false }), creds, {}, ''), null);
+  assert.equal(parseInbound(raw(voice().message, { remoteJid: '456@s.whatsapp.net' }), creds, {}, ''), null);
+  assert.equal(parseInbound(raw({ viewOnceMessage: { message: voice().message } }), creds, {}, ''), null);
+  assert.equal(parseInbound(media(), creds, {}).transcription, undefined);
+});
+
+test('voice note audio is stored as .ogg and transcript becomes the text, in arrival order', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wa-voice-'));
+  try {
+    const first = parseInbound(voice(), creds, {}, '');
+    const second = parseInbound(raw({ conversation: 'later' }, { id: 'T2' }), creds, {}, '');
+    await receiveAttachment(dir, first, async () => Readable.from([Buffer.from('abc')]));
+    assert.match(first.attachment.path, /\.ogg$/);
+    const state = loadState(dir); addInbound(state, first); addInbound(state, second);
+    assert.equal(pendingTranscription(state).id, first.id);
+    assert.equal(finishTranscription(first, { text: '  what is\nthe weather ' }), 'done');
+    assert.equal(first.text, 'what is the weather');
+    assert.equal(pendingTranscription(state), null);
+    cleanMediaInbox(dir, state);
+    assert.equal(readdirSync(join(dir, 'media-inbox')).length, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('transcription failures retry, then tell the sender; empty speech counts as failure', () => {
+  const entry = parseInbound(voice(), creds, {}, '');
+  assert.equal(finishTranscription(entry, { error: 'boom' }, 1000, 50), 'retry');
+  assert.equal(entry.transcription.retryAt, 1050);
+  assert.equal(entry.transcription.status, 'pending');
+  assert.equal(finishTranscription(entry, { text: '   ' }), 'retry');
+  for (let i = entry.transcription.attempts; i < MAX_TRANSCRIBE_ATTEMPTS - 1; i++) finishTranscription(entry, { error: 'boom' });
+  assert.equal(finishTranscription(entry, { error: 'boom' }), 'failed');
+  assert.equal(entry.transcription.status, 'failed');
+  assert.equal(entry.reply.status, 'queued');
+  assert.match(entry.reply.text, /could not transcribe/);
+  assert.equal(entry.text, '');
+  const state = { messages: { [entry.id]: entry } };
+  assert.equal(pendingTranscription(state), null);
+  const bad = parseInbound(voice(), creds, {}, '');
+  bad.transcription.permanent = true;
+  assert.equal(finishTranscription(bad, { error: 'attachment exceeds 20 MiB limit' }), 'failed');
+  assert.match(bad.reply.text, /20 MiB/);
+});

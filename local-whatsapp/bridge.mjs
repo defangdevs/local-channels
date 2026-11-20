@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import WebSocket from 'ws';
 import pino from 'pino';
-import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, pendingTranscription, finishTranscription, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -43,6 +43,9 @@ const routeCmd = process.env.LOCAL_WHATSAPP_ROUTE_CMD || '';
 if (routeCmd && !isAbsolute(routeCmd)) throw new Error('LOCAL_WHATSAPP_ROUTE_CMD must be an absolute path');
 const ROUTE_TIMEOUT_MS = Number(process.env.LOCAL_WHATSAPP_ROUTE_TIMEOUT_MS) || 180000;   // one model call plus, for a new topic, a session start
 const ROUTE_RETRY_MS = 30000;
+// Voice notes are transcribed on this box; the audio never goes to a service.
+const transcribeCmd = process.env.LOCAL_WHATSAPP_TRANSCRIBE_CMD || 'agent-box-transcribe';
+const TRANSCRIBE_TIMEOUT_MS = 10 * 60 * 1000;
 const ROUTE_RECENT = 50;
 
 function target() {
@@ -199,6 +202,33 @@ async function sessionCommand(args) {
       if (code !== 0) return reject(new Error(error.trim() || 'WhatsApp session command failed'));
       try { resolve(JSON.parse(output)); }
       catch (failure) { reject(failure); }
+    });
+  });
+}
+
+// Run the transcriber on one saved audio file; resolves with its stdout.
+function transcribeFile(path) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(transcribeCmd, [path], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let error = '';
+    let settled = false;
+    const finish = (failure, text) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (failure) reject(failure); else resolve(text);
+    };
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(new Error(`transcription timed out after ${TRANSCRIBE_TIMEOUT_MS / 60000} minutes`));
+    }, TRANSCRIBE_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => { output = (output + chunk.toString()).slice(0, 100000); });
+    child.stderr.on('data', (chunk) => { error = (error + chunk.toString()).slice(-500); });
+    child.on('error', (failure) => finish(failure));
+    child.on('close', (code) => {
+      if (code !== 0) return finish(new Error(error.trim() || `transcriber exited ${code}`));
+      finish(null, output);
     });
   });
 }
@@ -461,6 +491,26 @@ async function serve() {
     });
   }
 
+  // Oldest voice note first, so a later message never overtakes it. A failed
+  // attempt is retried after a delay, and a bridge that died mid-transcription
+  // simply finds the note still pending.
+  let transcribing = false;
+  async function processTranscriptions() {
+    if (transcribing) return;
+    transcribing = true;
+    try {
+      for (let entry = pendingTranscription(state); entry; entry = pendingTranscription(state)) {
+        if (Date.now() < (entry.transcription.retryAt || 0)) break;
+        let result;
+        try { result = { text: await transcribeFile(entry.attachment.path) }; }
+        catch (error) { result = { error: error.message }; }
+        if (result.error) process.stderr.write(`transcription failed for ${entry.id}: ${result.error}\n`);
+        if (finishTranscription(entry, result) === 'retry') { saveState(dir, state); break; }
+        saveState(dir, state);
+      }
+    } finally { transcribing = false; }
+  }
+
   async function dispatch() {
     if (dispatching || resetting || state.resetPending) return;
     dispatching = true;
@@ -474,6 +524,7 @@ async function serve() {
         for (const message of Object.values(state.messages)) {
           if (resetting || state.resetPending) break;
           if (message.reply || message.control || message.clearedAt || message.deliveredTo) continue;
+          if (message.transcription?.status === 'pending') break;
           // The retry delay counts from the end of the failed attempt
           // (routeRetryAt); lastAttemptAt covers a bridge that died mid-call.
           if (Date.now() < (message.routeRetryAt || 0) ||
@@ -509,6 +560,7 @@ async function serve() {
       for (const message of Object.values(state.messages)) {
         if (resetting || state.resetPending) break;
         if (message.reply || message.control || message.clearedAt) continue;
+        if (message.transcription?.status === 'pending') break;
         if (binding.harness === 'claude') {
           for (const [peer, info] of peers) {
             if (info.session !== binding.session || message.deliveredTo === info.id) continue;
@@ -757,6 +809,10 @@ async function serve() {
             if (inbound.attachment) {
               await receiveAttachment(dir, inbound, () => downloadMediaMessage(message, 'stream', { options: { timeout: 60000 } }, { logger, reuploadRequest: socket.updateMediaMessage }));
             }
+            if (inbound.transcription && inbound.attachment.error) {
+              inbound.transcription.permanent = true;
+              finishTranscription(inbound, { error: inbound.attachment.error });
+            }
             const control = !inbound.attachment && (inbound.text === '/clear' || inbound.text === '/attach' || inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
               inbound.text.startsWith('/profile'));
             if (control) {
@@ -770,6 +826,7 @@ async function serve() {
               saveState(dir, state);
               if (control) await handleControls();
               else {
+                await processTranscriptions();
                 let dispatchError = null;
                 try { await dispatch(); }
                 catch (error) { dispatchError = error; }
@@ -809,6 +866,8 @@ async function serve() {
   }
   const interval = setInterval(() => {
     handleControls().catch((error) => process.stderr.write(`control failed: ${error.message}\n`));
+    processTranscriptions().then(() => dispatch()).then(() => drainReplies())
+      .catch((error) => process.stderr.write(`transcription pass failed: ${error.message}\n`));
     dispatch().catch((error) => process.stderr.write(`dispatch failed: ${error.message}\n`));
     drainReplies().catch((error) => process.stderr.write(`reply drain failed: ${error.message}\n`));
   }, 3000);

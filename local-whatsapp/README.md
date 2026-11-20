@@ -217,6 +217,16 @@ and contents are untrusted data; the bridge never executes or extracts files.
 A download failure is delivered as an attachment error, so the agent can ask
 for a resend. Files stay private on this box and are not put in downloads.
 
+Voice notes are transcribed on this box with `agent-box-transcribe` (override
+with `LOCAL_WHATSAPP_TRANSCRIBE_CMD`); the audio is never sent to an outside
+service. The transcript becomes the message text, and routing waits for it, so
+the router sees the spoken request and a later message never overtakes an
+earlier voice note. A voice note follows the media rules above: with an empty
+prefix it is accepted as is, and with a prefix it needs the `/attach` window,
+because audio has no caption. A failed attempt is retried (three tries, 30
+seconds apart, and again after a restart). If it still fails, or the download
+fails, or no speech is found, the bridge replies in WhatsApp so you can resend.
+
 The media inbox is capped at 200 MiB. Files are kept while their message is
 retained; files for pruned messages and interrupted downloads are cleaned on
 startup and after replies. Copy files elsewhere if they need to be preserved.
