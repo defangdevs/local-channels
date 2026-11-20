@@ -202,12 +202,12 @@ success can cause a duplicate. Inbound images and documents are supported as des
 
 Send an image, video, or document to Message Yourself with a caption beginning with
 `@agent ` (replace `agent` with the bridge Linux username). A caption of just
-`@agent` also works. Attachments from other chats are ignored. To upload without a caption, first
-send `@agent /attach` as a text message. This enables captionless media in your
-self-chat for 10 minutes. The agent can enable the same window with
-`node bridge.mjs receive-files`. Outside that window, media needs an explicit
-prefix. Plain text, when enabled, is accepted independently of the upload
-window. View-once media is not imported.
+`@agent` also works. Attachments from other chats are ignored. When the prefix is empty, media in
+Message Yourself is accepted without a caption. With a non-empty prefix, to
+upload without a caption, first send `@agent /attach` as a text message. This
+enables captionless media in your self-chat for 10 minutes. The agent can enable
+the same window with `node bridge.mjs receive-files`. Outside that window, media
+needs an explicit prefix. View-once media is not imported.
 
 The bridge downloads at most 20 MiB per attachment, streams it into its private
 `media-inbox` directory, and includes the absolute path and metadata in the

@@ -76,7 +76,6 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   const head = `${prefix} `;
   const prefixed = !plain && (fullText.toLowerCase().startsWith(head.toLowerCase()) || fullText.toLowerCase() === prefix.toLowerCase());
   if (!prefixed && !plain && !(media && allowBareMedia)) return null;
-  if (plain && media && !fullText.trim() && !allowBareMedia) return null;
   const text = (prefixed ? fullText.slice(head.length) : fullText).trim();
   if (text.length > MAX_TEXT || (!text && !media)) return null;
   return {
