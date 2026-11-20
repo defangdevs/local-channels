@@ -940,3 +940,38 @@ test('/clear with automatic routing resets only the last routed Codex conversati
     assert.ok(saved.acceptMediaUntil > 0);
   } finally { await stop(daemon); await f.cleanup(); }
 });
+
+test('/clear under routing refuses a session whose Codex thread was replaced since routing', async () => {
+  const f = await resetFixture();
+  unlinkSync(join(f.state, 'target.json'));
+  const route = join(f.dir, 'route.sh');
+  writeFileSync(route, '#!/bin/sh\nexit 1\n'); chmodSync(route, 0o700);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'SECRET_OLD_CONTEXT', reply: null, deliveredTo: 'route:existing', routedTo: 'existing', routedThread: 'earlier-thread' },
+  }, sentIds: {}, acceptMediaUntil: Date.now() + 600000 }));
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route } });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('was replaced'), 'replaced-thread refusal');
+    assert.equal(f.calls.some((m) => m.method === 'thread/revert'), false);
+    const saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.equal(saved.messages.old.clearedAt, undefined);
+    assert.equal(saved.resetPending, null);
+  } finally { await stop(daemon); await f.cleanup(); }
+});
+
+test('/clear under routing releases the barrier when the session listing fails before any reset', async () => {
+  const f = await resetFixture();
+  unlinkSync(join(f.state, 'target.json'));
+  writeFileSync(f.sessionBin, '#!/bin/sh\nexit 1\n');
+  const route = join(f.dir, 'route.sh');
+  writeFileSync(route, '#!/bin/sh\nexit 1\n'); chmodSync(route, 0o700);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', text: 'x', reply: null, deliveredTo: 'route:existing', routedTo: 'existing' },
+  }, sentIds: {} }));
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env: { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route } });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('Box:'), 'failure reply');
+    await waitUntil(() => { const s = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')); return s.resetPending === null; }, 'barrier released');
+    assert.equal(f.calls.length, 0);
+  } finally { await stop(daemon); await f.cleanup(); }
+});

@@ -497,6 +497,7 @@ async function serve() {
           delete message.routeRetryAt;
           message.deliveredTo = `route:${decision.session}`;
           message.routedTo = decision.session;
+          try { const thread = codexThreads()[decision.session]?.thread; if (thread) message.routedThread = thread; } catch { /* not a registered Codex session */ }
           if (debugReceipts) {
             const action = typeof decision.action === 'string' ? decision.action.slice(0, 20) : '';
             message.debugRoute = { text: `Box: ${message.id} -> ${decision.session}${action ? ` (${action})` : ''}`, status: 'queued' };
@@ -609,15 +610,24 @@ async function serve() {
   // last used, and only if it is a registered, running Codex thread.
   async function routedBinding(clearId) {
     if (!routeCmd) return null;
-    const name = lastRoutedSession(state, clearId);
-    if (!name) return null;
     const unsupported = (text) => Object.assign(new Error(text), { resetUnsupported: true });
-    const item = (await sessions()).find((entry) => entry.name === name);
+    const preflight = (error) => { throw Object.assign(error, { resetUnsupported: true }); };
+    // A replayed /clear (restart before completion) reuses the binding saved with
+    // the barrier: the first pass already retired the messages it was derived from.
+    const saved = state.resetPending === clearId ? state.resetBinding : null;
+    const name = saved?.name || lastRoutedSession(state, clearId);
+    if (!name) return null;
+    const item = (await sessions().catch(preflight)).find((entry) => entry.name === name);
     if (!item) throw unsupported(`Routed session ${name} is unavailable; context was not changed`);
     if (item.harness !== 'codex') throw unsupported('In-process clear is not supported for this Claude connection; context was not changed and no replacement harness was started');
     if (item.stopped) throw unsupported(`Routed session ${name} is stopped; context was not changed`);
-    const registered = codexThreads()[name];
+    let threads;
+    try { threads = codexThreads(); } catch (error) { preflight(error); }
+    const registered = threads[name];
     if (!registered?.thread) throw unsupported(`Routed session ${name} has no registered Codex thread; context was not changed`);
+    // The thread must be the one the messages were routed to, not a later registration.
+    const routedThread = saved?.thread || Object.values(state.messages).filter((entry) => entry.routedTo === name && !entry.clearedAt && entry.routedThread).at(-1)?.routedThread;
+    if (routedThread && routedThread !== registered.thread) throw unsupported(`Routed session ${name} was replaced by another Codex thread; context was not changed`);
     return { harness: 'codex', session: registered.thread, name };
   }
 
@@ -638,13 +648,19 @@ async function serve() {
               if (dispatchFinished) await dispatchFinished;
               let binding = target();
               let routedTo = null;
-              if (!binding) { binding = await routedBinding(inbound.id); routedTo = binding?.name || null; }
+              if (!binding) {
+                binding = await routedBinding(inbound.id);
+                routedTo = binding?.name || null;
+                // Persist the resolved binding before any mutation, so recovery resets the same thread.
+                if (binding && (state.resetBinding?.name !== binding.name || state.resetBinding?.thread !== binding.session)) { state.resetBinding = { name: binding.name, thread: binding.session }; saveState(dir, state); }
+              }
               if (!binding) throw Object.assign(new Error('No selected conversation to clear'), { resetUnsupported: true });
               if (binding.harness !== 'codex') throw Object.assign(new Error('In-process clear is not supported for this Claude connection; context was not changed and no replacement harness was started'), { resetUnsupported: true });
               await resetCodexThread(binding);
               retireConversation(state, inbound.id, routedTo);
               saveState(dir, state);
               delete state.resetUncertain;
+              delete state.resetBinding;
               state.resetPending = Object.values(state.messages).find((entry) => entry.id !== inbound.id && entry.control && entry.text === '/clear' && !entry.reply && !entry.clearedAt)?.id || null;
               queueReply(state, inbound.id, 'Context cleared in the existing Codex thread and process. The system/workspace instructions and settings remain; previous chat turns have been removed.');
             } finally { resetting = false; }
@@ -684,7 +700,7 @@ async function serve() {
           }
         } catch (error) {
           if (inbound.text === '/clear' && !error.resetUnsupported) state.resetUncertain = true; // possibly mutated: keep barrier until a /clear succeeds
-          else if (error.resetUnsupported && !state.resetUncertain) state.resetPending = null;
+          else if (error.resetUnsupported && !state.resetUncertain) { state.resetPending = null; delete state.resetBinding; }
           queueReply(state, inbound.id, `Box: ${error.message}`);
         }
         saveState(dir, state);
