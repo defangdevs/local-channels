@@ -1007,3 +1007,20 @@ test('/clear under routing refuses when the newest routed message has no recorde
     assert.equal(JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8')).messages.a.clearedAt, undefined);
   } finally { await stop(daemon); await f.cleanup(); }
 });
+
+test('/clear under routing refuses when the thread registry changes while the router runs', async () => {
+  const f = await resetFixture();
+  unlinkSync(join(f.state, 'target.json'));
+  const route = join(f.dir, 'route.sh');
+  writeFileSync(route, `#!/bin/sh\ncat >/dev/null\nprintf '%s' '{"existing":{"thread":"replacement-thread"}}' > "$LOCAL_WHATSAPP_STATE_DIR/codex-threads.json"\nprintf '%s' '{"session":"existing","action":"followup"}'\n`);
+  chmodSync(route, 0o700);
+  writeFileSync(join(f.state, 'messages.json'), JSON.stringify({ messages: {}, sentIds: {} }));
+  const env = { ...f.env, LOCAL_WHATSAPP_ROUTE_CMD: route, FAKE_INBOUND_TEXT: 'hello', FAKE_FOLLOWUP_TEXT: '/clear' };
+  const daemon = spawn(process.execPath, [join(f.dir, 'bridge.mjs'), 'serve'], { env });
+  try {
+    await waitUntil(() => existsSync(f.fakeOut) && readFileSync(f.fakeOut, 'utf8').includes('is unknown'), 'unknown-thread refusal');
+    assert.equal(f.calls.some((m) => m.method === 'thread/revert'), false);
+    const saved = JSON.parse(readFileSync(join(f.state, 'messages.json'), 'utf8'));
+    assert.ok(Object.values(saved.messages).some((m) => m.routedTo === 'existing' && !m.routedThread && !m.clearedAt));
+  } finally { await stop(daemon); await f.cleanup(); }
+});
