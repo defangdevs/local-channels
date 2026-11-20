@@ -67,7 +67,8 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   if (!key?.id || !key?.fromMe || !ownChatIds(credentials).includes(chat)) return null;
   if (Object.hasOwn(sentIds, `wa:${key.id}`)) return null;
   const content = contentOf(message.message);
-  const media = content?.imageMessage || content?.documentMessage || content?.videoMessage;
+  const voice = content?.audioMessage;
+  const media = content?.imageMessage || content?.documentMessage || content?.videoMessage || voice;
   const fullText = content?.conversation || content?.extendedTextMessage?.text || media?.caption || '';
   if (typeof fullText !== 'string' || fullText.length > MAX_TEXT + prefix.length + 1) return null;
   // An empty prefix means plain mode: the owner self-chat is already checked
@@ -78,17 +79,20 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   if (!prefixed && !plain && !(media && allowBareMedia)) return null;
   const text = (prefixed ? fullText.slice(head.length) : fullText).trim();
   if (text.length > MAX_TEXT || (!text && !media)) return null;
+  const kind = voice ? 'voice' : content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document';
   return {
     id: createHash('sha256').update(`${chat}\0${key.id}`).digest('hex').slice(0, 24),
     chat,
     reactionKey: { remoteJid: key.remoteJid, id: key.id, fromMe: true },
     text,
     ...(media ? { attachment: {
-      kind: content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document',
-      name: String(media.fileName || (content.imageMessage ? 'image' : content.videoMessage ? 'video' : 'document')).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200),
+      kind,
+      name: String(media.fileName || kind).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200),
       mimeType: String(media.mimetype || 'application/octet-stream').slice(0, 100),
       declaredSize: Number(media.fileLength || 0),
     } } : {}),
+    // A voice note is routed only after its speech is turned into text.
+    ...(voice ? { transcription: { status: 'pending', attempts: 0 } } : {}),
     receivedAt: new Date().toISOString(),
     deliveredTo: null,
     reply: null,
@@ -159,7 +163,7 @@ export async function receiveAttachment(dir, inbound, download) {
     if (!size) throw new Error('attachment is empty');
     closeSync(fd); fd = undefined;
     // Images get an extension for local image viewers; documents are opaque.
-    const ext = attachment.kind === 'image' ? ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[attachment.mimeType] || '.bin') : attachment.kind === 'video' && attachment.mimeType === 'video/mp4' ? '.mp4' : '.bin';
+    const ext = attachment.kind === 'voice' ? '.ogg' : attachment.kind === 'image' ? ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[attachment.mimeType] || '.bin') : attachment.kind === 'video' && attachment.mimeType === 'video/mp4' ? '.mp4' : '.bin';
     const path = join(mediaDir, inbound.id + ext);
     renameSync(temporary, path); temporary = undefined;
     attachment.path = path;
@@ -180,8 +184,43 @@ export function cleanMediaInbox(dir, state, removePartial = false) {
   const retained = new Set(Object.values(state.messages).map((m) => m.attachment?.path));
   for (const name of readdirSync(mediaDir)) {
     const path = join(mediaDir, name);
-    if (/^[a-f0-9]{24}\.(part|bin|jpg|png|webp|mp4)$/.test(name) && (removePartial || !name.endsWith('.part')) && !retained.has(path)) unlinkSync(path);
+    if (/^[a-f0-9]{24}\.(part|bin|jpg|png|webp|mp4|ogg)$/.test(name) && (removePartial || !name.endsWith('.part')) && !retained.has(path)) unlinkSync(path);
   }
+}
+
+export const MAX_TRANSCRIBE_ATTEMPTS = 3;
+
+// The next voice note still waiting for its transcript, in arrival order.
+export function pendingTranscription(state) {
+  return Object.values(state.messages).find((m) => m.transcription?.status === 'pending' && !m.reply && !m.clearedAt) || null;
+}
+
+// Record one transcription attempt. Returns 'done', 'retry' or 'failed'. A
+// failed note gets a queued WhatsApp reply (so the sender is told) and, with
+// the reply set, is never routed as an empty message.
+export function finishTranscription(entry, { text, error }, now = Date.now(), retryMs = 30000, state = null) {
+  const t = entry.transcription;
+  t.attempts = (t.attempts || 0) + 1;
+  const spoken = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  if (!error && spoken) {
+    entry.text = spoken.slice(0, MAX_TEXT);
+    t.status = 'done';
+    delete t.error; delete t.retryAt;
+    return 'done';
+  }
+  t.error = String(error || 'no speech detected').slice(0, 300);
+  if (t.attempts < MAX_TRANSCRIBE_ATTEMPTS && !t.permanent) {
+    t.retryAt = now + retryMs;
+    return 'retry';
+  }
+  // Same backpressure as queueReply: keep the barrier until the reply fits.
+  if (state && Object.values(state.messages).filter((m) => m.reply?.status === 'queued').length >= MAX_OUTBOX) {
+    t.retryAt = now + retryMs;
+    return 'retry';
+  }
+  t.status = 'failed';
+  entry.reply = { text: `Box: I could not transcribe your voice note (${t.error}). Please send it again or type the request.`, status: 'queued' };
+  return 'failed';
 }
 
 export function queueReply(state, id, text) {
