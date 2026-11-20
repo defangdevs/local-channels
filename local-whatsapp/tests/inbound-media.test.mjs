@@ -156,3 +156,15 @@ test('transcription failures retry, then tell the sender; empty speech counts as
   assert.equal(finishTranscription(bad, { error: 'attachment exceeds 20 MiB limit' }), 'failed');
   assert.match(bad.reply.text, /20 MiB/);
 });
+
+test('a failure reply obeys the outbox limit and keeps the barrier', () => {
+  const entry = parseInbound(voice(), creds, {}, '');
+  entry.transcription.attempts = MAX_TRANSCRIBE_ATTEMPTS - 1;
+  const messages = { [entry.id]: entry };
+  for (let i = 0; i < 200; i++) messages[`q${i}`] = { reply: { status: 'queued' } };
+  assert.equal(finishTranscription(entry, { error: 'boom' }, 0, 50, { messages }), 'retry');
+  assert.equal(entry.transcription.status, 'pending');
+  assert.equal(entry.reply, null);
+  delete messages.q0;
+  assert.equal(finishTranscription(entry, { error: 'boom' }, 0, 50, { messages }), 'failed');
+});

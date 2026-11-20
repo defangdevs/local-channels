@@ -198,7 +198,7 @@ export function pendingTranscription(state) {
 // Record one transcription attempt. Returns 'done', 'retry' or 'failed'. A
 // failed note gets a queued WhatsApp reply (so the sender is told) and, with
 // the reply set, is never routed as an empty message.
-export function finishTranscription(entry, { text, error }, now = Date.now(), retryMs = 30000) {
+export function finishTranscription(entry, { text, error }, now = Date.now(), retryMs = 30000, state = null) {
   const t = entry.transcription;
   t.attempts = (t.attempts || 0) + 1;
   const spoken = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
@@ -210,6 +210,11 @@ export function finishTranscription(entry, { text, error }, now = Date.now(), re
   }
   t.error = String(error || 'no speech detected').slice(0, 300);
   if (t.attempts < MAX_TRANSCRIBE_ATTEMPTS && !t.permanent) {
+    t.retryAt = now + retryMs;
+    return 'retry';
+  }
+  // Same backpressure as queueReply: keep the barrier until the reply fits.
+  if (state && Object.values(state.messages).filter((m) => m.reply?.status === 'queued').length >= MAX_OUTBOX) {
     t.retryAt = now + retryMs;
     return 'retry';
   }

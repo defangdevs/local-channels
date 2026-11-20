@@ -209,7 +209,11 @@ async function sessionCommand(args) {
 // Run the transcriber on one saved audio file; resolves with its stdout.
 function transcribeFile(path) {
   return new Promise((resolve, reject) => {
-    const child = spawn(transcribeCmd, [path], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Own process group, so the deadline stops the transcriber AND any worker
+    // it started that still holds our pipes.
+    const child = spawn(transcribeCmd, [path], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     let output = '';
     let error = '';
     let settled = false;
@@ -220,11 +224,12 @@ function transcribeFile(path) {
       if (failure) reject(failure); else resolve(text);
     };
     const timeout = setTimeout(() => {
-      child.kill('SIGKILL');
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+      child.stdout.destroy(); child.stderr.destroy();
       finish(new Error(`transcription timed out after ${TRANSCRIBE_TIMEOUT_MS / 60000} minutes`));
     }, TRANSCRIBE_TIMEOUT_MS);
-    child.stdout.on('data', (chunk) => { output = (output + chunk.toString()).slice(0, 100000); });
-    child.stderr.on('data', (chunk) => { error = (error + chunk.toString()).slice(-500); });
+    child.stdout.on('data', (chunk) => { output = (output + chunk).slice(0, 100000); });
+    child.stderr.on('data', (chunk) => { error = (error + chunk).slice(-500); });
     child.on('error', (failure) => finish(failure));
     child.on('close', (code) => {
       if (code !== 0) return finish(new Error(error.trim() || `transcriber exited ${code}`));
@@ -505,7 +510,7 @@ async function serve() {
         try { result = { text: await transcribeFile(entry.attachment.path) }; }
         catch (error) { result = { error: error.message }; }
         if (result.error) process.stderr.write(`transcription failed for ${entry.id}: ${result.error}\n`);
-        if (finishTranscription(entry, result) === 'retry') { saveState(dir, state); break; }
+        if (finishTranscription(entry, result, Date.now(), 30000, state) === 'retry') { saveState(dir, state); break; }
         saveState(dir, state);
       }
     } finally { transcribing = false; }
@@ -811,7 +816,7 @@ async function serve() {
             }
             if (inbound.transcription && inbound.attachment.error) {
               inbound.transcription.permanent = true;
-              finishTranscription(inbound, { error: inbound.attachment.error });
+              finishTranscription(inbound, { error: inbound.attachment.error }, Date.now(), 30000, state);
             }
             const control = !inbound.attachment && (inbound.text === '/clear' || inbound.text === '/attach' || inbound.text === '/sessions' || inbound.text.startsWith('/target') ||
               inbound.text.startsWith('/profile'));
@@ -826,7 +831,13 @@ async function serve() {
               saveState(dir, state);
               if (control) await handleControls();
               else {
-                await processTranscriptions();
+                // Never wait for a transcript here: later messages (/clear,
+                // /attach, text) must keep parsing. dispatch() stops at a
+                // pending voice note, which keeps order.
+                if (inbound.transcription?.status === 'pending') {
+                  processTranscriptions().then(() => dispatch()).then(() => drainReplies())
+                    .catch((error) => process.stderr.write(`transcription pass failed: ${error.message}\n`));
+                }
                 let dispatchError = null;
                 try { await dispatch(); }
                 catch (error) { dispatchError = error; }
