@@ -80,7 +80,7 @@ esac
         ev.emit('connection.update', { connection: 'open' });
         ev.emit('messages.upsert', { type: 'notify', messages: [{
           key: { id: process.env.FAKE_INBOUND_ID || 'IN1', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' },
-          message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: process.env.FAKE_MEDIA_CAPTION ?? ('@' + userInfo().username + ' inspect this'), mimetype: process.env.FAKE_MEDIA === 'videoMessage' ? 'video/mp4' : 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') },
+          message: process.env.FAKE_MEDIA ? { [process.env.FAKE_MEDIA]: { caption: process.env.FAKE_MEDIA_CAPTION ?? ('@' + userInfo().username + ' inspect this'), mimetype: process.env.FAKE_MEDIA === 'videoMessage' ? 'video/mp4' : 'image/png', fileName: '../../unsafe.pdf', fileLength: 21 } } : (process.env.FAKE_QUOTED_ID ? { extendedTextMessage: { text: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello'), contextInfo: { stanzaId: process.env.FAKE_QUOTED_ID } } } : { conversation: process.env.FAKE_INBOUND_TEXT || ('@' + userInfo().username + ' hello') }),
         }] });
       }, Number(process.env.FAKE_INBOUND_DELAY || 100));
       if (process.env.FAKE_FOLLOWUP_TEXT) setTimeout(() => ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'AFTER-CLEAR', fromMe: true, remoteJid: '14155551234@s.whatsapp.net' }, message: { conversation: process.env.FAKE_FOLLOWUP_TEXT } }] }), 500);
@@ -823,6 +823,7 @@ test(`route command decides the session for each message (debug ${JSON.stringify
     assert.equal(spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'ack', id], { env, encoding: 'utf8' }).status, 0);
     assert.equal(spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'reply', id, '24%'], { env, encoding: 'utf8' }).status, 0);
     await waitUntil(() => existsSync(r.fixture.fakeOut) && readFileSync(r.fixture.fakeOut, 'utf8').includes('24%'), 'reply sent');
+    await waitUntil(() => only().replyWhatsappIds?.includes('OUT1'), 'outgoing id saved');
     const outbound = readFileSync(r.fixture.fakeOut, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.equal(outbound.some((item) => item.payload.text === `Box: ${id} -> wa-greece (NEW)`), debug === '1');
     const status = JSON.parse(spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' }).stdout);
@@ -916,5 +917,19 @@ test('a hung route command is stopped at the deadline and retried later', async 
     // The bridge still answers its control socket: nothing is wedged.
     const status = spawnSync(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'status'], { env, encoding: 'utf8' });
     assert.equal(status.status, 0, status.stderr);
+  } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
+});
+
+test('quoted outgoing message is passed to routing as its original inbound id', async () => {
+  const r = routeFixture(`printf '%s\n' '{"session":"wa-x","action":"CONTINUE"}'`);
+  writeFileSync(join(r.fixture.state, 'messages.json'), JSON.stringify({ messages: {
+    old: { id: 'old', chat: '14155551234@s.whatsapp.net', routedTo: 'wa-x',
+      reactionKey: { id: 'IN-OLD' }, replyWhatsappIds: ['OUT-OLD'], reply: { text: 'answer', status: 'sent', sentAt: '2026-11-15T09:00:00.000Z' } },
+  }, sentIds: {} }));
+  const env = { ...r.env, FAKE_QUOTED_ID: 'OUT-OLD' };
+  const daemon = spawn(process.execPath, [join(r.fixture.dir, 'bridge.mjs'), 'serve'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => r.requests().length > 0, 'quoted reply routed');
+    assert.equal(r.requests()[0].message.reply_to_message, 'old');
   } finally { await stop(daemon); rmSync(r.fixture.dir, { recursive: true, force: true }); }
 });

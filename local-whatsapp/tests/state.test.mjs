@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, symlinkSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { addInbound, loadState, parseInbound, queueReply, queueImageReply, imageReplyContent, cleanImageOutbox, MAX_IMAGE_BYTES, MAX_IMAGE_OUTBOX, MAX_TEXT, saveState } from '../state.mjs';
+import { addInbound, loadState, parseInbound, quotedRouteMessage, queueReply, queueImageReply, imageReplyContent, cleanImageOutbox, MAX_IMAGE_BYTES, MAX_IMAGE_OUTBOX, MAX_TEXT, saveState } from '../state.mjs';
 
 const credentials = { me: { id: '14155551234:2@s.whatsapp.net' } };
 function message(text, id = 'ABC123', remoteJid = '14155551234@s.whatsapp.net') {
@@ -166,4 +166,26 @@ test('image outbox is bounded and orphaned copies are reclaimed', () => {
     cleanImageOutbox(dir, state);
     assert.equal(existsSync(path), false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('quoted message references resolve only retained routed messages in the same chat', () => {
+  const incoming = message('unused');
+  incoming.message = { ephemeralMessage: { message: { extendedTextMessage: {
+    text: '@box why?', contextInfo: { stanzaId: 'OUT1' },
+  } } } };
+  const parsed = parseInbound(incoming, credentials, {});
+  assert.equal(parsed.quotedId, 'OUT1');
+  const prior = { id: 'old', chat: parsed.chat, routedTo: 'wa-old', reactionKey: { id: 'IN1' }, replyWhatsappIds: ['OUT0', 'OUT1'] };
+  const state = { messages: { old: prior } };
+  assert.equal(quotedRouteMessage(state, parsed), 'old');
+  assert.equal(quotedRouteMessage(state, { ...parsed, quotedId: 'IN1' }), 'old');
+  assert.equal(quotedRouteMessage(state, { ...parsed, quotedId: 'OUT0' }), 'old');
+  assert.equal(quotedRouteMessage(state, { ...parsed, quotedId: 'unknown' }), null);
+  assert.equal(quotedRouteMessage(state, { ...parsed, chat: 'other' }), null);
+  prior.clearedAt = 'now';
+  assert.equal(quotedRouteMessage(state, parsed), null);
+  delete prior.clearedAt; delete prior.routedTo;
+  assert.equal(quotedRouteMessage(state, parsed), null);
+  incoming.message = { imageMessage: { caption: '@box look', contextInfo: { stanzaId: 'IN1' } } };
+  assert.equal(parseInbound(incoming, credentials, {}).quotedId, 'IN1');
 });

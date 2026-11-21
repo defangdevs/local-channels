@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import WebSocket from 'ws';
 import pino from 'pino';
-import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, pendingTranscription, finishTranscription, addInbound, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
+import { REPLY_GUIDANCE, retireConversation, attachmentNotice, receiveAttachment, cleanMediaInbox, pendingTranscription, finishTranscription, addInbound, quotedRouteMessage, cleanImageOutbox, imageReplyContent, queueImageReply, ensurePrivateDir, loadState, parseInbound, queueReply, saveState, stateDir } from './state.mjs';
 
 process.umask(0o077);
 const dir = stateDir();
@@ -240,7 +240,7 @@ function transcribeFile(path) {
 
 // Hand one message to the route command. Request (stdin):
 //   {"channel": "whatsapp",
-//    "message": {"id", "text", "ts" (epoch seconds), "attachments" (notice or "")},
+//    "message": {"id", "text", "ts" (epoch seconds), "attachments", "reply_to_message" (optional)},
 //    "reply": command line the session runs to answer, "ack": ... to acknowledge,
 //    "recent": [{"id", "session", "reply"}]   answers already given to earlier
 //               routed messages, so the router can describe each session}
@@ -255,7 +255,7 @@ function routeMessage(message, state) {
   const body = JSON.stringify({
     channel: 'whatsapp',
     message: { id: message.id, text: message.text || '', ts: Math.floor(Date.parse(message.receivedAt || '') / 1000) || Math.floor(Date.now() / 1000),
-      attachments: attachmentNotice(message).trim() },
+      attachments: attachmentNotice(message).trim(), reply_to_message: quotedRouteMessage(state, message) },
     reply: `node ${self} reply ${message.id} <reply text>`,
     ack: `node ${self} ack ${message.id}`,
     recent,
@@ -643,7 +643,10 @@ async function serve() {
         try {
           const content = entry.reply.image ? imageReplyContent(dir, entry.reply) : { text: entry.reply.text };
           const sent = await whatsapp.sendMessage(entry.chat, content);
-          if (sent?.key?.id) state.sentIds[`wa:${sent.key.id}`] = Date.now();
+          if (sent?.key?.id) {
+            state.sentIds[`wa:${sent.key.id}`] = Date.now();
+            entry.replyWhatsappIds = [...(entry.replyWhatsappIds || []), sent.key.id].slice(-20);
+          }
           entry.reply.status = 'sent';
           entry.reply.sentAt = new Date().toISOString();
           for (const [id, timestamp] of Object.entries(state.sentIds)) {

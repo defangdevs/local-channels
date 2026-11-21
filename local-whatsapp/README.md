@@ -156,7 +156,12 @@ Request on stdin:
 `reply` and `ack` are the command lines that the chosen session runs to answer
 and to acknowledge; any session can run them. `recent` holds the last 50
 answers to earlier routed messages, so a router can describe each session by
-what was said in it.
+what was said in it. When the owner quotes a retained routed message or its
+answer, `message.reply_to_message` is the original inbound message ID. It is
+null when the quote cannot be matched. The router must check that the original
+session still exists before using it. Outgoing IDs are retained only for answers
+sent after this capability was installed; older or pruned messages fall back to
+ordinary routing.
 
 Response on stdout, exit status 0: `{"session": "NAME", "action": "NEW"}`.
 `session` is required; `action` is shown only in debug receipts. Any other
