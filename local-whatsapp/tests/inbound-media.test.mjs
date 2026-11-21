@@ -168,3 +168,14 @@ test('a failure reply obeys the outbox limit and keeps the barrier', () => {
   delete messages.q0;
   assert.equal(finishTranscription(entry, { error: 'boom' }, 0, 50, { messages }), 'failed');
 });
+
+test('a transcript longer than the chat limit is rejected, never truncated and routed', () => {
+  const entry = parseInbound(voice(), creds, {}, '');
+  assert.equal(finishTranscription(entry, { text: 'word '.repeat(1000) }), 'failed');
+  assert.equal(entry.transcription.status, 'failed');
+  assert.equal(entry.text, '');
+  assert.match(entry.reply.text, /longer than 4000 characters/);
+  const ok = parseInbound(voice(), creds, {}, '');
+  assert.equal(finishTranscription(ok, { text: 'x'.repeat(4000) }), 'done');
+  assert.equal(ok.text.length, 4000);
+});
