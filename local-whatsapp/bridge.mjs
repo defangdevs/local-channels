@@ -45,6 +45,10 @@ const ROUTE_TIMEOUT_MS = Number(process.env.LOCAL_WHATSAPP_ROUTE_TIMEOUT_MS) || 
 const ROUTE_RETRY_MS = 30000;
 // Voice notes are transcribed on this box; the audio never goes to a service.
 const transcribeCmd = process.env.LOCAL_WHATSAPP_TRANSCRIBE_CMD || 'agent-box-transcribe';
+// The default transcriber gets a multilingual model (base.en only knows English)
+// and detects the language; a custom command gets just the file path.
+const transcribeModel = process.env.LOCAL_WHATSAPP_TRANSCRIBE_MODEL || 'base';
+const transcribeArgs = process.env.LOCAL_WHATSAPP_TRANSCRIBE_CMD ? [] : ['--model', transcribeModel, '--lang', 'auto'];
 const TRANSCRIBE_TIMEOUT_MS = 10 * 60 * 1000;
 const ROUTE_RECENT = 50;
 
@@ -211,11 +215,12 @@ function transcribeFile(path) {
   return new Promise((resolve, reject) => {
     // Own process group, so the deadline stops the transcriber AND any worker
     // it started that still holds our pipes.
-    const child = spawn(transcribeCmd, [path], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const child = spawn(transcribeCmd, [...transcribeArgs, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     let output = '';
     let error = '';
+    let truncated = false;
     let settled = false;
     const finish = (failure, text) => {
       if (settled) return;
@@ -229,10 +234,15 @@ function transcribeFile(path) {
       finish(new Error(`transcription timed out after ${TRANSCRIBE_TIMEOUT_MS / 60000} minutes`));
     }, TRANSCRIBE_TIMEOUT_MS);
     child.stdout.on('data', (chunk) => { output = (output + chunk).slice(0, 100000); });
-    child.stderr.on('data', (chunk) => { error = (error + chunk).slice(-500); });
+    child.stderr.on('data', (chunk) => {
+      error = (error + chunk).slice(-2000);
+      // agent-box-transcribe warns and exits 0 when it cut a long recording.
+      if (/WARNING: the audio is longer than/.test(error)) truncated = true;
+    });
     child.on('error', (failure) => finish(failure));
     child.on('close', (code) => {
-      if (code !== 0) return finish(new Error(error.trim() || `transcriber exited ${code}`));
+      if (code !== 0) return finish(new Error(error.trim().slice(-500) || `transcriber exited ${code}`));
+      if (truncated) return finish(Object.assign(new Error('the recording is too long to transcribe completely; send a shorter one'), { permanent: true }));
       finish(null, output);
     });
   });
@@ -508,7 +518,7 @@ async function serve() {
         if (Date.now() < (entry.transcription.retryAt || 0)) break;
         let result;
         try { result = { text: await transcribeFile(entry.attachment.path) }; }
-        catch (error) { result = { error: error.message }; }
+        catch (error) { result = { error: error.message }; if (error.permanent) entry.transcription.permanent = true; }
         if (result.error) process.stderr.write(`transcription failed for ${entry.id}: ${result.error}\n`);
         if (finishTranscription(entry, result, Date.now(), 30000, state) === 'retry') { saveState(dir, state); break; }
         saveState(dir, state);
