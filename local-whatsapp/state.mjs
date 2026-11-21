@@ -70,6 +70,7 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   const voice = content?.audioMessage;
   const media = content?.imageMessage || content?.documentMessage || content?.videoMessage || voice;
   const fullText = content?.conversation || content?.extendedTextMessage?.text || media?.caption || '';
+  const quotedId = (content?.extendedTextMessage || media)?.contextInfo?.stanzaId;
   if (typeof fullText !== 'string' || fullText.length > MAX_TEXT + prefix.length + 1) return null;
   // An empty prefix means plain mode: the owner self-chat is already checked
   // above, so every text is accepted. Captioned media is accepted too.
@@ -83,6 +84,7 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
   return {
     id: createHash('sha256').update(`${chat}\0${key.id}`).digest('hex').slice(0, 24),
     chat,
+    ...(typeof quotedId === 'string' && quotedId.length > 0 && quotedId.length <= 200 ? { quotedId } : {}),
     reactionKey: { remoteJid: key.remoteJid, id: key.id, fromMe: true },
     text,
     ...(media ? { attachment: {
@@ -97,6 +99,16 @@ export function parseInbound(message, credentials, sentIds, prefix = '@box', all
     deliveredTo: null,
     reply: null,
   };
+}
+
+// Resolve only messages retained in this chat and routed by this bridge. The
+// router checks the recorded session identity before using the message id.
+export function quotedRouteMessage(state, message) {
+  if (!message.quotedId) return null;
+  const match = Object.values(state.messages).find((entry) =>
+    entry.chat === message.chat && entry.routedTo && !entry.clearedAt &&
+    (entry.reactionKey?.id === message.quotedId || (entry.replyWhatsappIds || []).includes(message.quotedId)));
+  return match?.id || null;
 }
 
 export function addInbound(state, inbound) {
