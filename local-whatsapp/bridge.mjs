@@ -235,9 +235,12 @@ function transcribeFile(path) {
     }, TRANSCRIBE_TIMEOUT_MS);
     child.stdout.on('data', (chunk) => { output = (output + chunk).slice(0, 100000); });
     child.stderr.on('data', (chunk) => {
-      error = (error + chunk).slice(-2000);
       // agent-box-transcribe warns and exits 0 when it cut a long recording.
+      // Look at the whole buffer before trimming it, so the warning is seen
+      // across chunk boundaries and inside a chunk longer than the tail kept.
+      error += chunk;
       if (/WARNING: the audio is longer than/.test(error)) truncated = true;
+      error = error.slice(-2000);
     });
     child.on('error', (failure) => finish(failure));
     child.on('close', (code) => {
