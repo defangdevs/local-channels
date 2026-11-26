@@ -231,9 +231,12 @@ function transcribeFile(path) {
     const timeout = setTimeout(() => {
       try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
       child.stdout.destroy(); child.stderr.destroy();
-      finish(new Error(`transcription timed out after ${TRANSCRIBE_TIMEOUT_MS / 60000} minutes`));
+      finish(Object.assign(new Error(`transcription timed out after ${TRANSCRIBE_TIMEOUT_MS / 60000} minutes`), { permanent: truncated }));
     }, TRANSCRIBE_TIMEOUT_MS);
-    child.stdout.on('data', (chunk) => { output = (output + chunk).slice(0, 100000); });
+    // Collapse whitespace as it is read, so a long run of spaces cannot push
+    // real speech past the cap; any text that still overflows it is far over
+    // the chat limit, and finishTranscription rejects that as too long.
+    child.stdout.on('data', (chunk) => { output = (output + chunk).replace(/\s+/g, ' ').slice(0, 100000); });
     child.stderr.on('data', (chunk) => {
       // agent-box-transcribe warns and exits 0 when it cut a long recording.
       // Look at the whole buffer before trimming it, so the warning is seen
@@ -244,8 +247,8 @@ function transcribeFile(path) {
     });
     child.on('error', (failure) => finish(failure));
     child.on('close', (code) => {
-      if (code !== 0) return finish(new Error(error.trim().slice(-500) || `transcriber exited ${code}`));
       if (truncated) return finish(Object.assign(new Error('the recording is too long to transcribe completely; send a shorter one'), { permanent: true }));
+      if (code !== 0) return finish(new Error(error.trim().slice(-500) || `transcriber exited ${code}`));
       finish(null, output);
     });
   });
