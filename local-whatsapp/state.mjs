@@ -214,13 +214,22 @@ export function finishTranscription(entry, { text, error }, now = Date.now(), re
   const t = entry.transcription;
   t.attempts = (t.attempts || 0) + 1;
   const spoken = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  // A transcript the chat limit would cut is rejected, never routed as complete.
+  if (!error && spoken.length > MAX_TEXT) {
+    t.permanent = true;
+    return failTranscription(entry, t, `the transcript is longer than ${MAX_TEXT} characters`, state, now, retryMs);
+  }
   if (!error && spoken) {
-    entry.text = spoken.slice(0, MAX_TEXT);
+    entry.text = spoken;
     t.status = 'done';
     delete t.error; delete t.retryAt;
     return 'done';
   }
-  t.error = String(error || 'no speech detected').slice(0, 300);
+  return failTranscription(entry, t, error || 'no speech detected', state, now, retryMs);
+}
+
+function failTranscription(entry, t, error, state, now, retryMs) {
+  t.error = String(error).slice(0, 300);
   if (t.attempts < MAX_TRANSCRIBE_ATTEMPTS && !t.permanent) {
     t.retryAt = now + retryMs;
     return 'retry';
